@@ -18,6 +18,7 @@ This repo is intended to be the “models.dev for harnesses” layer:
 - `data/models.json` — cached model catalog (from models.dev)
 - `data/harnesses.json` — harness metadata and capabilities
 - `data/compatibility.json` — model↔harness support matrix
+- `data/schema.json` — JSON schema for compatibility entries
 
 ## Commands
 
@@ -27,3 +28,13 @@ This repo is intended to be the “models.dev for harnesses” layer:
 ## Status
 
 Bootstrapped. Ready to start adding harness support mappings.
+_effort_values`
+- `default_reasoning_effort`
+- `reasoning_cost_multiplier`
+- `reasoning_latency_impact_ms`
+- `quality_delta_by_effort`
+- `recommended_profiles` (`fast`, `balanced`, `deep`)
+
+## Status
+
+Bootstrapped. Ready to start adding harness support mappings and verified reasoning profiles.

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentworkforce.github.io/agents/schema.json",
+  "title": "Agents Compatibility Schema",
+  "type": "object",
+  "properties": {
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["model", "harness_id", "status", "confidence"],
+        "properties": {
+          "model": { "type": "string" },
+          "harness_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["supported", "partial", "unsupported", "assumed"] },
+          "confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+          "notes": { "type": "string" },
+          "reasoning_effort_supported": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["none", "low", "medium", "high", "max", "unknown"] }
+          },
+          "reasoning_effort_param": { "type": "string" },
+          "reasoning_effort_values": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "default_reasoning_effort": { "type": "string" },
+          "reasoning_cost_multiplier": { "type": "number" },
+          "reasoning_latency_impact_ms": { "type": "number" },
+          "quality_delta_by_effort": {
+            "type": "object",
+            "additionalProperties": { "type": "number" }
+          },
+          "recommended_profiles": {
+            "type": "object",
+            "properties": {
+              "fast": { "type": "string" },
+              "balanced": { "type": "string" },
+              "deep": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "required": ["entries"],
+  "additionalProperties": false
+}

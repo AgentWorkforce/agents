@@ -5,14 +5,32 @@
       "harness_id": "codex-cli",
       "status": "assumed",
       "confidence": "low",
-      "notes": "Seed row; replace with verified run evidence"
+      "notes": "Seed row; replace with verified run evidence",
+      "reasoning_effort_supported": ["low", "medium", "high"],
+      "reasoning_effort_param": "reasoning_effort",
+      "reasoning_effort_values": ["low", "medium", "high"],
+      "default_reasoning_effort": "medium",
+      "recommended_profiles": {
+        "fast": "low",
+        "balanced": "medium",
+        "deep": "high"
+      }
     },
     {
       "model": "anthropic/claude-3.7-sonnet",
       "harness_id": "claude-code",
       "status": "assumed",
       "confidence": "low",
-      "notes": "Seed row; replace with verified run evidence"
+      "notes": "Seed row; replace with verified run evidence",
+      "reasoning_effort_supported": ["low", "medium", "high"],
+      "reasoning_effort_param": "thinking",
+      "reasoning_effort_values": ["low", "medium", "high"],
+      "default_reasoning_effort": "medium",
+      "recommended_profiles": {
+        "fast": "low",
+        "balanced": "medium",
+        "deep": "high"
+      }
     }
   ]
 }

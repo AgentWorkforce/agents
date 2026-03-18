@@ -1,9 +1,23 @@
 {
   "name": "@agentworkforce/agents",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "package.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepublishOnly": "npm run build && npm run validate",
     "fetch:models": "node scripts/fetch-models.mjs",
     "validate": "node scripts/validate.mjs"
   }

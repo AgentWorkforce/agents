@@ -1,0 +1,76 @@
+name: Publish Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version bump type
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major, prerelease]
+      tag:
+        description: npm dist-tag
+        required: true
+        default: latest
+        type: choice
+        options: [latest, next, beta]
+      dry_run:
+        description: Dry run only
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Build + validate
+        run: |
+          npm ci || npm install
+          npm run build
+          npm run validate
+
+      - name: Bump version
+        id: bump
+        run: |
+          npm version ${{ github.event.inputs.version }} --no-git-tag-version
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore(release): @agentworkforce/agents v${{ steps.bump.outputs.version }}"
+
+      - name: Publish (dry run)
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: npm publish --dry-run --access public --tag ${{ github.event.inputs.tag }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: npm publish --access public --provenance --tag ${{ github.event.inputs.tag }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag + push
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          git tag v${{ steps.bump.outputs.version }}
+          git push origin main --follow-tags

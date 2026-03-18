@@ -6,6 +6,30 @@ const CANDIDATE_URLS = [
   'https://models.dev/models.json'
 ].filter(Boolean);
 
+async function fetchFromPackage() {
+  try {
+    const { providers } = await import('models-dev-db');
+    const providerList = await providers();
+    const models = [];
+
+    for (const p of providerList) {
+      const entries = Object.values(p.models || {});
+      for (const m of entries) {
+        const id = `${p.id}/${m.id || m.name}`;
+        models.push({ id, provider: p.id, model: m.id || m.name });
+      }
+    }
+
+    return {
+      source: 'models-dev-db',
+      fetchedAt: new Date().toISOString(),
+      models
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchJson(url) {
   const res = await fetch(url, { headers: { accept: 'application/json' } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -13,39 +37,53 @@ async function fetchJson(url) {
 }
 
 function normalizeModels(payload) {
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload?.models)) return payload.models;
-  if (Array.isArray(payload?.data)) return payload.data;
-  return [];
+  const arr = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.models)
+      ? payload.models
+      : Array.isArray(payload?.data)
+        ? payload.data
+        : [];
+
+  return arr
+    .map((m) => {
+      const id = m?.id || m?.name || m?.model;
+      if (!id) return null;
+      return { id };
+    })
+    .filter(Boolean);
+}
+
+async function fetchFromHttp() {
+  for (const url of CANDIDATE_URLS) {
+    try {
+      const payload = await fetchJson(url);
+      const models = normalizeModels(payload);
+      if (models.length > 0) {
+        return {
+          source: url,
+          fetchedAt: new Date().toISOString(),
+          models
+        };
+      }
+    } catch {}
+  }
+  return null;
 }
 
 async function main() {
   await fs.mkdir('data', { recursive: true });
 
-  let models = [];
-  let source = null;
-  for (const url of CANDIDATE_URLS) {
-    try {
-      const payload = await fetchJson(url);
-      const normalized = normalizeModels(payload);
-      if (normalized.length > 0) {
-        models = normalized;
-        source = url;
-        break;
-      }
-    } catch {}
+  const fromPkg = await fetchFromPackage();
+  const fromHttp = fromPkg ? null : await fetchFromHttp();
+  const out = fromPkg || fromHttp;
+
+  if (!out) {
+    throw new Error('Could not fetch models from models.dev sources (package or HTTP).');
   }
 
-  if (!models.length) {
-    throw new Error('Could not fetch models from models.dev (set MODELS_DEV_URL if needed).');
-  }
-
-  await fs.writeFile(
-    'data/models.json',
-    JSON.stringify({ source, fetchedAt: new Date().toISOString(), models }, null, 2) + '\n',
-    'utf8'
-  );
-  console.log(`Wrote data/models.json (${models.length} models) from ${source}`);
+  await fs.writeFile('data/models.json', JSON.stringify(out, null, 2) + '\n', 'utf8');
+  console.log(`Wrote data/models.json (${out.models.length} models) from ${out.source}`);
 }
 
 main().catch((err) => {

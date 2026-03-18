@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { execSync } from 'node:child_process';
 
 function getModelId(model) {
   return model?.id || model?.name || model?.model || null;
@@ -41,11 +42,12 @@ async function main() {
   await fs.rm('dist', { recursive: true, force: true });
   await fs.mkdir('dist', { recursive: true });
 
-  await fs.copyFile('src/index.js', 'dist/index.js');
   await fs.writeFile('dist/matrix.json', JSON.stringify(matrix, null, 2) + '\n', 'utf8');
   await fs.copyFile('data/harness-models.json', 'dist/harness-models.json');
 
-  console.log('Built dist/ with matrix.json');
+  execSync('npx tsc -p tsconfig.json', { stdio: 'inherit' });
+
+  console.log('Built dist/ with TypeScript output + matrix.json');
 }
 
 main().catch((err) => {

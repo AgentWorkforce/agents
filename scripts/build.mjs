@@ -37,7 +37,22 @@ async function main() {
   const modelsPayload = JSON.parse(await fs.readFile('data/models.json', 'utf8'));
   const harnessConfig = JSON.parse(await fs.readFile('data/harness-models.json', 'utf8'));
 
+  let overrides = {};
+  try {
+    const raw = JSON.parse(await fs.readFile('data/harness-overrides.json', 'utf8'));
+    overrides = raw || {};
+  } catch {}
+
   const matrix = resolveMatrix(modelsPayload.models || [], harnessConfig);
+
+  // Apply explicit harness overrides when present (ground-truth model sets).
+  for (const [harnessId, cfg] of Object.entries(overrides)) {
+    if (!cfg || !Array.isArray(cfg.models)) continue;
+    matrix[harnessId] = {
+      name: matrix[harnessId]?.name || harnessId,
+      models: [...cfg.models]
+    };
+  }
 
   await fs.rm('dist', { recursive: true, force: true });
   await fs.mkdir('dist', { recursive: true });

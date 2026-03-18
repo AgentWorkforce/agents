@@ -46,3 +46,4 @@ npm run validate       # validate harness rule file shape
 
 - This repo intentionally avoids complex scoring/metadata.
 - “Less is more”: keep support mapping clear and maintainable.
+- Harness overrides are preferred over inference when available (UI/probe truth beats wildcard rules).

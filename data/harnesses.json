@@ -1,0 +1,22 @@
+{
+  "harnesses": [
+    {
+      "id": "codex-cli",
+      "name": "Codex CLI",
+      "runtime": "acp",
+      "notes": "PTY-oriented coding harness"
+    },
+    {
+      "id": "claude-code",
+      "name": "Claude Code",
+      "runtime": "acp",
+      "notes": "Strong repo-editing + tool-use loop"
+    },
+    {
+      "id": "gemini-cli",
+      "name": "Gemini CLI",
+      "runtime": "acp",
+      "notes": "Google model harness"
+    }
+  ]
+}

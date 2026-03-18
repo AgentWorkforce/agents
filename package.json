@@ -1,0 +1,10 @@
+{
+  "name": "@agentworkforce/agents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fetch:models": "node scripts/fetch-models.mjs",
+    "validate": "node scripts/validate.mjs"
+  }
+}

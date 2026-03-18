@@ -1,6 +1,6 @@
 {
   "name": "@agentworkforce/agents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "main": "dist/index.js",
@@ -16,9 +16,10 @@
     "access": "public"
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "prepublishOnly": "npm run build && npm run validate",
     "fetch:models": "node scripts/fetch-models.mjs",
-    "validate": "node scripts/validate.mjs"
+    "validate": "node scripts/validate.mjs",
+    "build": "node scripts/build.mjs",
+    "refresh": "npm run fetch:models && npm run validate && npm run build",
+    "prepublishOnly": "npm run validate && npm run build"
   }
 }

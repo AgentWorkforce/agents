@@ -1,0 +1,19 @@
+{
+  "harnesses": {
+    "codex-cli": {
+      "name": "Codex CLI",
+      "supports": ["openai/*", "openrouter/*"],
+      "deny": []
+    },
+    "claude-code": {
+      "name": "Claude Code",
+      "supports": ["anthropic/*"],
+      "deny": []
+    },
+    "gemini-cli": {
+      "name": "Gemini CLI",
+      "supports": ["google/*"],
+      "deny": []
+    }
+  }
+}

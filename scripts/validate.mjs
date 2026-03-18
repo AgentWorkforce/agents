@@ -1,23 +1,17 @@
 import fs from 'node:fs/promises';
 
-async function readJson(path) {
-  const raw = await fs.readFile(path, 'utf8');
-  return JSON.parse(raw);
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
 }
 
 async function main() {
-  const harnesses = await readJson('data/harnesses.json');
-  const compatibility = await readJson('data/compatibility.json');
+  const cfg = JSON.parse(await fs.readFile('data/harness-models.json', 'utf8'));
+  assert(cfg && typeof cfg === 'object', 'harness-models.json must be an object');
+  assert(cfg.harnesses && typeof cfg.harnesses === 'object', 'harnesses is required');
 
-  const harnessIds = new Set(harnesses.harnesses.map((h) => h.id));
-  const bad = [];
-
-  for (const row of compatibility.entries) {
-    if (!harnessIds.has(row.harness_id)) bad.push(row);
-  }
-
-  if (bad.length) {
-    throw new Error(`Compatibility rows reference unknown harnesses: ${bad.length}`);
+  for (const [id, h] of Object.entries(cfg.harnesses)) {
+    assert(Array.isArray(h.supports), `${id}: supports must be an array`);
+    assert(Array.isArray(h.deny || []), `${id}: deny must be an array when provided`);
   }
 
   console.log('Validation passed');

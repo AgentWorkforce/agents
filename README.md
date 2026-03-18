@@ -1,40 +1,48 @@
-# agents
+# @agentworkforce/agents
 
-A compatibility map for **models × harnesses**.
+A tiny package for one thing:
 
-This repo is intended to be the “models.dev for harnesses” layer:
-- pull model metadata from models.dev
-- track which harnesses support which models
-- store known-good settings per harness/model
+**Which harnesses support which models.**
 
-## Initial scope
+Model catalog is sourced from models.dev (fetched into `data/models.json`), and harness support rules are defined in `data/harness-models.json`.
 
-- ingest model catalog from models.dev (or mirror export)
-- define a normalized harness registry
-- maintain compatibility matrix with confidence + notes
+## Install
 
-## Data layout
+```bash
+npm i @agentworkforce/agents
+```
 
-- `data/models.json` — cached model catalog (from models.dev)
-- `data/harnesses.json` — harness metadata and capabilities
-- `data/compatibility.json` — model↔harness support matrix
-- `data/schema.json` — JSON schema for compatibility entries
+## Usage
+
+```js
+import {
+  getHarnesses,
+  getModelsByHarness,
+  getHarnessesByModel,
+  getMatrix,
+} from '@agentworkforce/agents';
+
+getHarnesses();
+getModelsByHarness('codex-cli');
+getHarnessesByModel('openai/gpt-5');
+getMatrix();
+```
+
+## Data model (minimal)
+
+- `data/models.json` → models catalog (fetched from models.dev)
+- `data/harness-models.json` → simple include/exclude rules by harness
+- `dist/matrix.json` → generated final harness→models map
 
 ## Commands
 
-- `npm run fetch:models` — fetch/refresh models catalog
-- `npm run validate` — validate schemas and matrix consistency
+```bash
+npm run fetch:models   # refresh data/models.json from models.dev
+npm run build          # regenerate dist/matrix.json
+npm run validate       # validate harness rule file shape
+```
 
-## Status
+## Notes
 
-Bootstrapped. Ready to start adding harness support mappings.
-_effort_values`
-- `default_reasoning_effort`
-- `reasoning_cost_multiplier`
-- `reasoning_latency_impact_ms`
-- `quality_delta_by_effort`
-- `recommended_profiles` (`fast`, `balanced`, `deep`)
-
-## Status
-
-Bootstrapped. Ready to start adding harness support mappings and verified reasoning profiles.
+- This repo intentionally avoids complex scoring/metadata.
+- “Less is more”: keep support mapping clear and maintainable.

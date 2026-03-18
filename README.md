@@ -36,7 +36,6 @@ getMatrix();
 ## Commands
 
 ```bash
-npm run fetch:models   # optional: refresh raw models.dev snapshot (reference only)
 npm run validate       # validate known/unknown capability shape
 npm run build          # regenerate dist/matrix.json from capabilities
 ```

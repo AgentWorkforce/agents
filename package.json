@@ -20,14 +20,9 @@
     "access": "public"
   },
   "scripts": {
-    "fetch:models": "node scripts/fetch-models.mjs",
     "validate": "node scripts/validate.mjs",
     "build": "node scripts/build.mjs",
-    "refresh": "npm run fetch:models && npm run validate && npm run build",
     "prepublishOnly": "npm run validate && npm run build"
-  },
-  "dependencies": {
-    "models-dev-db": "^1.0.193"
   },
   "devDependencies": {
     "typescript": "^5.9.2"

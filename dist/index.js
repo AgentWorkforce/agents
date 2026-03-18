@@ -1,7 +1,7 @@
 import matrix from '../dist/matrix.json' with { type: 'json' };
 const typedMatrix = matrix;
 export function getHarnesses() {
-    return Object.entries(typedMatrix).map(([id, v]) => ({ id, name: v.name }));
+    return Object.entries(typedMatrix).map(([id, v]) => ({ id, name: v.name, known: v.known, source: v.source }));
 }
 export function getModelsByHarness(harnessId) {
     return typedMatrix[harnessId]?.models ?? [];

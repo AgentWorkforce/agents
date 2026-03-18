@@ -4,7 +4,7 @@ A tiny package for one thing:
 
 **Which harnesses support which models.**
 
-Model catalog is sourced from models.dev (fetched into `data/models.json`), and harness support rules are defined in `data/harness-models.json`.
+No inference. If we don't have evidence, it is marked unknown.
 
 ## Install
 
@@ -14,7 +14,7 @@ npm i @agentworkforce/agents
 
 ## Usage
 
-```js
+```ts
 import {
   getHarnesses,
   getModelsByHarness,
@@ -24,26 +24,25 @@ import {
 
 getHarnesses();
 getModelsByHarness('codex-cli');
-getHarnessesByModel('openai/gpt-5');
+getHarnessesByModel('gpt-5.4');
 getMatrix();
 ```
 
 ## Data model (minimal)
 
-- `data/models.json` → models catalog (fetched from models.dev)
-- `data/harness-models.json` → simple include/exclude rules by harness
-- `dist/matrix.json` → generated final harness→models map
+- `data/harness-capabilities.json` → canonical known/unknown harness capability set
+- `dist/matrix.json` → generated output for package consumers
 
 ## Commands
 
 ```bash
-npm run fetch:models   # refresh data/models.json from models.dev
-npm run build          # regenerate dist/matrix.json
-npm run validate       # validate harness rule file shape
+npm run fetch:models   # optional: refresh raw models.dev snapshot (reference only)
+npm run validate       # validate known/unknown capability shape
+npm run build          # regenerate dist/matrix.json from capabilities
 ```
 
-## Notes
+## Policy
 
-- This repo intentionally avoids complex scoring/metadata.
-- “Less is more”: keep support mapping clear and maintainable.
-- Harness overrides are preferred over inference when available (UI/probe truth beats wildcard rules).
+- Known means observed/proven (manual probe, docs, or automated test evidence).
+- Unknown means we do not claim support.
+- We do not infer support from provider catalogs.

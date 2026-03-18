@@ -1,56 +1,16 @@
 import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 
-function getModelId(model) {
-  return model?.id || model?.name || model?.model || null;
-}
+async function main() {
+  const capabilities = JSON.parse(await fs.readFile('data/harness-capabilities.json', 'utf8'));
 
-function matchesRule(modelId, rule) {
-  if (rule.endsWith('/*')) return modelId.startsWith(rule.slice(0, -1));
-  return modelId === rule;
-}
-
-function resolveMatrix(models, harnessConfig) {
-  const ids = models.map(getModelId).filter(Boolean);
   const matrix = {};
-
-  for (const [harnessId, cfg] of Object.entries(harnessConfig.harnesses || {})) {
-    const allow = cfg.supports || [];
-    const deny = cfg.deny || [];
-
-    const selected = ids.filter((id) => {
-      const allowed = allow.some((r) => matchesRule(id, r));
-      const denied = deny.some((r) => matchesRule(id, r));
-      return allowed && !denied;
-    });
-
+  for (const [harnessId, cfg] of Object.entries(capabilities.harnesses || {})) {
     matrix[harnessId] = {
       name: cfg.name || harnessId,
-      models: selected.sort()
-    };
-  }
-
-  return matrix;
-}
-
-async function main() {
-  const modelsPayload = JSON.parse(await fs.readFile('data/models.json', 'utf8'));
-  const harnessConfig = JSON.parse(await fs.readFile('data/harness-models.json', 'utf8'));
-
-  let overrides = {};
-  try {
-    const raw = JSON.parse(await fs.readFile('data/harness-overrides.json', 'utf8'));
-    overrides = raw || {};
-  } catch {}
-
-  const matrix = resolveMatrix(modelsPayload.models || [], harnessConfig);
-
-  // Apply explicit harness overrides when present (ground-truth model sets).
-  for (const [harnessId, cfg] of Object.entries(overrides)) {
-    if (!cfg || !Array.isArray(cfg.models)) continue;
-    matrix[harnessId] = {
-      name: matrix[harnessId]?.name || harnessId,
-      models: [...cfg.models]
+      source: cfg.source || 'unknown',
+      known: !!cfg.known,
+      models: Array.isArray(cfg.models) ? [...cfg.models].sort() : []
     };
   }
 
@@ -58,11 +18,11 @@ async function main() {
   await fs.mkdir('dist', { recursive: true });
 
   await fs.writeFile('dist/matrix.json', JSON.stringify(matrix, null, 2) + '\n', 'utf8');
-  await fs.copyFile('data/harness-models.json', 'dist/harness-models.json');
+  await fs.copyFile('data/harness-capabilities.json', 'dist/harness-capabilities.json');
 
   execSync('npx tsc -p tsconfig.json', { stdio: 'inherit' });
 
-  console.log('Built dist/ with TypeScript output + matrix.json');
+  console.log('Built dist/ from explicit harness capabilities (no inference).');
 }
 
 main().catch((err) => {

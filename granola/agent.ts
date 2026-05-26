@@ -31,8 +31,7 @@ export default handler(async (ctx, event) => {
     return;
   }
 
-  const teamId = input(ctx, 'LINEAR_TEAM_ID');
-  if (!teamId) throw new Error('LINEAR_TEAM_ID is required');
+  const teamId = await resolveTeamId(ctx);
   const issue = await ctx.linear.createIssue({ teamId, title: ask.title, description: ask.summary });
   ctx.log('info', 'granola-prospect.issue-created', { url: issue.url });
 
@@ -80,6 +79,42 @@ async function classify(ctx: WorkforceCtx, transcript: string): Promise<Ask> {
   } catch {
     return { isProspect: false, title: '', summary: '' };
   }
+}
+
+/**
+ * Which Linear team to file under. An explicit LINEAR_TEAM_ID wins; otherwise
+ * we auto-pick when the `fetch-teams` sync shows exactly one team, and block
+ * (with a helpful list) when it's ambiguous.
+ */
+async function resolveTeamId(ctx: WorkforceCtx): Promise<string> {
+  const configured = input(ctx, 'LINEAR_TEAM_ID');
+  if (configured) return configured;
+
+  const teams = await listLinearTeams(ctx);
+  if (teams.length === 1) return teams[0].id;
+
+  const found = teams.length ? ` Teams: ${teams.map((t) => `${t.name} (${t.id})`).join(', ')}.` : '';
+  throw new Error(
+    `Can't pick a Linear team automatically — found ${teams.length}. Set LINEAR_TEAM_ID.${found}`
+  );
+}
+
+/** Linear teams the `fetch-teams` sync materialized at /linear/teams/*.json. */
+async function listLinearTeams(ctx: WorkforceCtx): Promise<Array<{ id: string; name: string }>> {
+  const root = process.env.RELAYFILE_MOUNT_ROOT?.replace(/\/$/, '') ?? '';
+  const { output } = await ctx.sandbox.exec(
+    `find ${root}/linear/teams -maxdepth 1 -name '*.json' -not -name '_index.json' 2>/dev/null || true`
+  );
+  const teams: Array<{ id: string; name: string }> = [];
+  for (const file of output.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    try {
+      const t = JSON.parse(await ctx.files.read(file)) as { id?: string; name?: string };
+      if (t.id) teams.push({ id: t.id, name: t.name ?? t.id });
+    } catch {
+      /* skip unreadable entries */
+    }
+  }
+  return teams;
 }
 
 // ── tiny helpers ────────────────────────────────────────────────────────────

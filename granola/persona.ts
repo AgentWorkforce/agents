@@ -25,7 +25,13 @@ export default definePersona({
   },
 
   inputs: {
-    LINEAR_TEAM_ID: { description: 'Linear team to file prospect issues under.', env: 'LINEAR_TEAM_ID' }
+    // Optional: auto-resolved from the `fetch-teams` sync when there's exactly
+    // one Linear team. Only needed to disambiguate when you have several.
+    LINEAR_TEAM_ID: {
+      description: 'Linear team to file prospect issues under (only needed if you have multiple teams).',
+      env: 'LINEAR_TEAM_ID',
+      optional: true
+    }
   },
 
   harness: 'claude',

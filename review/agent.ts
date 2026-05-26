@@ -20,6 +20,15 @@ interface Pr {
   author: string; // github login of whoever opened the PR
 }
 
+type GithubMergeClient = NonNullable<WorkforceCtx['github']> & {
+  mergePullRequest(args: {
+    owner: string;
+    repo: string;
+    number: number;
+    method?: 'merge' | 'squash' | 'rebase';
+  }): Promise<{ merged: boolean; sha?: string }>;
+};
+
 export default handler(async (ctx, event) => {
   if (event.source !== 'github' || !ctx.github) return;
 
@@ -63,8 +72,17 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 }
 
 async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
-  // `pr.number` is a validated integer (see readPr), safe to interpolate.
-  await ctx.sandbox.exec(`gh pr merge ${pr.number} --repo ${shellQuote(`${pr.owner}/${pr.repo}`)} --squash`);
+  if (!ctx.github) return;
+  const github = ctx.github as GithubMergeClient;
+  if (typeof github.mergePullRequest !== 'function') {
+    throw new Error('ctx.github.mergePullRequest is required to merge approved pull requests.');
+  }
+  await github.mergePullRequest({
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    method: 'squash'
+  });
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel && ctx.slack) await ctx.slack.post(channel, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
 }
@@ -115,9 +133,6 @@ function ciFailed(payload: unknown): boolean {
 // ── tiny helpers ────────────────────────────────────────────────────────────
 function lastLine(text: string): string {
   return text.trimEnd().split('\n').pop()?.trim() ?? '';
-}
-function shellQuote(v: string): string {
-  return `'${v.replace(/'/g, `'\\''`)}'`;
 }
 function input(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona.inputSpecs?.[name];

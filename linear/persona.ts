@@ -12,13 +12,12 @@ export default definePersona({
   cloud: true,
   useSubscription: true,
 
-  // Two Linear triggers — `on` autocompletes Linear's catalog events. `match`
-  // narrows issue.create to a single label.
+  // Two Linear triggers — `on` autocompletes Linear's catalog events.
   integrations: {
     linear: {
       triggers: [
-        { on: 'issue.create', match: 'agentrelay' }, // only issues labelled "agentrelay"
-        { on: 'comment.create' } // …or a new comment on an issue
+        { on: 'issue.create', match: 'agentrelay' }, // new issues labelled "agentrelay"
+        { on: 'comment.create' } // …or a comment that @-mentions the agent (handler enforces MENTION + skips its own replies)
       ]
     },
     // Default repo the cloud materializes into the sandbox (ctx.sandbox.cwd)
@@ -27,10 +26,16 @@ export default definePersona({
     github: { scope: { repo: 'your-org/your-repo' } }
   },
 
+  inputs: {
+    // The handle the agent answers to in Linear comments. Adjust to your
+    // workspace's bot handle (e.g. @agentrelay / @agent_relay).
+    MENTION: { description: 'Mention that triggers the comment path.', env: 'MENTION', default: '@agentrelay', optional: true }
+  },
+
   // The coding agent implements inside a sandbox with write + network access.
   harness: 'codex',
   model: 'gpt-5.5',
-  systemPrompt: 'Implement Linear issues as small, reviewable GitHub PRs with a clear description.',
+  systemPrompt: 'Implement Linear issues as complete, well-described GitHub PRs that fully resolve the issue.',
   harnessSettings: {
     reasoning: 'high',
     timeoutSeconds: 1800,

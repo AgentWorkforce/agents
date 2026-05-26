@@ -29,7 +29,15 @@ export default definePersona({
   },
 
   inputs: {
-    SLACK_USER: { description: 'Slack user id to ping when a PR is ready (and whose approval merges it).', env: 'SLACK_USER' }
+    SLACK_CHANNEL: {
+      description: 'Slack channel to post review updates to (the message references the PR author).',
+      env: 'SLACK_CHANNEL'
+    },
+    APPROVERS: {
+      description: 'Comma-separated GitHub logins whose approval merges the PR. If unset, any approval merges.',
+      env: 'APPROVERS',
+      optional: true
+    }
   },
 
   harness: 'codex',

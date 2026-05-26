@@ -36,10 +36,10 @@ export default handler(async (ctx, event) => {
   ctx.log('info', 'granola-prospect.issue-created', { url: issue.url });
 
   // The cloud materializes the github repo into the sandbox (ctx.sandbox.cwd)
-  // via relayfile — no clone. Hand the ask to the coding agent to open a PR.
+  // via relayfile — no clone, no gh/git. The GitHub integration opens the PR.
   const run = await ctx.harness.run({
     cwd: ctx.sandbox.cwd,
-    prompt: `A prospect asked for the following. Implement it as a small PR and open it with \`gh\`; put the PR URL on the last line.\n\nLinear issue: ${issue.url}\n\n${ask.summary}`
+    prompt: `A prospect asked for the following. Comprehensively implement it (every change needed to fully address the ask), then open a GitHub pull request with your changes — the GitHub integration opens it, do not use git or the \`gh\` CLI. Put the PR URL on the last line.\n\nLinear issue: ${issue.url}\n\n${ask.summary}`
   });
 
   const prUrl = run.output.match(/https?:\/\/\S*\/pull\/\d+/g)?.pop();
@@ -75,7 +75,9 @@ async function classify(ctx: WorkforceCtx, transcript: string): Promise<Ask> {
     transcript.slice(0, 8000)
   ].join('\n');
   try {
-    return JSON.parse((await ctx.llm.complete(prompt, { maxTokens: 400 })).trim()) as Ask;
+    // Models often wrap JSON in ```json fences — strip them before parsing.
+    const raw = (await ctx.llm.complete(prompt, { maxTokens: 400 })).replace(/```json\s*|```/g, '').trim();
+    return JSON.parse(raw) as Ask;
   } catch {
     return { isProspect: false, title: '', summary: '' };
   }

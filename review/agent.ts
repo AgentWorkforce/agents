@@ -1,10 +1,14 @@
 /**
  * pr-reviewer handler — review, auto-fix, and shepherd a PR to the finish line.
  *
- *   you approve (pull_request_review.submitted)        → merge the PR.
- *   CI finishes green (check_run.completed)            → nothing to do.
- *   anything else — opened, new commits (synchronize),
- *   a review comment, failed CI, changes requested     → (re)review and fix.
+ *   an authorized approval (pull_request_review.submitted) → merge the PR.
+ *   a check run that finished green (check_run.completed)   → nothing to do.
+ *   anything else — opened, new commits (synchronize), a
+ *   review comment, failed CI, changes requested            → (re)review and fix.
+ *
+ * The PR's repo is materialized into ctx.sandbox.cwd by the cloud via relayfile;
+ * the agent fixes by editing files there (the integration pushes them to the
+ * PR) — no clone, no git/gh.
  */
 import { handler, type WorkforceCtx } from '@agentworkforce/runtime';
 
@@ -13,13 +17,14 @@ interface Pr {
   repo: string;
   number: number;
   url: string;
+  author: string; // github login of whoever opened the PR
 }
 
 export default handler(async (ctx, event) => {
   if (event.source !== 'github' || !ctx.github) return;
 
-  // Your approval is the one signal that ends the loop: merge and stop.
-  if (event.type === 'pull_request_review.submitted' && isApproval(event.payload)) {
+  // An approval from an authorized reviewer ends the loop: merge and stop.
+  if (event.type === 'pull_request_review.submitted' && isApproval(event.payload) && isAuthorizedApprover(ctx, event.payload)) {
     const pr = readPr(event.payload);
     if (pr) await mergePr(ctx, pr);
     return;
@@ -34,35 +39,34 @@ export default handler(async (ctx, event) => {
 });
 
 async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
-  // The cloud materializes the PR's repo into the sandbox (ctx.sandbox.cwd) via
-  // relayfile — no clone. The agent checks out the PR branch itself.
   const run = await ctx.harness.run({
     cwd: ctx.sandbox.cwd,
     prompt: [
-      `Check out pull request #${pr.number} (\`gh pr checkout ${pr.number}\`) in this repo.`,
-      `Review it thoroughly and post your review with \`gh pr review\`.`,
-      `Then proactively FIX what needs changing — your own findings and any other bot reviews on the PR.`,
-      `Resolve failing CI checks and merge conflicts. Commit and push the fixes to the PR branch.`,
-      `When the PR is genuinely ready for a human, finish with the single word: READY`
+      `Review pull request #${pr.number} (its code is checked out here) and post your review.`,
+      `Then proactively FIX everything that needs changing — your own findings and any other bot reviews on the PR —`,
+      `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; your edits`,
+      `are pushed to the PR for you. When the PR is genuinely ready for a human, end your output with READY on its own last line.`
     ].join('\n')
   });
 
-  const user = input(ctx, 'SLACK_USER');
-  if (user && ctx.slack) {
-    const ready = /\bREADY\b/.test(run.output);
-    await ctx.slack.dm(
-      user,
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (channel && ctx.slack) {
+    const ready = lastLine(run.output) === 'READY';
+    const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
+    await ctx.slack.post(
+      channel,
       ready
-        ? `:white_check_mark: PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
-        : `:eyes: Reviewed PR #${pr.number} in *${pr.owner}/${pr.repo}* — still working on it: ${pr.url}`
+        ? `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
+        : `:eyes: ${who} — reviewing PR #${pr.number} in *${pr.owner}/${pr.repo}*, still working on it: ${pr.url}`
     );
   }
 }
 
 async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
+  // `pr.number` is a validated integer (see readPr), safe to interpolate.
   await ctx.sandbox.exec(`gh pr merge ${pr.number} --repo ${shellQuote(`${pr.owner}/${pr.repo}`)} --squash`);
-  const user = input(ctx, 'SLACK_USER');
-  if (user && ctx.slack) await ctx.slack.dm(user, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (channel && ctx.slack) await ctx.slack.post(channel, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
 }
 
 // ── parsing the github webhook payload ──────────────────────────────────────
@@ -72,19 +76,35 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 function readPr(payload: unknown): Pr | undefined {
   const p = payload as {
     number?: number;
-    pull_request?: { number?: number; html_url?: string };
+    pull_request?: { number?: number; html_url?: string; user?: { login?: string } };
     check_run?: { pull_requests?: Array<{ number?: number; html_url?: string }> };
     repository?: { name?: string; owner?: { login?: string } };
+    sender?: { login?: string };
   } | null;
-  const pr = p?.pull_request ?? p?.check_run?.pull_requests?.[0];
-  const number = pr?.number ?? p?.number;
+  const prRef = p?.pull_request ?? p?.check_run?.pull_requests?.[0];
+  const number = prRef?.number ?? p?.number;
   const owner = p?.repository?.owner?.login;
   const repo = p?.repository?.name;
-  if (!number || !owner || !repo) return undefined;
-  return { owner, repo, number, url: pr?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}` };
+  // Validate `number` is a real integer — it's interpolated into a shell command.
+  if (typeof number !== 'number' || !Number.isInteger(number) || !owner || !repo) return undefined;
+  return {
+    owner,
+    repo,
+    number,
+    url: prRef?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}`,
+    author: p?.pull_request?.user?.login ?? p?.sender?.login ?? 'unknown'
+  };
 }
 function isApproval(payload: unknown): boolean {
   return (payload as { review?: { state?: string } } | null)?.review?.state?.toLowerCase() === 'approved';
+}
+/** Honor approvals only from APPROVERS (comma-separated github logins). When
+ *  APPROVERS is unset, any approval merges. */
+function isAuthorizedApprover(ctx: WorkforceCtx, payload: unknown): boolean {
+  const allow = (input(ctx, 'APPROVERS') ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (allow.length === 0) return true;
+  const approver = (payload as { review?: { user?: { login?: string } } } | null)?.review?.user?.login?.toLowerCase();
+  return approver !== undefined && allow.includes(approver);
 }
 /** A finished check run that didn't pass — failure, timed out, cancelled, etc. */
 function ciFailed(payload: unknown): boolean {
@@ -93,6 +113,9 @@ function ciFailed(payload: unknown): boolean {
 }
 
 // ── tiny helpers ────────────────────────────────────────────────────────────
+function lastLine(text: string): string {
+  return text.trimEnd().split('\n').pop()?.trim() ?? '';
+}
 function shellQuote(v: string): string {
   return `'${v.replace(/'/g, `'\\''`)}'`;
 }

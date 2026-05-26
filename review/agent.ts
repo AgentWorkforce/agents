@@ -18,7 +18,18 @@ interface Pr {
   number: number;
   url: string;
   author: string; // github login of whoever opened the PR
+  headSha?: string;
 }
+
+type GithubMergeClient = NonNullable<WorkforceCtx['github']> & {
+  mergePullRequest(args: {
+    owner: string;
+    repo: string;
+    number: number;
+    method?: 'merge' | 'squash' | 'rebase';
+    sha?: string;
+  }): Promise<{ merged: boolean; sha?: string }>;
+};
 
 export default handler(async (ctx, event) => {
   if (event.source !== 'github' || !ctx.github) return;
@@ -63,8 +74,21 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 }
 
 async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
-  // `pr.number` is a validated integer (see readPr), safe to interpolate.
-  await ctx.sandbox.exec(`gh pr merge ${pr.number} --repo ${shellQuote(`${pr.owner}/${pr.repo}`)} --squash`);
+  if (!ctx.github) return;
+  const github = ctx.github as GithubMergeClient;
+  if (typeof github.mergePullRequest !== 'function') {
+    throw new Error('ctx.github.mergePullRequest is required to merge approved pull requests.');
+  }
+  const result = await github.mergePullRequest({
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    method: 'squash',
+    ...(pr.headSha ? { sha: pr.headSha } : {})
+  });
+  if (!result.merged) {
+    throw new Error(`GitHub did not confirm PR #${pr.number} in ${pr.owner}/${pr.repo} was merged.`);
+  }
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel && ctx.slack) await ctx.slack.post(channel, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
 }
@@ -76,8 +100,8 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 function readPr(payload: unknown): Pr | undefined {
   const p = payload as {
     number?: number;
-    pull_request?: { number?: number; html_url?: string; user?: { login?: string } };
-    check_run?: { pull_requests?: Array<{ number?: number; html_url?: string }> };
+    pull_request?: { number?: number; html_url?: string; user?: { login?: string }; head?: { sha?: string } };
+    check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
     repository?: { name?: string; owner?: { login?: string } };
     sender?: { login?: string };
   } | null;
@@ -87,12 +111,14 @@ function readPr(payload: unknown): Pr | undefined {
   const repo = p?.repository?.name;
   // Validate `number` is a real integer — it's interpolated into a shell command.
   if (typeof number !== 'number' || !Number.isInteger(number) || !owner || !repo) return undefined;
+  const headSha = p?.pull_request?.head?.sha ?? p?.check_run?.pull_requests?.[0]?.head_sha;
   return {
     owner,
     repo,
     number,
     url: prRef?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}`,
-    author: p?.pull_request?.user?.login ?? p?.sender?.login ?? 'unknown'
+    author: p?.pull_request?.user?.login ?? p?.sender?.login ?? 'unknown',
+    ...(headSha ? { headSha } : {})
   };
 }
 function isApproval(payload: unknown): boolean {
@@ -115,9 +141,6 @@ function ciFailed(payload: unknown): boolean {
 // ── tiny helpers ────────────────────────────────────────────────────────────
 function lastLine(text: string): string {
   return text.trimEnd().split('\n').pop()?.trim() ?? '';
-}
-function shellQuote(v: string): string {
-  return `'${v.replace(/'/g, `'\\''`)}'`;
 }
 function input(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona.inputSpecs?.[name];

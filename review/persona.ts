@@ -33,7 +33,7 @@ export default definePersona({
   },
 
   harness: 'codex',
-  model: 'gpt-5.4',
+  model: 'gpt-5.5',
   systemPrompt: 'You are a rigorous senior reviewer. Review PRs, fix what you find, keep CI green, and only hand back when the PR is genuinely ready.',
   harnessSettings: {
     reasoning: 'high',

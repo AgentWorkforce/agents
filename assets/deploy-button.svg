@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="263" height="52" viewBox="0 0 263 52" fill="none" role="img" aria-label="Deploy to Agent Relay">
+  <defs>
+    <linearGradient id="btn" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#5AA2D2"/>
+      <stop offset="100%" stop-color="#3C6582"/>
+    </linearGradient>
+    <linearGradient id="txt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#C9DDEE"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#4A90C2" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#4A90C2" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+
+  <!-- on-brand halo glow (echoes banner.svg) -->
+  <ellipse cx="131.5" cy="28" rx="120" ry="26" fill="url(#glow)" filter="url(#soft)"/>
+
+  <!-- button body -->
+  <rect x="4" y="4" width="255" height="44" rx="12" fill="url(#btn)"/>
+  <rect x="4" y="4" width="255" height="44" rx="12" fill="url(#gloss)"/>
+  <rect x="4.5" y="4.5" width="254" height="43" rx="11.5" fill="none" stroke="#C9DDEE" stroke-opacity="0.55"/>
+
+  <!-- Agent Workforce logo mark (lifted from banner.svg, recolored light for contrast on blue) -->
+  <g transform="translate(18 13.5) scale(0.2704) translate(1.058 1.058)">
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M71.3682 21.7098L54.042 39.036C50.6567 42.4213 50.6568 47.9099 54.042 51.2952L71.3727 68.6259L52.8321 87.1665C48.6005 91.3981 41.7397 91.3981 37.5081 87.1665L3.17369 52.8321C-1.05789 48.6005 -1.0579 41.7397 3.17369 37.5081L37.5081 3.17369C41.7397 -1.0579 48.6005 -1.05789 52.8321 3.17369L71.3682 21.7098Z" fill="#FFFFFF"/>
+    <path d="M75.5711 72.8243C78.9563 76.2096 84.445 76.2096 87.8302 72.8243L109.359 51.2952C112.745 47.9099 112.745 42.4213 109.359 39.036L87.8302 17.507C84.445 14.1218 78.9563 14.1218 75.5711 17.507L71.3682 21.7098L88.6989 39.0405C92.0842 42.4258 92.0842 47.9144 88.6989 51.2997L71.3727 68.6259L75.5711 72.8243Z" fill="#BBD9F0"/>
+  </g>
+
+  <!-- label -->
+  <text x="60" y="27.5" font-family="'Sora','Helvetica Neue',Arial,sans-serif" font-weight="700" font-size="17" letter-spacing="0.3" fill="url(#txt)" dominant-baseline="middle">Deploy to Agent Relay</text>
+</svg>

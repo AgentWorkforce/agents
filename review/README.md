@@ -1,9 +1,9 @@
 Review Agent
 ==================
 
-[![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?persona=https://github.com/AgentWorkforce/agents/blob/main/review/persona.ts)
-
 Instantly launch this agent on Agent Relay
+
+[![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?persona=https://github.com/AgentWorkforce/agents/blob/main/review/persona.ts)
 
 A proactive agent that when a PR is opened up posts a multi agent review. If
 the review finds items that needs to be changed it proactively fixes the issues both

@@ -25,12 +25,14 @@ export default handler(async (ctx, event) => {
   if (!token) throw new Error('SPOTIFY_TOKEN is required');
 
   const since = await loadLastCheck(ctx);
-  const releases: Release[] = [];
-  for (const artist of await followedArtists(token)) {
-    for (const r of await latestReleases(token, artist)) {
-      if (r.date > since) releases.push(r);
-    }
-  }
+  const artists = await followedArtists(token);
+
+  // Fetch every artist's releases in parallel; one failing artist shouldn't
+  // sink the whole check.
+  const perArtist = await Promise.allSettled(
+    artists.map((artist) => latestReleases(token, artist))
+  );
+  const releases = perArtist.flatMap((r) => (r.status === 'fulfilled' ? r.value : [])).filter((rel) => rel.date > since);
 
   if (releases.length > 0) await ctx.slack.dm(user, render(releases));
   await saveLastCheck(ctx, today());

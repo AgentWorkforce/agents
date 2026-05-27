@@ -35,11 +35,16 @@ export default handler(async (ctx, event) => {
   await saveVersions(ctx, { ...lastSeen, ...current });
 });
 
-/** Latest published version from the npm registry. */
+/** Latest published version from the npm registry. Returns undefined on any
+ *  failure so one bad/unreachable package doesn't abort the whole sweep. */
 async function latestVersion(pkg: string): Promise<string | undefined> {
-  const res = await fetch(`https://registry.npmjs.org/${encodeURIComponent(pkg)}/latest`);
-  if (!res.ok) return undefined;
-  return ((await res.json()) as { version?: string }).version;
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${encodeURIComponent(pkg)}/latest`);
+    if (!res.ok) return undefined;
+    return ((await res.json()) as { version?: string }).version;
+  } catch {
+    return undefined;
+  }
 }
 
 // ── tiny helpers ────────────────────────────────────────────────────────────

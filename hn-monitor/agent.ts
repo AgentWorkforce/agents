@@ -38,16 +38,22 @@ export default handler(async (ctx, event) => {
   await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
 });
 
-/** Top ~30 front-page stories via the public HN Algolia API. */
+/** Top ~30 front-page stories via the public HN Algolia API. Returns [] on
+ *  any network/parse failure so a transient outage doesn't crash the run. */
 async function fetchFrontPage(): Promise<Story[]> {
-  const res = await fetch('https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30');
-  const data = (await res.json()) as { hits: Array<{ objectID: string; title: string; url: string | null; points: number }> };
-  return data.hits.map((h) => ({
-    id: Number(h.objectID),
-    title: h.title,
-    url: h.url ?? `https://news.ycombinator.com/item?id=${h.objectID}`,
-    points: h.points
-  }));
+  try {
+    const res = await fetch('https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30');
+    if (!res.ok) return [];
+    const data = (await res.json()) as { hits: Array<{ objectID: string; title: string; url: string | null; points: number }> };
+    return data.hits.map((h) => ({
+      id: Number(h.objectID),
+      title: h.title,
+      url: h.url ?? `https://news.ycombinator.com/item?id=${h.objectID}`,
+      points: h.points
+    }));
+  } catch {
+    return [];
+  }
 }
 
 async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<string> {

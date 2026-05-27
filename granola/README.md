@@ -1,7 +1,9 @@
 Granola Agent
 ==================
 
-[![Launch Agent](https://agentrelay.com/launch-agent.svg)](https://agentrelay.com/cloud/deploy?agent=granola-prospect)
+[![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?agent=granola-prospect)
+
+You can instantly launch your own agent on Agent Relay
 
 A proactive agent that responds when a new meeting recording is created, if it is a prospect
 creates a Linear issue with what the prospect wanted and then opens up a PR implementing

@@ -1,7 +1,7 @@
 Review Agent
 ==================
 
-[![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?agent=pr-reviewer)
+[![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?persona=https://github.com/AgentWorkforce/agents/blob/main/review/persona.ts)
 
 Instantly launch this agent on Agent Relay
 

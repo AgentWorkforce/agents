@@ -1,7 +1,7 @@
 Review Agent
 ==================
 
-[![Launch Agent](https://agentrelay.com/launch-agent.svg)](https://agentrelay.com/cloud/deploy?agent=review)
+[![Launch Agent](https://agentrelay.com/launch-agent.svg)](https://agentrelay.com/cloud/deploy?agent=pr-reviewer)
 
 A proactive agent that when a PR is opened up posts a multi agent review. If
 the review finds items that needs to be changed it proactively fixes the issues both

@@ -3,7 +3,7 @@ Review Agent
 
 [![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?agent=pr-reviewer)
 
-You can instantly launch your own agent on Agent Relay
+Instantly launch this agent on Agent Relay
 
 A proactive agent that when a PR is opened up posts a multi agent review. If
 the review finds items that needs to be changed it proactively fixes the issues both

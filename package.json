@@ -1,0 +1,19 @@
+{
+  "name": "agent-workforce-agents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A collection of proactive agents — showcase examples for Agent Workforce.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done"
+  },
+  "dependencies": {
+    "@agentworkforce/persona-kit": "^3.0.24",
+    "@agentworkforce/runtime": "^3.0.24"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.6.0"
+  }
+}

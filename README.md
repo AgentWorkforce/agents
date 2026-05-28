@@ -16,6 +16,7 @@ it does). The persona compiles to `persona.json`; deploy with
 | [**granola**](granola/) | a new Granola note (Nango sync → `file.created`) | Detects prospect calls, files a Linear issue with the ask, and opens a GitHub PR implementing it. |
 | [**hn-monitor**](hn-monitor/) | schedule (2×/day) | Scans Hacker News for your topics and posts a digest to Slack. |
 | [**linear**](linear/) | Linear `issue.create` (labelled) / `comment.create` | Implements the issue and opens a GitHub PR; comments the PR link back. |
+| [**repo-hygiene**](repo-hygiene/) | GitHub PR opened / updated | Diagnoses duplicated/dead code, divergent paths, stale skills/rules/docs, and code smells; comments findings and journals the run to Notion. |
 | [**review**](review/) | GitHub PR opened / updated / reviewed / CI finished | Reviews the PR, fixes the issues it (and other bots) find, resolves failing CI and merge conflicts, DMs you when it's ready, and merges once you approve. |
 | [**spotify-releases**](spotify-releases/) | schedule (daily) | Checks for new releases from artists you follow and DMs them to you. |
 | [**vendor-monitor**](vendor-monitor/) | schedule (weekday mornings) | Watches the vendors in your stack for new releases and posts changes to your team channel. |

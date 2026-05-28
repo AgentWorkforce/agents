@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="./card.png" alt="Granola Prospect Agent graphic" width="720">
-</p>
+<img src="./banner.png" alt="Granola Prospect Agent">
 
 Granola Agent
 ==================

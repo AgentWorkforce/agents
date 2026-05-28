@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="./card.png" alt="PR Reviewer graphic" width="720">
-</p>
+<img src="./banner.png" alt="PR Reviewer">
 
 Review Agent
 ==================

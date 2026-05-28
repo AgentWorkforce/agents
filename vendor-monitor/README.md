@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="./card.png" alt="Vendor Monitor graphic" width="720">
-</p>
+<img src="./banner.png" alt="Vendor Monitor">
 
 Vendor Monitor
 ==================

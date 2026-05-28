@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="./card.png" alt="Spotify Releases graphic" width="720">
-</p>
+<img src="./banner.png" alt="Spotify Releases">
 
 Spotify Releases
 ==================

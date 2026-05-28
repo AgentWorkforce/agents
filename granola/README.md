@@ -1,6 +1,7 @@
 <p align="center">
-  <img src="./card.png" alt="Granola Prospect Agent graphic" width="900">
+  <img src="./card.png" alt="Granola Prospect Agent graphic" width="720">
 </p>
+
 Granola Agent
 ==================
 

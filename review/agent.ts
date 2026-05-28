@@ -67,12 +67,20 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
     ].join('\n')
   });
 
+  const exitCode = (run as { exitCode?: unknown }).exitCode;
+  if (typeof exitCode === 'number' && exitCode !== 0) {
+    await failReviewRun(ctx, pr, `The review harness exited with code ${exitCode}.`);
+  }
+
   // The harness only writes a review when we explicitly post it. Strip the
   // READY sentinel (it's the slack/ready signal, not a review-body line) and
   // post whatever's left as a PR comment via ctx.github.comment.
   const raw = (run.output ?? '').trimEnd();
   const ready = lastLine(raw) === 'READY';
   const body = ready ? stripLastLine(raw).trimEnd() : raw;
+  if (!body) {
+    await failReviewRun(ctx, pr, 'The review harness produced no review output.');
+  }
   if (body && ctx.github?.comment) {
     await ctx.github.comment(
       { owner: pr.owner, repo: pr.repo, number: pr.number },
@@ -90,6 +98,34 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
         : `:eyes: ${who} — reviewing PR #${pr.number} in *${pr.owner}/${pr.repo}*, still working on it: ${pr.url}`
     );
   }
+}
+
+async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<never> {
+  const message = [
+    `pr-reviewer could not complete review for #${pr.number} in ${pr.owner}/${pr.repo}.`,
+    reason,
+    'No review was posted; this needs operator attention.',
+  ].join('\n');
+  ctx.log?.('error', 'pr-reviewer harness failed', {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    reason,
+  });
+  if (ctx.github?.comment) {
+    await ctx.github.comment(
+      { owner: pr.owner, repo: pr.repo, number: pr.number },
+      message,
+    );
+  }
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (channel && ctx.slack) {
+    await ctx.slack.post(
+      channel,
+      `:warning: pr-reviewer failed for PR #${pr.number} in *${pr.owner}/${pr.repo}*: ${reason}`,
+    );
+  }
+  throw new Error(message);
 }
 
 async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {

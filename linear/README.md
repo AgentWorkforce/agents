@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="./card.png" alt="Linear Implementer graphic" width="900">
+</p>
 Linear Agent
 ==================
 

@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="./card.png" alt="HN Monitor graphic" width="900">
+</p>
 Hacker News Monitor
 ==================
 
@@ -7,4 +10,3 @@ Instantly launch this agent on Agent Relay
 
 A proactive agent that scans hacker news posts for relevant topics that we decide
 and posts to Slack a summary of them.
-

@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="./card.png" alt="Spotify Releases graphic" width="900">
+</p>
 Spotify Releases
 ==================
 

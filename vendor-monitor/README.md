@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="./card.png" alt="Vendor Monitor graphic" width="900">
+</p>
 Vendor Monitor
 ==================
 

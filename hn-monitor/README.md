@@ -1,6 +1,7 @@
 <p align="center">
-  <img src="./card.png" alt="HN Monitor graphic" width="900">
+  <img src="./card.png" alt="HN Monitor graphic" width="720">
 </p>
+
 Hacker News Monitor
 ==================
 

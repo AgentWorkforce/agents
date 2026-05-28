@@ -6,9 +6,9 @@
  *   anything else — opened, new commits (synchronize), a
  *   review comment, failed CI, changes requested            → (re)review and fix.
  *
- * The PR's repo is materialized into ctx.sandbox.cwd by the cloud via relayfile;
- * the agent fixes by editing files there (the integration pushes them to the
- * PR) — no clone, no git/gh.
+ * The PR's repo is materialized into ctx.sandbox.cwd by cloud before the
+ * harness runs. The agent fixes by editing files there; cloud commits and
+ * pushes those edits after the harness exits — no git/gh in the harness.
  */
 import { handler, type WorkforceCtx } from '@agentworkforce/runtime';
 
@@ -60,10 +60,12 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   const run = await ctx.harness.run({
     cwd: ctx.sandbox.cwd,
     prompt: [
-      `Review pull request #${pr.number} (its code is checked out here) and post your review.`,
+      `Review pull request #${pr.number} in ${pr.owner}/${pr.repo}. The PR code is checked out in the current directory.`,
+      `Focus on the actual PR changes: read .workforce/pr.diff first, then .workforce/changed-files.txt and .workforce/context.json.`,
+      `Use the checkout for surrounding context, but do not review unrelated files outside the changed-file set unless needed to understand the diff.`,
       `Then proactively FIX everything that needs changing — your own findings and any other bot reviews on the PR —`,
-      `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; your edits`,
-      `are pushed to the PR for you. When the PR is genuinely ready for a human, end your output with READY on its own last line.`
+      `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; cloud commits`,
+      `and pushes your file edits to the PR after this run. When the PR is genuinely ready for a human, end your output with READY on its own last line.`
     ].join('\n')
   });
 

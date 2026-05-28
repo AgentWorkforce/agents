@@ -50,12 +50,18 @@ export default handler(async (ctx, event) => {
   const body = renderPrComment(pr, report);
 
   await ctx.github.comment(pr, body);
-  const notionPage = await writeNotionJournal(ctx, pr, event, report, body);
-  await rememberRun(ctx, pr, event, report, notionPage.url);
+  let notionUrl: string | undefined;
+  try {
+    const notionPage = await writeNotionJournal(ctx, pr, event, report, body);
+    notionUrl = notionPage.url;
+    await rememberRun(ctx, pr, event, report, notionUrl);
+  } catch (error) {
+    ctx.log('warn', 'repo-hygiene.journal-failed', { error: serializeError(error) });
+  }
 
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel && ctx.slack) {
-    await ctx.slack.post(channel, renderSlackSummary(pr, report, notionPage.url));
+    await ctx.slack.post(channel, renderSlackSummary(pr, report, notionUrl));
   }
 });
 
@@ -96,7 +102,8 @@ function readPr(event: WorkforceProviderEvent): PrRef | undefined {
 
 async function diagnose(ctx: WorkforceCtx, pr: PrRef, diff: string): Promise<HygieneReport> {
   const diffBudget = Number(input(ctx, 'MAX_DIFF_CHARS') ?? '40000');
-  const boundedDiff = diff.slice(0, Number.isFinite(diffBudget) ? Math.max(4000, diffBudget) : 40000);
+  const maxDiffChars = Number.isFinite(diffBudget) ? Math.min(40000, Math.max(0, Math.floor(diffBudget))) : 40000;
+  const boundedDiff = diff.slice(0, maxDiffChars);
   const repoHints = await collectRepoHints(ctx);
   const priorMemory = await recallPriorMemory(ctx, pr);
 
@@ -319,6 +326,17 @@ function renderSlackSummary(pr: PrRef, report: HygieneReport, notionUrl?: string
 
 function label(severity: Finding['severity']): string {
   return severity === 'high' ? 'High' : severity === 'medium' ? 'Medium' : 'Low';
+}
+
+function serializeError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack
+    };
+  }
+  return { message: String(error) };
 }
 
 function input(ctx: WorkforceCtx, name: string): string | undefined {

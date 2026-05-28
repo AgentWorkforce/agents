@@ -31,12 +31,14 @@ export default definePersona({
   inputs: {
     SLACK_CHANNEL: {
       description: 'Slack channel to post review updates to (the message references the PR author).',
-      env: 'SLACK_CHANNEL'
+      env: 'SLACK_CHANNEL',
+      picker: { provider: 'slack', resource: 'channels' }
     },
     APPROVERS: {
-      description: 'Comma-separated GitHub logins whose approval merges the PR. If unset, any approval merges.',
+      description: 'GitHub logins whose approval merges the PR. If unset, any approval merges.',
       env: 'APPROVERS',
-      optional: true
+      optional: true,
+      picker: { provider: 'github', resource: 'users' }
     }
   },
 

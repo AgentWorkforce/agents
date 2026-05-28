@@ -1,6 +1,7 @@
 <p align="center">
-  <img src="./card.png" alt="Repo Hygiene graphic" width="900">
+  <img src="./card.png" alt="Repo Hygiene graphic" width="720">
 </p>
+
 Repo Hygiene Agent
 ==================
 

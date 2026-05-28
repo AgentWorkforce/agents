@@ -1,0 +1,4 @@
+interface:
+  display_name: "Generate Agent Graphics"
+  short_description: "Create memorable graphics for agents."
+  default_prompt: "Use $generate-agent-graphics to generate avatar, card, and README banner graphics for each agent in this repo."

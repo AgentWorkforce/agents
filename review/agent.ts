@@ -46,7 +46,14 @@ export default handler(async (ctx, event) => {
 
   // Everything else is a reason to (re)review and push fixes.
   const pr = readPr(event.payload);
-  if (pr) await reviewAndFix(ctx, pr);
+  if (pr) {
+    await reviewAndFix(ctx, pr);
+  } else if (event.type === 'check_run.completed') {
+    // GitHub sometimes emits check_run.completed with pull_requests: [] for
+    // fork PRs and org-level checks; surface so a "silent no-op" isn't
+    // mistaken for "PR review skipped on purpose".
+    ctx.log?.('info', 'check_run.completed with no associated PR; skipping', { eventId: event.id });
+  }
 });
 
 async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
@@ -60,9 +67,21 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
     ].join('\n')
   });
 
+  // The harness only writes a review when we explicitly post it. Strip the
+  // READY sentinel (it's the slack/ready signal, not a review-body line) and
+  // post whatever's left as a PR comment via ctx.github.comment.
+  const raw = (run.output ?? '').trimEnd();
+  const ready = lastLine(raw) === 'READY';
+  const body = ready ? stripLastLine(raw).trimEnd() : raw;
+  if (body && ctx.github?.comment) {
+    await ctx.github.comment(
+      { owner: pr.owner, repo: pr.repo, number: pr.number },
+      body
+    );
+  }
+
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel && ctx.slack) {
-    const ready = lastLine(run.output) === 'READY';
     const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
     await ctx.slack.post(
       channel,
@@ -141,6 +160,10 @@ function ciFailed(payload: unknown): boolean {
 // ── tiny helpers ────────────────────────────────────────────────────────────
 function lastLine(text: string): string {
   return text.trimEnd().split('\n').pop()?.trim() ?? '';
+}
+function stripLastLine(text: string): string {
+  const i = text.lastIndexOf('\n');
+  return i < 0 ? '' : text.slice(0, i);
 }
 function input(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona.inputSpecs?.[name];

@@ -65,7 +65,9 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
       `Use the checkout for surrounding context, but do not review unrelated files outside the changed-file set unless needed to understand the diff.`,
       `Then proactively FIX everything that needs changing — your own findings and any other bot reviews on the PR —`,
       `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; cloud commits`,
-      `and pushes your file edits to the PR after this run. When the PR is genuinely ready for a human, end your output with READY on its own last line.`
+      `and pushes your file edits to the PR after this run. In your output, do not claim that fixes were pushed,`,
+      `a GitHub review was submitted, or CI was verified; those are post-harness actions that cloud reports separately.`,
+      `When the PR is genuinely ready for a human after your local review and edits, end your output with READY on its own last line.`
     ].join('\n')
   });
 

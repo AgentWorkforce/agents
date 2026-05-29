@@ -62,7 +62,8 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
     prompt: [
       `Review pull request #${pr.number} in ${pr.owner}/${pr.repo}. The PR code is checked out in the current directory.`,
       `Focus on the actual PR changes: read .workforce/pr.diff first, then .workforce/changed-files.txt and .workforce/context.json.`,
-      `Use the checkout for surrounding context, but do not review unrelated files outside the changed-file set unless needed to understand the diff.`,
+      `Use the checked-out repo to trace the impact of this diff across callers, types, tests, config, and related files.`,
+      `Flag and fix breakage even when the affected file is outside the changed-file set, but do not do an unrelated full-repo audit.`,
       `Then proactively FIX everything that needs changing — your own findings and any other bot reviews on the PR —`,
       `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; cloud commits`,
       `and pushes your file edits to the PR after this run. In your output, do not claim that fixes were pushed,`,

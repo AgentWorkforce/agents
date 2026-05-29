@@ -48,8 +48,9 @@ export default definePersona({
   harnessSettings: {
     reasoning: 'high',
     timeoutSeconds: 2400,
-    sandboxMode: 'workspace-write',
-    workspaceWriteNetworkAccess: true
+    // Daytona is the trust boundary for cloud fires. Codex's nested
+    // bubblewrap sandbox requires user namespaces that Daytona does not allow.
+    dangerouslyBypassApprovalsAndSandbox: true
   },
 
   onEvent: './agent.ts'

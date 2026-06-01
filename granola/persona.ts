@@ -17,7 +17,7 @@ export default definePersona({
     // Granola has no realtime webhook yet, so notes arrive via the Nango
     // `granola-relay:fetch-notes` sync, which writes each note to the VFS at
     // /granola/notes/<id>.json and fires a storage `file.created` event.
-    granola: { triggers: [{ on: 'file.created' }] },
+    granola: {},
     linear: {},
     // The cloud materializes this repo into the sandbox (ctx.sandbox.cwd) via
     // relayfile — the agent never clones it.

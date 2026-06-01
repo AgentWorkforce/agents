@@ -12,19 +12,8 @@ export default definePersona({
   description: 'Reviews new PRs, fixes the issues found (its own + other bots\'), resolves failing CI and merge conflicts, pings you on Slack when ready, and merges once you approve.',
   cloud: true,
 
-  // Re-review on every PR change (open, new commits, review comments, finished
-  // CI), and merge when you approve. Every `on` value autocompletes from
-  // github's catalog (see relayfile-adapters DEFAULT_SUPPORTED_EVENTS).
   integrations: {
-    github: {
-      triggers: [
-        { on: 'pull_request.opened' },
-        { on: 'pull_request_review.submitted' },
-        { on: 'pull_request_review_comment.created' },
-        { on: 'check_run.completed' },
-        { on: 'pull_request.synchronize' }
-      ]
-    },
+    github: {},
     slack: {}
   },
 

@@ -6,7 +6,7 @@
  *     → keep releases newer than the last check (durable memory)
  *     → DM the list on Slack
  */
-import { handler, type WorkforceCtx } from '@agentworkforce/runtime';
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
 
 interface Release {
   name: string;
@@ -15,7 +15,9 @@ interface Release {
   url: string;
 }
 
-export default handler(async (ctx, event) => {
+export default defineAgent({
+  schedules: [{ name: 'check', cron: '0 10 * * *', tz: 'America/New_York' }],
+  handler: async (ctx, event) => {
   if (event.source !== 'cron') return;
   if (!ctx.slack) throw new Error('spotify-releases requires the slack integration');
 
@@ -36,6 +38,7 @@ export default handler(async (ctx, event) => {
 
   if (releases.length > 0) await ctx.slack.dm(user, render(releases));
   await saveLastCheck(ctx, today());
+  }
 });
 
 async function followedArtists(token: string): Promise<Array<{ id: string; name: string }>> {

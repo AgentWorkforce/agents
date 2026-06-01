@@ -14,12 +14,7 @@ export default definePersona({
   useSubscription: true,
 
   integrations: {
-    github: {
-      triggers: [
-        { on: 'pull_request.opened' },
-        { on: 'pull_request.synchronize' }
-      ]
-    },
+    github: {},
     notion: {},
     slack: {}
   },

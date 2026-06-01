@@ -6,9 +6,12 @@
  *     → compare to the version we saw last time (durable memory)
  *     → post any bumps to the team Slack channel
  */
-import { handler, type WorkforceCtx } from '@agentworkforce/runtime';
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
 
-export default handler(async (ctx, event) => {
+export default defineAgent({
+  // Weekday mornings.
+  schedules: [{ name: 'check', cron: '0 8 * * 1-5', tz: 'America/New_York' }],
+  handler: async (ctx, event) => {
   if (event.source !== 'cron') return;
   if (!ctx.slack) throw new Error('vendor-monitor requires the slack integration');
 
@@ -33,6 +36,7 @@ export default handler(async (ctx, event) => {
     await ctx.slack.post(channel, `:package: *Vendor updates*\n${bumps.join('\n')}`);
   }
   await saveVersions(ctx, { ...lastSeen, ...current });
+  }
 });
 
 /** Latest published version from the npm registry. Returns undefined on any

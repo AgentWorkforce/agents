@@ -8,7 +8,7 @@
  *     -> create a Notion journal page for the run
  *     -> optionally post a Slack summary
  */
-import { handler, type WorkforceCtx, type WorkforceProviderEvent } from '@agentworkforce/runtime';
+import { defineAgent, type WorkforceCtx, type WorkforceProviderEvent } from '@agentworkforce/runtime';
 
 interface PrRef {
   owner: string;
@@ -36,7 +36,14 @@ interface HygieneReport {
   confidence: 'high' | 'medium' | 'low';
 }
 
-export default handler(async (ctx, event) => {
+export default defineAgent({
+  triggers: {
+    github: [
+      { on: 'pull_request.opened' },
+      { on: 'pull_request.synchronize' }
+    ]
+  },
+  handler: async (ctx, event) => {
   if (event.source !== 'github') return;
   if (event.type !== 'pull_request.opened' && event.type !== 'pull_request.synchronize') return;
   if (!ctx.github) throw new Error('repo-hygiene requires the github integration');
@@ -62,6 +69,7 @@ export default handler(async (ctx, event) => {
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel && ctx.slack) {
     await ctx.slack.post(channel, renderSlackSummary(pr, report, notionUrl));
+  }
   }
 });
 

@@ -11,7 +11,6 @@ export default definePersona({
   description: 'Checks daily for new releases from artists you follow on Spotify and DMs you about them.',
   cloud: true,
 
-  schedules: [{ name: 'check', cron: '0 10 * * *', tz: 'America/New_York' }],
   integrations: { slack: {} },
 
   inputs: {

@@ -7,7 +7,7 @@
  *     → summarize with ctx.llm
  *     → post to Slack
  */
-import { handler, type WorkforceCtx } from '@agentworkforce/runtime';
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
 
 interface Story {
   id: number;
@@ -16,7 +16,10 @@ interface Story {
   points: number;
 }
 
-export default handler(async (ctx, event) => {
+export default defineAgent({
+  // Runs on a clock (09:00 & 17:00), not an event. No triggers needed.
+  schedules: [{ name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' }],
+  handler: async (ctx, event) => {
   if (event.source !== 'cron') return;
   if (!ctx.slack) throw new Error('hn-monitor requires the slack integration');
 
@@ -36,6 +39,7 @@ export default handler(async (ctx, event) => {
 
   await ctx.slack.post(channel, await summarize(ctx, fresh));
   await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
+  }
 });
 
 /** Top ~30 front-page stories via the public HN Algolia API. Returns [] on

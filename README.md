@@ -23,7 +23,7 @@ it does). The persona compiles to `persona.json`; deploy with
 
 ## How they're built
 
-- **Typed authoring.** Personas use `definePersona` from `@agentworkforce/persona-kit`, so `integrations.<provider>.triggers[].on` autocompletes the provider's real events and is linted at deploy.
+- **Typed authoring.** Personas use `definePersona` from `@agentworkforce/persona-kit` (identity, runtime, integration connections); agents use `defineAgent` from `@agentworkforce/runtime` for triggers/schedules + the handler, so `triggers.<provider>[].on` autocompletes the provider's real events and is linted at deploy.
 - **Integrations are VFS-backed.** Agents read/write providers (Slack, Linear, GitHub, Gmail/Google-Mail, Granola…) through the Relayfile VFS and the typed `ctx` clients — no direct API calls or tokens to manage.
 - **Repos are materialized, not cloned.** For agents that touch code, the cloud materializes the GitHub repo into the sandbox (`ctx.sandbox.cwd`) via Relayfile, so handlers never run `git clone` — they just hand the work to the coding agent (`ctx.harness.run`).
 

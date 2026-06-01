@@ -9,9 +9,17 @@
  * The repo is already in the sandbox: the cloud materializes the github
  * integration's repo into ctx.sandbox.cwd via relayfile, so there's no clone.
  */
-import { handler, type WorkforceCtx } from '@agentworkforce/runtime';
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
 
-export default handler(async (ctx, event) => {
+export default defineAgent({
+  // Two Linear triggers — `on` autocompletes Linear's catalog events.
+  triggers: {
+    linear: [
+      { on: 'issue.create', match: 'agentrelay' }, // new issues labelled "agentrelay"
+      { on: 'comment.create' } // …or a comment that @-mentions the agent (handler enforces MENTION + skips its own replies)
+    ]
+  },
+  handler: async (ctx, event) => {
   if (event.source !== 'linear') return;
   if (!ctx.linear) throw new Error('linear-implementer requires the linear integration');
 
@@ -46,6 +54,7 @@ export default handler(async (ctx, event) => {
     issueId,
     prUrl ? `:rocket: Opened a PR: ${prUrl}` : "I worked on this but couldn't open a PR — check the run logs."
   );
+  }
 });
 
 /** The issue id for this event. For `comment.create`, `data.id` is the COMMENT

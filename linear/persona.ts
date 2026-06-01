@@ -12,14 +12,8 @@ export default definePersona({
   cloud: true,
   useSubscription: true,
 
-  // Two Linear triggers — `on` autocompletes Linear's catalog events.
   integrations: {
-    linear: {
-      triggers: [
-        { on: 'issue.create', match: 'agentrelay' }, // new issues labelled "agentrelay"
-        { on: 'comment.create' } // …or a comment that @-mentions the agent (handler enforces MENTION + skips its own replies)
-      ]
-    },
+    linear: {},
     // Default repo the cloud materializes into the sandbox (ctx.sandbox.cwd)
     // via relayfile — the agent never clones. If the issue names its own repo,
     // the handler parses it and points the coding agent there instead.

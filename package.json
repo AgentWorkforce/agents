@@ -9,8 +9,8 @@
     "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done"
   },
   "dependencies": {
-    "@agentworkforce/persona-kit": "^3.0.24",
-    "@agentworkforce/runtime": "^3.0.24"
+    "@agentworkforce/persona-kit": "^3.0.38",
+    "@agentworkforce/runtime": "^3.0.38"
   },
   "devDependencies": {
     "@types/node": "^22",

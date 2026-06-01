@@ -17,9 +17,8 @@ interface Ask {
 export default defineAgent({
   triggers: { granola: [{ on: 'file.created' }] },
   handler: async (ctx, event) => {
-  // Notes arrive via the Nango sync as storage events; the clock isn't one.
-  if (event.source === 'cron') return;
-
+  // Notes arrive via the Nango sync as storage events (defineAgent narrows
+  // `event` to the declared granola trigger, so there's no clock case here).
   const notePath = readNotePath(event.payload);
   if (!notePath || !notePath.includes('/granola/notes/')) return; // ignore folders/other writes
   if (!ctx.linear) throw new Error('granola-prospect requires the linear integration');

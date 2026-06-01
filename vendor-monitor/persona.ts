@@ -11,8 +11,6 @@ export default definePersona({
   description: 'Watches the vendors in your stack for new releases and posts the changes to your team Slack channel.',
   cloud: true,
 
-  // Weekday mornings.
-  schedules: [{ name: 'check', cron: '0 8 * * 1-5', tz: 'America/New_York' }],
   integrations: { slack: {} },
 
   inputs: {

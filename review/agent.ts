@@ -10,7 +10,7 @@
  * harness runs. The agent fixes by editing files there; cloud commits and
  * pushes those edits after the harness exits — no git/gh in the harness.
  */
-import { handler, type WorkforceCtx } from '@agentworkforce/runtime';
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
 
 interface Pr {
   owner: string;
@@ -31,7 +31,20 @@ type GithubMergeClient = NonNullable<WorkforceCtx['github']> & {
   }): Promise<{ merged: boolean; sha?: string }>;
 };
 
-export default handler(async (ctx, event) => {
+export default defineAgent({
+  // Re-review on every PR change (open, new commits, review comments, finished
+  // CI), and merge when you approve. Every `on` value autocompletes from
+  // github's catalog (see relayfile-adapters DEFAULT_SUPPORTED_EVENTS).
+  triggers: {
+    github: [
+      { on: 'pull_request.opened' },
+      { on: 'pull_request_review.submitted' },
+      { on: 'pull_request_review_comment.created' },
+      { on: 'check_run.completed' },
+      { on: 'pull_request.synchronize' }
+    ]
+  },
+  handler: async (ctx, event) => {
   if (event.source !== 'github' || !ctx.github) return;
 
   // An approval from an authorized reviewer ends the loop: merge and stop.
@@ -53,6 +66,7 @@ export default handler(async (ctx, event) => {
     // fork PRs and org-level checks; surface so a "silent no-op" isn't
     // mistaken for "PR review skipped on purpose".
     ctx.log?.('info', 'check_run.completed with no associated PR; skipping', { eventId: event.id });
+  }
   }
 });
 

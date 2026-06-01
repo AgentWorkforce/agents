@@ -11,9 +11,6 @@ export default definePersona({
   description: 'Scans Hacker News a few times a day for topics you care about and posts a summary to Slack.',
   cloud: true,
 
-  // Runs on a clock (09:00 & 17:00), not an event. No triggers needed.
-  schedules: [{ name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' }],
-
   // `slack` gives the handler the ctx.slack client to post the digest.
   integrations: { slack: {} },
 

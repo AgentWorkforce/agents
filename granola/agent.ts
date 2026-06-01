@@ -6,7 +6,7 @@
  *     → ask the model "is this a prospect call, and what did they ask for?"
  *     → if yes: file a Linear issue, then have the coding agent open a PR for it
  */
-import { handler, type WorkforceCtx } from '@agentworkforce/runtime';
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
 
 interface Ask {
   isProspect: boolean;
@@ -14,7 +14,9 @@ interface Ask {
   summary: string;
 }
 
-export default handler(async (ctx, event) => {
+export default defineAgent({
+  triggers: { granola: [{ on: 'file.created' }] },
+  handler: async (ctx, event) => {
   // Notes arrive via the Nango sync as storage events; the clock isn't one.
   if (event.source === 'cron') return;
 
@@ -44,6 +46,7 @@ export default handler(async (ctx, event) => {
 
   const prUrl = run.output.match(/https?:\/\/\S*\/pull\/\d+/g)?.pop();
   if (prUrl) await ctx.linear.comment(issue.id, `:rocket: Implementation PR: ${prUrl}`);
+  }
 });
 
 /** A storage `file.created` event carries the VFS path of the file that landed. */

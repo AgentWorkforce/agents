@@ -19,6 +19,7 @@ import {
   type WorkforceCtx,
   type WorkforceProviderEvent
 } from '@agentworkforce/runtime';
+import { githubClient, slackClient } from '@relayfile/relay-helpers';
 
 function vfsClient(): IntegrationClientOptions {
   return { relayfileMountRoot: resolveMountRoot({}) };
@@ -84,13 +85,7 @@ export default defineAgent({
   const report = await diagnose(ctx, pr, details.diff ?? '');
   const body = renderPrComment(pr, report);
 
-  await writeJsonFile(
-    client,
-    'github',
-    'comment',
-    `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/issues/${pr.number}/comments/${draftFile('comment')}`,
-    { body }
-  );
+  await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
   let notionUrl: string | undefined;
   try {
     const notionPage = await writeNotionJournal(ctx, client, pr, event, report, body);
@@ -102,13 +97,7 @@ export default defineAgent({
 
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel) {
-    await writeJsonFile(
-      client,
-      'slack',
-      'post',
-      `/slack/channels/${encodeSegment(channel)}/messages/${draftFile('message')}`,
-      { text: renderSlackSummary(pr, report, notionUrl) }
-    );
+    await slackClient().post(channel, renderSlackSummary(pr, report, notionUrl));
   }
   }
 });

@@ -6,19 +6,8 @@
  *     → keep releases newer than the last check (durable memory)
  *     → DM the list on Slack
  */
-import {
-  defineAgent,
-  draftFile,
-  encodeSegment,
-  resolveMountRoot,
-  writeJsonFile,
-  type IntegrationClientOptions,
-  type WorkforceCtx
-} from '@agentworkforce/runtime';
-
-function vfsClient(): IntegrationClientOptions {
-  return { relayfileMountRoot: resolveMountRoot({}) };
-}
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import { slackClient } from '@relayfile/relay-helpers';
 
 interface Release {
   name: string;
@@ -48,13 +37,7 @@ export default defineAgent({
   const releases = perArtist.flatMap((r) => (r.status === 'fulfilled' ? r.value : [])).filter((rel) => rel.date > since);
 
   if (releases.length > 0) {
-    await writeJsonFile(
-      vfsClient(),
-      'slack',
-      'dm',
-      `/slack/users/${encodeSegment(user)}/messages/${draftFile('dm')}`,
-      { text: render(releases) }
-    );
+    await slackClient().dm(user, render(releases));
   }
   await saveLastCheck(ctx, today());
   }

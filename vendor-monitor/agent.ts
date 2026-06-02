@@ -6,19 +6,8 @@
  *     → compare to the version we saw last time (durable memory)
  *     → post any bumps to the team Slack channel
  */
-import {
-  defineAgent,
-  draftFile,
-  encodeSegment,
-  resolveMountRoot,
-  writeJsonFile,
-  type IntegrationClientOptions,
-  type WorkforceCtx
-} from '@agentworkforce/runtime';
-
-function vfsClient(): IntegrationClientOptions {
-  return { relayfileMountRoot: resolveMountRoot({}) };
-}
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import { slackClient } from '@relayfile/relay-helpers';
 
 export default defineAgent({
   // Weekday mornings.
@@ -44,13 +33,7 @@ export default defineAgent({
   }
 
   if (bumps.length > 0) {
-    await writeJsonFile(
-      vfsClient(),
-      'slack',
-      'post',
-      `/slack/channels/${encodeSegment(channel)}/messages/${draftFile('message')}`,
-      { text: `:package: *Vendor updates*\n${bumps.join('\n')}` }
-    );
+    await slackClient().post(channel, `:package: *Vendor updates*\n${bumps.join('\n')}`);
   }
   await saveVersions(ctx, { ...lastSeen, ...current });
   }

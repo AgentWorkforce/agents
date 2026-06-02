@@ -7,19 +7,8 @@
  *     → summarize with ctx.llm
  *     → post to Slack
  */
-import {
-  defineAgent,
-  draftFile,
-  encodeSegment,
-  resolveMountRoot,
-  writeJsonFile,
-  type IntegrationClientOptions,
-  type WorkforceCtx
-} from '@agentworkforce/runtime';
-
-function vfsClient(): IntegrationClientOptions {
-  return { relayfileMountRoot: resolveMountRoot({}) };
-}
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import { slackClient } from '@relayfile/relay-helpers';
 
 interface Story {
   id: number;
@@ -48,13 +37,7 @@ export default defineAgent({
     return;
   }
 
-  await writeJsonFile(
-    vfsClient(),
-    'slack',
-    'post',
-    `/slack/channels/${encodeSegment(channel)}/messages/${draftFile('message')}`,
-    { text: await summarize(ctx, fresh) }
-  );
+  await slackClient().post(channel, await summarize(ctx, fresh));
   await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
   }
 });

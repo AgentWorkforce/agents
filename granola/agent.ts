@@ -6,19 +6,8 @@
  *     → ask the model "is this a prospect call, and what did they ask for?"
  *     → if yes: file a Linear issue, then have the coding agent open a PR for it
  */
-import {
-  defineAgent,
-  draftFile,
-  encodeSegment,
-  resolveMountRoot,
-  writeJsonFile,
-  type IntegrationClientOptions,
-  type WorkforceCtx
-} from '@agentworkforce/runtime';
-
-function vfsClient(): IntegrationClientOptions {
-  return { relayfileMountRoot: resolveMountRoot({}) };
-}
+import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import { relayClient } from '@relayfile/relay-helpers';
 
 interface Ask {
   isProspect: boolean;
@@ -44,14 +33,8 @@ export default defineAgent({
   }
 
   const teamId = await resolveTeamId(ctx);
-  const client = vfsClient();
-  const created = await writeJsonFile(
-    client,
-    'linear',
-    'createIssue',
-    `/linear/issues/${draftFile('create issue')}`,
-    { teamId, title: ask.title, description: ask.summary }
-  );
+  const linear = relayClient('linear');
+  const created = await linear.write('issues', {}, { teamId, title: ask.title, description: ask.summary });
   // The writeback worker returns a receipt carrying the real issue URL/id once
   // the Linear create lands. Without a receipt we can't link the issue or
   // address a follow-up comment, so log and continue with the implementation.
@@ -72,13 +55,7 @@ export default defineAgent({
 
   const prUrl = run.output.match(/https?:\/\/\S*\/pull\/\d+/g)?.pop();
   if (prUrl && issueId) {
-    await writeJsonFile(
-      client,
-      'linear',
-      'comment',
-      `/linear/issues/${encodeSegment(issueId)}/comments/${draftFile('comment')}`,
-      { body: `:rocket: Implementation PR: ${prUrl}` }
-    );
+    await linear.write('comments', { issueId }, { body: `:rocket: Implementation PR: ${prUrl}` });
   } else if (prUrl) {
     ctx.log('warn', 'granola-prospect.comment-skipped.no-issue-id', { prUrl, draftPath: created.path });
   }

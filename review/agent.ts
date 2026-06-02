@@ -12,13 +12,9 @@
  */
 import {
   defineAgent,
-  draftFile,
-  encodeSegment,
-  resolveMountRoot,
-  writeJsonFile,
-  type IntegrationClientOptions,
   type WorkforceCtx
 } from '@agentworkforce/runtime';
+import { githubClient, slackClient } from '@relayfile/relay-helpers';
 
 interface Pr {
   owner: string;
@@ -27,20 +23,6 @@ interface Pr {
   url: string;
   author: string; // github login of whoever opened the PR
   headSha?: string;
-}
-
-function vfsClient(): IntegrationClientOptions {
-  return { relayfileMountRoot: resolveMountRoot({}) };
-}
-
-/** Draft path for a PR-level comment (PRs are issues on the github side). */
-function prCommentPath(pr: Pr): string {
-  return `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/issues/${pr.number}/comments/${draftFile('comment')}`;
-}
-
-/** Slack channel message draft path. */
-function slackPostPath(channel: string): string {
-  return `/slack/channels/${encodeSegment(channel)}/messages/${draftFile('message')}`;
 }
 
 export default defineAgent({
@@ -112,19 +94,19 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   if (!body) {
     await failReviewRun(ctx, pr, 'The review harness produced no review output.');
   }
-  const client = vfsClient();
   if (body) {
-    await writeJsonFile(client, 'github', 'comment', prCommentPath(pr), { body });
+    await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
   }
 
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel) {
     const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
-    await writeJsonFile(client, 'slack', 'post', slackPostPath(channel), {
-      text: ready
+    await slackClient().post(
+      channel,
+      ready
         ? `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
         : `:eyes: ${who} — reviewing PR #${pr.number} in *${pr.owner}/${pr.repo}*, still working on it: ${pr.url}`
-    });
+    );
   }
 }
 
@@ -140,36 +122,33 @@ async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise
     number: pr.number,
     reason,
   });
-  const client = vfsClient();
-  await writeJsonFile(client, 'github', 'comment', prCommentPath(pr), { body: message });
+  await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, message);
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel) {
-    await writeJsonFile(client, 'slack', 'post', slackPostPath(channel), {
-      text: `:warning: pr-reviewer failed for PR #${pr.number} in *${pr.owner}/${pr.repo}*: ${reason}`
-    });
+    await slackClient().post(
+      channel,
+      `:warning: pr-reviewer failed for PR #${pr.number} in *${pr.owner}/${pr.repo}*: ${reason}`
+    );
   }
   throw new Error(message);
 }
 
 async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
-  const client = vfsClient();
-  const mergePath = `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/pulls/${pr.number}/merge.json`;
-  const result = await writeJsonFile(client, 'github', 'merge', mergePath, {
+  const result = await githubClient().mergePullRequest({
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
     method: 'squash',
     ...(pr.headSha ? { sha: pr.headSha } : {})
   });
-  // The writeback worker reports the merge outcome on the receipt. A missing
-  // receipt means fire-and-forget didn't confirm — surface that loudly rather
-  // than pretend the merge landed.
-  const merged = result.receipt?.merged;
-  if (merged !== true && merged !== 'true') {
+  // mergePullRequest surfaces the writeback worker's merge outcome as `merged`.
+  // A false/unconfirmed result means we shouldn't pretend the merge landed.
+  if (!result.merged) {
     throw new Error(`GitHub did not confirm PR #${pr.number} in ${pr.owner}/${pr.repo} was merged.`);
   }
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel) {
-    await writeJsonFile(client, 'slack', 'post', slackPostPath(channel), {
-      text: `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`
-    });
+    await slackClient().post(channel, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
   }
 }
 

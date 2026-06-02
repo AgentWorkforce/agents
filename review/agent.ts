@@ -27,6 +27,9 @@ interface Pr {
   url: string;
   author: string; // github login of whoever opened the PR
   headSha?: string;
+  state?: string;
+  merged?: boolean;
+  labels?: unknown;
 }
 
 /** The materialized PR record at `…/pulls/{n}/meta.json`. Read for the
@@ -98,9 +101,9 @@ export default defineAgent({
 // ── review gate ─────────────────────────────────────────────────────────────
 // Decide whether to (re)review/fix this PR at all. Returns a skip reason, or
 // null to proceed. Three gates, in order: already-merged, a disabling label,
-// and an author allowlist. Author and labels come from the live PR meta.json
-// (the webhook payload doesn't carry them on every trigger); the read is
-// best-effort — if it fails we fall back to the payload author and proceed.
+// and an author allowlist. Prefer the live PR meta.json, but fall back to
+// fields that are present on pull_request webhook payloads; check_run.completed
+// payloads do not carry enough detail, so those fail open when meta is missing.
 async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: string; notify?: boolean } | null> {
   const meta = await loadPrMeta(pr);
 
@@ -108,16 +111,15 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
   // on a finished PR. This is the cheap, agent-side half of the merge-race;
   // preserving the unpushed fixes via a recovery PR needs the cloud-side work
   // tracked in AgentWorkforce/cloud#1659 / #1660.
-  if (meta && (meta.merged === true || meta.state === 'closed')) {
+  const state = (meta?.state ?? pr.state ?? '').trim().toLowerCase();
+  if (meta?.merged === true || pr.merged === true || state === 'closed') {
     return { reason: 'PR is already merged/closed', notify: true };
   }
 
   // A disabling label turns the reviewer off entirely for this PR. `labels` is
   // validated here (not just type-asserted) since meta.json shape can drift.
   const skipLabels = skipLabelSet(ctx);
-  const prLabels = (Array.isArray(meta?.labels) ? meta.labels : [])
-    .map((l) => (l && typeof (l as { name?: unknown }).name === 'string' ? (l as { name: string }).name.trim().toLowerCase() : ''))
-    .filter(Boolean);
+  const prLabels = labelNames(Array.isArray(meta?.labels) ? meta.labels : pr.labels);
   const hit = prLabels.find((name) => skipLabels.has(name));
   if (hit) {
     return { reason: `PR carries the "${hit}" label` };
@@ -171,6 +173,13 @@ function skipLabelSet(ctx: WorkforceCtx): Set<string> {
 function reviewAuthorAllowlist(ctx: WorkforceCtx): Set<string> {
   const raw = input(ctx, 'REVIEW_AUTHORS') ?? '';
   return new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
+
+function labelNames(labels: unknown): string[] {
+  if (!Array.isArray(labels)) return [];
+  return labels
+    .map((l) => (l && typeof (l as { name?: unknown }).name === 'string' ? (l as { name: string }).name.trim().toLowerCase() : ''))
+    .filter(Boolean);
 }
 
 async function notifySkip(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<void> {
@@ -277,7 +286,15 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 function readPr(payload: unknown): Pr | undefined {
   const p = payload as {
     number?: number;
-    pull_request?: { number?: number; html_url?: string; user?: { login?: string }; head?: { sha?: string } };
+    pull_request?: {
+      number?: number;
+      html_url?: string;
+      user?: { login?: string };
+      head?: { sha?: string };
+      state?: string;
+      merged?: boolean;
+      labels?: unknown;
+    };
     check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
     repository?: { name?: string; owner?: { login?: string } };
     sender?: { login?: string };
@@ -295,7 +312,10 @@ function readPr(payload: unknown): Pr | undefined {
     number,
     url: prRef?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}`,
     author: p?.pull_request?.user?.login ?? p?.sender?.login ?? 'unknown',
-    ...(headSha ? { headSha } : {})
+    ...(headSha ? { headSha } : {}),
+    ...(p?.pull_request?.state ? { state: p.pull_request.state } : {}),
+    ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),
+    ...(p?.pull_request?.labels !== undefined ? { labels: p.pull_request.labels } : {})
   };
 }
 function isApproval(payload: unknown): boolean {

@@ -9,7 +9,11 @@
  * The repo is already in the sandbox: the cloud materializes the github
  * integration's repo into ctx.sandbox.cwd via relayfile, so there's no clone.
  */
-import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  type WorkforceCtx,
+  type WorkforceProviderEvent
+} from '@agentworkforce/runtime';
 import { linearClient } from '@relayfile/relay-helpers';
 
 interface LinearIssue {
@@ -30,18 +34,50 @@ export default defineAgent({
     ]
   },
   handler: async (ctx, event) => {
-  if (event.source !== 'linear') return;
+    await handleLinearEvent(ctx, event, linearClient());
+  }
+});
 
-  const linear = linearClient();
+interface LinearClientLike {
+  getIssue<T>(issueId: string): Promise<T>;
+  comment(issueId: string, body: string): Promise<unknown>;
+}
 
-  // The comment path only fires when someone @-mentions the agent (configurable
-  // via MENTION, e.g. "@agentrelay") — and never on the agent's own reply.
-  if (event.type === 'comment.create') {
-    if (isOwnComment(event.payload) || !commentMentionsAgent(ctx, event.payload)) return;
+export async function handleLinearEvent(
+  ctx: WorkforceCtx,
+  event: WorkforceProviderEvent,
+  linear: LinearClientLike,
+): Promise<void> {
+  ctx.log?.('info', 'linear event', {
+    eventId: event.id,
+    type: event.type,
+    payloadKeys: payloadKeys(event.payload),
+    hasIssueId: Boolean(readIssueId(event.payload, event.type)),
+  });
+
+  if (event.source !== 'linear') {
+    logSkip(ctx, event, 'non-linear event source');
+    return;
   }
 
-  const issueId = readIssueId(event.payload);
-  if (!issueId) return;
+  // Keep the self-reply loop guard, but do not silently return.
+  if (event.type === 'comment.create') {
+    if (isOwnComment(event.payload)) {
+      logSkip(ctx, event, 'own comment');
+      return;
+    }
+    const mention = commentMentionsAgent(ctx, event.payload);
+    if (!mention.matched) {
+      logSkip(ctx, event, mention.reason, mention.attrs);
+      return;
+    }
+  }
+
+  const issueId = readIssueId(event.payload, event.type);
+  if (!issueId) {
+    logSkip(ctx, event, 'missing issue id');
+    return;
+  }
   const issue = await linear.getIssue<LinearIssue>(issueId);
 
   // The issue may name its own target repo (a github URL); if so, tell the agent
@@ -67,37 +103,192 @@ export default defineAgent({
       ? `:rocket: Opened a PR: ${prUrl}`
       : "I worked on this but couldn't open a PR — check the run logs."
   );
-  }
-});
+}
 
 /** The issue id for this event. For `comment.create`, `data.id` is the COMMENT
  *  id, so prefer issue-specific fields and only fall back to `data.id`
  *  (which is the issue id for `issue.create`). */
-function readIssueId(payload: unknown): string | undefined {
+function readIssueId(payload: unknown, eventType?: string): string | undefined {
   const p = payload as {
-    data?: { id?: string; issueId?: string; issue?: { id?: string } };
+    data?: {
+      id?: string;
+      issueId?: string;
+      issue_id?: string;
+      issue?: { id?: string };
+      comment?: { issueId?: string; issue_id?: string; issue?: { id?: string } };
+    };
+    comment?: { issueId?: string; issue_id?: string; issue?: { id?: string } };
+    issueId?: string;
+    issue_id?: string;
     issue?: { id?: string };
   } | null;
-  return p?.data?.issueId ?? p?.data?.issue?.id ?? p?.issue?.id ?? p?.data?.id;
+  return (
+    p?.data?.issueId ??
+    p?.data?.issue_id ??
+    p?.data?.issue?.id ??
+    p?.data?.comment?.issueId ??
+    p?.data?.comment?.issue_id ??
+    p?.data?.comment?.issue?.id ??
+    p?.comment?.issueId ??
+    p?.comment?.issue_id ??
+    p?.comment?.issue?.id ??
+    p?.issueId ??
+    p?.issue_id ??
+    p?.issue?.id ??
+    (eventType === 'comment.create' ? undefined : p?.data?.id)
+  );
 }
 function commentBody(payload: unknown): string {
-  const p = payload as { data?: { body?: string }; comment?: { body?: string } } | null;
-  return p?.data?.body ?? p?.comment?.body ?? '';
+  const p = payload as {
+    body?: string;
+    data?: { body?: string; comment?: { body?: string } };
+    comment?: { body?: string };
+  } | null;
+  return p?.data?.body ?? p?.data?.comment?.body ?? p?.comment?.body ?? p?.body ?? '';
 }
 /** True if a comment event is the agent's own PR-link reply (loop guard). */
 function isOwnComment(payload: unknown): boolean {
   const body = commentBody(payload);
   return body.includes('Opened a PR') || body.includes("couldn't open a PR");
 }
-/** Only act on a comment that @-mentions the agent (e.g. "@agentrelay"). */
-function commentMentionsAgent(ctx: WorkforceCtx, payload: unknown): boolean {
-  const mention = input(ctx, 'MENTION') ?? '@agentrelay';
-  return commentBody(payload).toLowerCase().includes(mention.toLowerCase());
+interface MentionMatch {
+  matched: boolean;
+  reason: string;
+  attrs?: Record<string, unknown>;
+}
+
+/** Only act on a comment that explicitly mentions this agent. */
+function commentMentionsAgent(ctx: WorkforceCtx, payload: unknown): MentionMatch {
+  const aliases = mentionAliases(ctx);
+  const body = commentBody(payload);
+  const structuredMentions = collectStructuredMentionTexts(payload);
+
+  for (const mention of structuredMentions) {
+    const alias = matchingAlias(mention, aliases);
+    if (alias) {
+      return { matched: true, reason: 'structured mention', attrs: { alias } };
+    }
+  }
+
+  const bodyAlias = matchingBodyAlias(body, aliases);
+  if (bodyAlias) {
+    return { matched: true, reason: 'body mention', attrs: { alias: bodyAlias } };
+  }
+
+  return {
+    matched: false,
+    reason: 'comment did not mention agent',
+    attrs: {
+      aliasCount: aliases.length,
+      structuredMentionCount: structuredMentions.length,
+    },
+  };
 }
 function input(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona.inputSpecs?.[name];
   const v = process.env[spec?.env ?? name] ?? ctx.persona.inputs?.[name] ?? spec?.default;
   return v && v.trim() ? v : undefined;
+}
+function mentionAliases(ctx: WorkforceCtx): string[] {
+  const configured = splitAliases(input(ctx, 'MENTION'));
+  const inferred = [
+    ctx.agent?.id,
+    ctx.agentName,
+    ctx.agent?.deployedName,
+    ctx.persona?.id,
+    'agentrelay',
+    'agent relay',
+  ];
+  const aliases = new Set<string>();
+  for (const value of [...configured, ...inferred]) {
+    for (const alias of aliasVariants(value)) {
+      aliases.add(alias);
+    }
+  }
+  return [...aliases];
+}
+function splitAliases(value: string | undefined): string[] {
+  return (value ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
+}
+function aliasVariants(value: string | undefined): string[] {
+  const trimmed = value?.trim();
+  if (!trimmed) return [];
+  const withoutAt = trimmed.replace(/^@+/u, '');
+  const spaced = withoutAt.replace(/[-_]+/gu, ' ');
+  return [trimmed, withoutAt, spaced, compactToken(trimmed), compactToken(withoutAt), compactToken(spaced)]
+    .filter((entry, index, entries): entry is string => Boolean(entry) && entries.indexOf(entry) === index);
+}
+function matchingAlias(value: string, aliases: string[]): string | undefined {
+  const normalized = compactToken(value);
+  return aliases.find((alias) => compactToken(alias) === normalized);
+}
+function matchingBodyAlias(body: string, aliases: string[]): string | undefined {
+  const explicitMentions = [
+    ...body.matchAll(/@\[([^\]]+)\]/gu),
+    ...body.matchAll(/@([A-Za-z0-9][\w .-]{1,80})/gu),
+    ...body.matchAll(/\[([^\]]+)\]\((?:linear|https?):\/\/[^)]*(?:user|users)[^)]*\)/giu),
+    ...body.matchAll(/<@([^>]+)>/gu),
+  ].map((match) => match[1] ?? '');
+  for (const mention of explicitMentions) {
+    const alias = matchingAlias(mention, aliases);
+    if (alias) return alias;
+  }
+  return undefined;
+}
+function collectStructuredMentionTexts(value: unknown): string[] {
+  const texts = new Set<string>();
+  const seen = new WeakSet<object>();
+  collectMentionTexts(value, false, texts, seen);
+  return [...texts];
+}
+function collectMentionTexts(
+  value: unknown,
+  inMentionField: boolean,
+  texts: Set<string>,
+  seen: WeakSet<object>,
+): void {
+  if (typeof value === 'string') {
+    if (inMentionField) texts.add(value);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (seen.has(value)) return;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) collectMentionTexts(item, inMentionField, texts, seen);
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    const mentionField = inMentionField || /mention/i.test(key);
+    if (mentionField && typeof entry === 'object' && entry !== null) {
+      for (const field of ['id', 'userId', 'user_id', 'name', 'displayName', 'display_name', 'handle']) {
+        const candidate = (entry as Record<string, unknown>)[field];
+        if (typeof candidate === 'string') texts.add(candidate);
+      }
+    }
+    collectMentionTexts(entry, mentionField, texts, seen);
+  }
+}
+function compactToken(value: string | undefined): string {
+  return (value ?? '').toLowerCase().replace(/[^a-z0-9]+/gu, '');
+}
+function payloadKeys(payload: unknown): string[] {
+  return payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? Object.keys(payload)
+    : [];
+}
+function logSkip(
+  ctx: WorkforceCtx,
+  event: WorkforceProviderEvent,
+  reason: string,
+  attrs: Record<string, unknown> = {},
+): void {
+  ctx.log?.('info', 'linear comment skipped', {
+    eventId: event.id,
+    type: event.type,
+    reason,
+    ...attrs,
+  });
 }
 function findPrUrl(text: string): string | undefined {
   return text.match(/https?:\/\/\S*github\.com\/\S+\/pull\/\d+/g)?.pop();

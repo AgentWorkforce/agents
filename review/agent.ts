@@ -10,7 +10,15 @@
  * harness runs. The agent fixes by editing files there; cloud commits and
  * pushes those edits after the harness exits — no git/gh in the harness.
  */
-import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  draftFile,
+  encodeSegment,
+  resolveMountRoot,
+  writeJsonFile,
+  type IntegrationClientOptions,
+  type WorkforceCtx
+} from '@agentworkforce/runtime';
 
 interface Pr {
   owner: string;
@@ -21,15 +29,19 @@ interface Pr {
   headSha?: string;
 }
 
-type GithubMergeClient = NonNullable<WorkforceCtx['github']> & {
-  mergePullRequest(args: {
-    owner: string;
-    repo: string;
-    number: number;
-    method?: 'merge' | 'squash' | 'rebase';
-    sha?: string;
-  }): Promise<{ merged: boolean; sha?: string }>;
-};
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
+}
+
+/** Draft path for a PR-level comment (PRs are issues on the github side). */
+function prCommentPath(pr: Pr): string {
+  return `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/issues/${pr.number}/comments/${draftFile('comment')}`;
+}
+
+/** Slack channel message draft path. */
+function slackPostPath(channel: string): string {
+  return `/slack/channels/${encodeSegment(channel)}/messages/${draftFile('message')}`;
+}
 
 export default defineAgent({
   // Re-review on every PR change (open, new commits, review comments, finished
@@ -45,7 +57,7 @@ export default defineAgent({
     ]
   },
   handler: async (ctx, event) => {
-  if (event.source !== 'github' || !ctx.github) return;
+  if (event.source !== 'github') return;
 
   // An approval from an authorized reviewer ends the loop: merge and stop.
   if (event.type === 'pull_request_review.submitted' && isApproval(event.payload) && isAuthorizedApprover(ctx, event.payload)) {
@@ -93,29 +105,26 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 
   // The harness only writes a review when we explicitly post it. Strip the
   // READY sentinel (it's the slack/ready signal, not a review-body line) and
-  // post whatever's left as a PR comment via ctx.github.comment.
+  // post whatever's left as a PR comment via the github VFS.
   const raw = (run.output ?? '').trimEnd();
   const ready = lastLine(raw) === 'READY';
   const body = ready ? stripLastLine(raw).trimEnd() : raw;
   if (!body) {
     await failReviewRun(ctx, pr, 'The review harness produced no review output.');
   }
-  if (body && ctx.github?.comment) {
-    await ctx.github.comment(
-      { owner: pr.owner, repo: pr.repo, number: pr.number },
-      body
-    );
+  const client = vfsClient();
+  if (body) {
+    await writeJsonFile(client, 'github', 'comment', prCommentPath(pr), { body });
   }
 
   const channel = input(ctx, 'SLACK_CHANNEL');
-  if (channel && ctx.slack) {
+  if (channel) {
     const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
-    await ctx.slack.post(
-      channel,
-      ready
+    await writeJsonFile(client, 'slack', 'post', slackPostPath(channel), {
+      text: ready
         ? `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
         : `:eyes: ${who} — reviewing PR #${pr.number} in *${pr.owner}/${pr.repo}*, still working on it: ${pr.url}`
-    );
+    });
   }
 }
 
@@ -131,40 +140,37 @@ async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise
     number: pr.number,
     reason,
   });
-  if (ctx.github?.comment) {
-    await ctx.github.comment(
-      { owner: pr.owner, repo: pr.repo, number: pr.number },
-      message,
-    );
-  }
+  const client = vfsClient();
+  await writeJsonFile(client, 'github', 'comment', prCommentPath(pr), { body: message });
   const channel = input(ctx, 'SLACK_CHANNEL');
-  if (channel && ctx.slack) {
-    await ctx.slack.post(
-      channel,
-      `:warning: pr-reviewer failed for PR #${pr.number} in *${pr.owner}/${pr.repo}*: ${reason}`,
-    );
+  if (channel) {
+    await writeJsonFile(client, 'slack', 'post', slackPostPath(channel), {
+      text: `:warning: pr-reviewer failed for PR #${pr.number} in *${pr.owner}/${pr.repo}*: ${reason}`
+    });
   }
   throw new Error(message);
 }
 
 async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
-  if (!ctx.github) return;
-  const github = ctx.github as GithubMergeClient;
-  if (typeof github.mergePullRequest !== 'function') {
-    throw new Error('ctx.github.mergePullRequest is required to merge approved pull requests.');
-  }
-  const result = await github.mergePullRequest({
-    owner: pr.owner,
-    repo: pr.repo,
-    number: pr.number,
+  const client = vfsClient();
+  const mergePath = `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/pulls/${pr.number}/merge.json`;
+  const result = await writeJsonFile(client, 'github', 'merge', mergePath, {
     method: 'squash',
     ...(pr.headSha ? { sha: pr.headSha } : {})
   });
-  if (!result.merged) {
+  // The writeback worker reports the merge outcome on the receipt. A missing
+  // receipt means fire-and-forget didn't confirm — surface that loudly rather
+  // than pretend the merge landed.
+  const merged = result.receipt?.merged;
+  if (merged !== true && merged !== 'true') {
     throw new Error(`GitHub did not confirm PR #${pr.number} in ${pr.owner}/${pr.repo} was merged.`);
   }
   const channel = input(ctx, 'SLACK_CHANNEL');
-  if (channel && ctx.slack) await ctx.slack.post(channel, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
+  if (channel) {
+    await writeJsonFile(client, 'slack', 'post', slackPostPath(channel), {
+      text: `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`
+    });
+  }
 }
 
 // ── parsing the github webhook payload ──────────────────────────────────────

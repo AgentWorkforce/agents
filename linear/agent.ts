@@ -9,7 +9,29 @@
  * The repo is already in the sandbox: the cloud materializes the github
  * integration's repo into ctx.sandbox.cwd via relayfile, so there's no clone.
  */
-import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  draftFile,
+  encodeSegment,
+  readJsonFile,
+  resolveMountRoot,
+  writeJsonFile,
+  type IntegrationClientOptions,
+  type WorkforceCtx
+} from '@agentworkforce/runtime';
+
+interface LinearIssue {
+  id?: string;
+  identifier?: string;
+  title: string;
+  description: string | null;
+  url?: string;
+  [key: string]: unknown;
+}
+
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
+}
 
 export default defineAgent({
   // Two Linear triggers — `on` autocompletes Linear's catalog events.
@@ -21,7 +43,8 @@ export default defineAgent({
   },
   handler: async (ctx, event) => {
   if (event.source !== 'linear') return;
-  if (!ctx.linear) throw new Error('linear-implementer requires the linear integration');
+
+  const client = vfsClient();
 
   // The comment path only fires when someone @-mentions the agent (configurable
   // via MENTION, e.g. "@agentrelay") — and never on the agent's own reply.
@@ -31,7 +54,12 @@ export default defineAgent({
 
   const issueId = readIssueId(event.payload);
   if (!issueId) return;
-  const issue = await ctx.linear.getIssue(issueId);
+  const issue = await readJsonFile<LinearIssue>(
+    client,
+    'linear',
+    'getIssue',
+    `/linear/issues/${encodeSegment(issueId)}.json`
+  );
 
   // The issue may name its own target repo (a github URL); if so, tell the agent
   // to work there — otherwise it uses the materialized repo.
@@ -50,9 +78,16 @@ export default defineAgent({
   });
 
   const prUrl = findPrUrl(run.output);
-  await ctx.linear.comment(
-    issueId,
-    prUrl ? `:rocket: Opened a PR: ${prUrl}` : "I worked on this but couldn't open a PR — check the run logs."
+  await writeJsonFile(
+    client,
+    'linear',
+    'comment',
+    `/linear/issues/${encodeSegment(issueId)}/comments/${draftFile('comment')}`,
+    {
+      body: prUrl
+        ? `:rocket: Opened a PR: ${prUrl}`
+        : "I worked on this but couldn't open a PR — check the run logs."
+    }
   );
   }
 });

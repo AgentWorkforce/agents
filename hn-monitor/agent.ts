@@ -7,7 +7,19 @@
  *     → summarize with ctx.llm
  *     → post to Slack
  */
-import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  draftFile,
+  encodeSegment,
+  resolveMountRoot,
+  writeJsonFile,
+  type IntegrationClientOptions,
+  type WorkforceCtx
+} from '@agentworkforce/runtime';
+
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
+}
 
 interface Story {
   id: number;
@@ -21,7 +33,6 @@ export default defineAgent({
   schedules: [{ name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' }],
   handler: async (ctx, event) => {
   if (event.source !== 'cron') return;
-  if (!ctx.slack) throw new Error('hn-monitor requires the slack integration');
 
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (!channel) throw new Error('SLACK_CHANNEL is required');
@@ -37,7 +48,13 @@ export default defineAgent({
     return;
   }
 
-  await ctx.slack.post(channel, await summarize(ctx, fresh));
+  await writeJsonFile(
+    vfsClient(),
+    'slack',
+    'post',
+    `/slack/channels/${encodeSegment(channel)}/messages/${draftFile('message')}`,
+    { text: await summarize(ctx, fresh) }
+  );
   await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
   }
 });

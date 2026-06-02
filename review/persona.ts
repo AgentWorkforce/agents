@@ -21,6 +21,7 @@ export default definePersona({
     SLACK_CHANNEL: {
       description: 'Slack channel to post review updates to (the message references the PR author).',
       env: 'SLACK_CHANNEL',
+      optional: true,
       picker: { provider: 'slack', resource: 'channels' }
     },
     APPROVERS: {

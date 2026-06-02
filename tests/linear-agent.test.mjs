@@ -96,6 +96,33 @@ test('Linear comment.create with plain default mention reaches harness', async (
   assert.equal(linear.comments[0]?.issueId, 'issue-1');
 });
 
+test('Linear comment.create with relayfile record payload reaches harness', async () => {
+  const runtime = ctx();
+  const linear = linearClient();
+
+  await handleLinearEvent(runtime, event({
+    resource: {
+      provider: 'linear',
+      objectType: 'comment',
+      objectId: 'comment-1',
+      payload: {
+        body: '@agentrelay please implement this.',
+        issue_id: 'issue-1',
+        issue_identifier: 'AR-70',
+      },
+    },
+  }), linear);
+
+  assert.equal(runtime.harnessCalls.length, 1);
+  assert.equal(linear.comments[0]?.issueId, 'issue-1');
+  assert.ok(runtime.logs.some((log) =>
+    log.message === 'linear event' &&
+    log.attrs?.hasIssueId === true &&
+    Array.isArray(log.attrs?.recordKeys) &&
+    log.attrs.recordKeys.includes('body')
+  ));
+});
+
 test('Linear comment.create with configured plain mention alias reaches harness', async () => {
   const runtime = ctx({
     persona: {

@@ -52,6 +52,7 @@ export async function handleLinearEvent(
     eventId: event.id,
     type: event.type,
     payloadKeys: payloadKeys(event.payload),
+    recordKeys: payloadKeys(linearRecordPayload(event.payload)),
     hasIssueId: Boolean(readIssueId(event.payload, event.type)),
   });
 
@@ -109,6 +110,15 @@ export async function handleLinearEvent(
  *  id, so prefer issue-specific fields and only fall back to `data.id`
  *  (which is the issue id for `issue.create`). */
 function readIssueId(payload: unknown, eventType?: string): string | undefined {
+  const rec = linearRecordPayload(payload) as {
+    body?: string;
+    id?: string;
+    issueId?: string;
+    issue_id?: string;
+    issueIdentifier?: string;
+    issue_identifier?: string;
+    issue?: { id?: string; identifier?: string };
+  } | null;
   const p = payload as {
     data?: {
       id?: string;
@@ -123,6 +133,12 @@ function readIssueId(payload: unknown, eventType?: string): string | undefined {
     issue?: { id?: string };
   } | null;
   return (
+    rec?.issueId ??
+    rec?.issue_id ??
+    rec?.issueIdentifier ??
+    rec?.issue_identifier ??
+    rec?.issue?.id ??
+    rec?.issue?.identifier ??
     p?.data?.issueId ??
     p?.data?.issue_id ??
     p?.data?.issue?.id ??
@@ -135,16 +151,17 @@ function readIssueId(payload: unknown, eventType?: string): string | undefined {
     p?.issueId ??
     p?.issue_id ??
     p?.issue?.id ??
-    (eventType === 'comment.create' ? undefined : p?.data?.id)
+    (eventType === 'comment.create' ? undefined : p?.data?.id ?? rec?.id)
   );
 }
 function commentBody(payload: unknown): string {
+  const rec = linearRecordPayload(payload) as { body?: string } | null;
   const p = payload as {
     body?: string;
     data?: { body?: string; comment?: { body?: string } };
     comment?: { body?: string };
   } | null;
-  return p?.data?.body ?? p?.data?.comment?.body ?? p?.comment?.body ?? p?.body ?? '';
+  return rec?.body ?? p?.data?.body ?? p?.data?.comment?.body ?? p?.comment?.body ?? p?.body ?? '';
 }
 /** True if a comment event is the agent's own PR-link reply (loop guard). */
 function isOwnComment(ctx: WorkforceCtx, payload: unknown): boolean {
@@ -368,6 +385,16 @@ function payloadKeys(payload: unknown): string[] {
   return payload && typeof payload === 'object' && !Array.isArray(payload)
     ? Object.keys(payload)
     : [];
+}
+function linearRecordPayload(payload: unknown): unknown {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const outer = payload as Record<string, unknown>;
+  const resource = outer.resource && typeof outer.resource === 'object' && !Array.isArray(outer.resource)
+    ? outer.resource as Record<string, unknown>
+    : outer;
+  return resource.payload && typeof resource.payload === 'object' && !Array.isArray(resource.payload)
+    ? resource.payload
+    : resource;
 }
 function logSkip(
   ctx: WorkforceCtx,

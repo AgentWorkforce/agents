@@ -29,6 +29,17 @@ export default definePersona({
       env: 'APPROVERS',
       optional: true,
       picker: { provider: 'github', resource: 'users' }
+    },
+    REVIEW_AUTHORS: {
+      description: 'Only review and auto-fix PRs opened by these GitHub logins (comma-separated). If unset, every author is reviewed.',
+      env: 'REVIEW_AUTHORS',
+      optional: true,
+      picker: { provider: 'github', resource: 'users' }
+    },
+    SKIP_LABELS: {
+      description: 'PR labels that disable the reviewer entirely (comma-separated). Defaults to "no-agent-relay-review".',
+      env: 'SKIP_LABELS',
+      optional: true
     }
   },
 

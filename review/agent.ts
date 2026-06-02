@@ -12,6 +12,10 @@
  */
 import {
   defineAgent,
+  encodeSegment,
+  readJsonFile,
+  resolveMountRoot,
+  type IntegrationClientOptions,
   type WorkforceCtx
 } from '@agentworkforce/runtime';
 import { githubClient, slackClient } from '@relayfile/relay-helpers';
@@ -23,6 +27,30 @@ interface Pr {
   url: string;
   author: string; // github login of whoever opened the PR
   headSha?: string;
+  state?: string;
+  merged?: boolean;
+  labels?: unknown;
+}
+
+/** The materialized PR record at `…/pulls/{n}/meta.json`. Read for the
+ *  authoritative author/labels/state — the webhook payload doesn't carry them
+ *  on every trigger (check_run.completed has neither). Read defensively: the
+ *  shape is the github adapter's projection and fields may be absent. */
+interface PrMeta {
+  state?: string; // 'open' | 'closed'
+  merged?: boolean;
+  // The materialized meta.json has carried `author` both as a bare login
+  // string and as an object — accept either so the allowlist isn't silently
+  // bypassed by a shape mismatch.
+  author?: string | { login?: string };
+  labels?: unknown; // validated as Array<{ name?: string }> at read time
+  [key: string]: unknown;
+}
+
+const DEFAULT_SKIP_LABEL = 'no-agent-relay-review';
+
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
 }
 
 export default defineAgent({
@@ -54,6 +82,12 @@ export default defineAgent({
   // Everything else is a reason to (re)review and push fixes.
   const pr = readPr(event.payload);
   if (pr) {
+    const skip = await shouldSkipReview(ctx, pr);
+    if (skip) {
+      ctx.log?.('info', 'pr-reviewer skipped', { owner: pr.owner, repo: pr.repo, number: pr.number, reason: skip.reason });
+      if (skip.notify) await notifySkip(ctx, pr, skip.reason);
+      return;
+    }
     await reviewAndFix(ctx, pr);
   } else if (event.type === 'check_run.completed') {
     // GitHub sometimes emits check_run.completed with pull_requests: [] for
@@ -63,6 +97,99 @@ export default defineAgent({
   }
   }
 });
+
+// ── review gate ─────────────────────────────────────────────────────────────
+// Decide whether to (re)review/fix this PR at all. Returns a skip reason, or
+// null to proceed. Three gates, in order: already-merged, a disabling label,
+// and an author allowlist. Prefer the live PR meta.json, but fall back to
+// fields that are present on pull_request webhook payloads; check_run.completed
+// payloads do not carry enough detail, so those fail open when meta is missing.
+async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: string; notify?: boolean } | null> {
+  const meta = await loadPrMeta(pr);
+
+  // Already merged/closed by the time we got here — don't post a stale review
+  // on a finished PR. This is the cheap, agent-side half of the merge-race;
+  // preserving the unpushed fixes via a recovery PR needs the cloud-side work
+  // tracked in AgentWorkforce/cloud#1659 / #1660.
+  const state = (meta?.state ?? pr.state ?? '').trim().toLowerCase();
+  if (meta?.merged === true || pr.merged === true || state === 'closed') {
+    return { reason: 'PR is already merged/closed', notify: true };
+  }
+
+  // A disabling label turns the reviewer off entirely for this PR. `labels` is
+  // validated here (not just type-asserted) since meta.json shape can drift.
+  const skipLabels = skipLabelSet(ctx);
+  const prLabels = labelNames(Array.isArray(meta?.labels) ? meta.labels : pr.labels);
+  const hit = prLabels.find((name) => skipLabels.has(name));
+  if (hit) {
+    return { reason: `PR carries the "${hit}" label` };
+  }
+
+  // Author allowlist: when REVIEW_AUTHORS is set, only review/fix PRs opened by
+  // those logins (e.g. "only my own PRs"). Unset → review every author.
+  // Fail open: if we couldn't determine a confident author (meta read failed
+  // and the payload had none), don't block — the gate only excludes a known
+  // author that isn't allowed.
+  const allow = reviewAuthorAllowlist(ctx);
+  if (allow.size > 0) {
+    const author = resolveAuthorLogin(meta, pr);
+    if (author && author !== 'unknown' && !allow.has(author)) {
+      return { reason: `author @${author} is not in REVIEW_AUTHORS` };
+    }
+  }
+
+  return null;
+}
+
+/** Lowercased PR author login, preferring the authoritative meta.json (string
+ *  or `{ login }`) and falling back to the webhook payload. Returns '' when no
+ *  login can be determined. */
+function resolveAuthorLogin(meta: PrMeta | undefined, pr: Pr): string {
+  const fromMeta = typeof meta?.author === 'string' ? meta.author : meta?.author?.login;
+  return (fromMeta ?? pr.author ?? '').trim().toLowerCase();
+}
+
+async function loadPrMeta(pr: Pr): Promise<PrMeta | undefined> {
+  try {
+    return await readJsonFile<PrMeta>(
+      vfsClient(),
+      'github',
+      'getPr',
+      `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/pulls/${pr.number}/meta.json`
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/** Lowercased label names that disable the reviewer. Defaults to
+ *  "no-agent-relay-review" when SKIP_LABELS is unset. */
+function skipLabelSet(ctx: WorkforceCtx): Set<string> {
+  const raw = input(ctx, 'SKIP_LABELS') ?? DEFAULT_SKIP_LABEL;
+  return new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
+
+/** Lowercased github logins allowed to be reviewed/fixed. Empty = everyone. */
+function reviewAuthorAllowlist(ctx: WorkforceCtx): Set<string> {
+  const raw = input(ctx, 'REVIEW_AUTHORS') ?? '';
+  return new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
+
+function labelNames(labels: unknown): string[] {
+  if (!Array.isArray(labels)) return [];
+  return labels
+    .map((l) => (l && typeof (l as { name?: unknown }).name === 'string' ? (l as { name: string }).name.trim().toLowerCase() : ''))
+    .filter(Boolean);
+}
+
+async function notifySkip(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<void> {
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (!channel) return;
+  await slackClient().post(
+    channel,
+    `:information_source: pr-reviewer skipped PR #${pr.number} in *${pr.owner}/${pr.repo}* — ${reason}: ${pr.url}`
+  );
+}
 
 async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   const run = await ctx.harness.run({
@@ -159,7 +286,15 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 function readPr(payload: unknown): Pr | undefined {
   const p = payload as {
     number?: number;
-    pull_request?: { number?: number; html_url?: string; user?: { login?: string }; head?: { sha?: string } };
+    pull_request?: {
+      number?: number;
+      html_url?: string;
+      user?: { login?: string };
+      head?: { sha?: string };
+      state?: string;
+      merged?: boolean;
+      labels?: unknown;
+    };
     check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
     repository?: { name?: string; owner?: { login?: string } };
     sender?: { login?: string };
@@ -177,7 +312,10 @@ function readPr(payload: unknown): Pr | undefined {
     number,
     url: prRef?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}`,
     author: p?.pull_request?.user?.login ?? p?.sender?.login ?? 'unknown',
-    ...(headSha ? { headSha } : {})
+    ...(headSha ? { headSha } : {}),
+    ...(p?.pull_request?.state ? { state: p.pull_request.state } : {}),
+    ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),
+    ...(p?.pull_request?.labels !== undefined ? { labels: p.pull_request.labels } : {})
   };
 }
 function isApproval(payload: unknown): boolean {

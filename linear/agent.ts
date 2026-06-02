@@ -62,7 +62,7 @@ export async function handleLinearEvent(
 
   // Keep the self-reply loop guard, but do not silently return.
   if (event.type === 'comment.create') {
-    if (isOwnComment(event.payload)) {
+    if (isOwnComment(ctx, event.payload)) {
       logSkip(ctx, event, 'own comment');
       return;
     }
@@ -147,9 +147,10 @@ function commentBody(payload: unknown): string {
   return p?.data?.body ?? p?.data?.comment?.body ?? p?.comment?.body ?? p?.body ?? '';
 }
 /** True if a comment event is the agent's own PR-link reply (loop guard). */
-function isOwnComment(payload: unknown): boolean {
+function isOwnComment(ctx: WorkforceCtx, payload: unknown): boolean {
   const body = commentBody(payload);
-  return body.includes('Opened a PR') || body.includes("couldn't open a PR");
+  if (!body.includes('Opened a PR') && !body.includes("couldn't open a PR")) return false;
+  return commentAuthorMatchesAgent(ctx, payload);
 }
 interface MentionMatch {
   matched: boolean;
@@ -234,6 +235,97 @@ function matchingBodyAlias(body: string, aliases: string[]): string | undefined 
     if (alias) return alias;
   }
   return undefined;
+}
+function commentAuthorMatchesAgent(ctx: WorkforceCtx, payload: unknown): boolean {
+  const aliases = mentionAliases(ctx);
+  return commentAuthorTexts(payload).some((author) => Boolean(matchingAlias(author, aliases)));
+}
+function commentAuthorTexts(payload: unknown): string[] {
+  const p = payload as {
+    actor?: unknown;
+    actorId?: string;
+    actor_id?: string;
+    author?: unknown;
+    authorId?: string;
+    author_id?: string;
+    createdBy?: unknown;
+    creator?: unknown;
+    data?: {
+      actor?: unknown;
+      actorId?: string;
+      actor_id?: string;
+      author?: unknown;
+      authorId?: string;
+      author_id?: string;
+      comment?: {
+        actor?: unknown;
+        actorId?: string;
+        actor_id?: string;
+        author?: unknown;
+        authorId?: string;
+        author_id?: string;
+        createdBy?: unknown;
+        creator?: unknown;
+        user?: unknown;
+        userId?: string;
+        user_id?: string;
+      };
+      createdBy?: unknown;
+      creator?: unknown;
+      user?: unknown;
+      userId?: string;
+      user_id?: string;
+    };
+    user?: unknown;
+    userId?: string;
+    user_id?: string;
+  } | null;
+  const texts = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value === 'string') {
+      texts.add(value);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    for (const field of ['id', 'userId', 'user_id', 'name', 'displayName', 'display_name', 'handle']) {
+      const candidate = (value as Record<string, unknown>)[field];
+      if (typeof candidate === 'string') texts.add(candidate);
+    }
+  };
+  add(p?.data?.comment?.user);
+  add(p?.data?.comment?.author);
+  add(p?.data?.comment?.actor);
+  add(p?.data?.comment?.creator);
+  add(p?.data?.comment?.createdBy);
+  add(p?.data?.comment?.userId);
+  add(p?.data?.comment?.user_id);
+  add(p?.data?.comment?.authorId);
+  add(p?.data?.comment?.author_id);
+  add(p?.data?.comment?.actorId);
+  add(p?.data?.comment?.actor_id);
+  add(p?.data?.user);
+  add(p?.data?.author);
+  add(p?.data?.actor);
+  add(p?.data?.creator);
+  add(p?.data?.createdBy);
+  add(p?.data?.userId);
+  add(p?.data?.user_id);
+  add(p?.data?.authorId);
+  add(p?.data?.author_id);
+  add(p?.data?.actorId);
+  add(p?.data?.actor_id);
+  add(p?.user);
+  add(p?.author);
+  add(p?.actor);
+  add(p?.creator);
+  add(p?.createdBy);
+  add(p?.userId);
+  add(p?.user_id);
+  add(p?.authorId);
+  add(p?.author_id);
+  add(p?.actorId);
+  add(p?.actor_id);
+  return [...texts];
 }
 function collectStructuredMentionTexts(value: unknown): string[] {
   const texts = new Set<string>();

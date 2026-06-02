@@ -138,6 +138,23 @@ test('Linear comment.create without a mention logs a skip and does not run harne
   ));
 });
 
+test('Linear user comment with PR-reply phrase still triggers when it mentions the agent', async () => {
+  const runtime = ctx();
+  const linear = linearClient();
+
+  await handleLinearEvent(runtime, event({
+    data: {
+      id: 'comment-1',
+      issueId: 'issue-1',
+      body: '@agentrelay Opened a PR: https://github.com/owner/repo/pull/1 but please implement this too',
+      user: { id: 'user-1', displayName: 'Regular User' },
+    },
+  }), linear);
+
+  assert.equal(runtime.harnessCalls.length, 1);
+  assert.equal(linear.comments[0]?.issueId, 'issue-1');
+});
+
 test('Linear own PR comment short-circuits before triggering another run', async () => {
   const runtime = ctx();
   const linear = linearClient();
@@ -147,6 +164,7 @@ test('Linear own PR comment short-circuits before triggering another run', async
       id: 'comment-1',
       issueId: 'issue-1',
       body: ':rocket: Opened a PR: https://github.com/AgentWorkforce/cloud/pull/123',
+      user: { id: 'agent-linear', displayName: 'Agent Relay' },
     },
   }), linear);
 

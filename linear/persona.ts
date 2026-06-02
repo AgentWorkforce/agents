@@ -21,9 +21,9 @@ export default definePersona({
   },
 
   inputs: {
-    // The handle the agent answers to in Linear comments. Adjust to your
-    // workspace's bot handle (e.g. @agentrelay / @agent_relay).
-    MENTION: { description: 'Mention that triggers the comment path.', env: 'MENTION', default: '@agentrelay', optional: true }
+    // Optional comma-separated aliases for this agent's Linear mention identity.
+    // The handler also infers aliases from the deployed agent/persona names.
+    MENTION: { description: 'Optional comma-separated Linear mention aliases.', env: 'MENTION', optional: true }
   },
 
   // The coding agent implements inside a sandbox with write + network access.

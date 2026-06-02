@@ -1,0 +1,35 @@
+{
+  "id": "linear-implementer",
+  "intent": "relay-orchestrator",
+  "tags": [
+    "implementation"
+  ],
+  "description": "When a labelled Linear issue is opened (or commented on), implements it and opens a GitHub PR.",
+  "cloud": true,
+  "useSubscription": true,
+  "integrations": {
+    "linear": {},
+    "github": {
+      "scope": {
+        "repo": "your-org/your-repo"
+      }
+    }
+  },
+  "inputs": {
+    "MENTION": {
+      "description": "Optional comma-separated Linear mention aliases.",
+      "env": "MENTION",
+      "optional": true
+    }
+  },
+  "harness": "codex",
+  "model": "gpt-5.5",
+  "systemPrompt": "Implement Linear issues as complete, well-described GitHub PRs that fully resolve the issue.",
+  "harnessSettings": {
+    "reasoning": "high",
+    "timeoutSeconds": 1800,
+    "sandboxMode": "workspace-write",
+    "workspaceWriteNetworkAccess": true
+  },
+  "onEvent": "./agent.ts"
+}

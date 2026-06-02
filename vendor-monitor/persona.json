@@ -1,0 +1,35 @@
+{
+  "id": "vendor-monitor",
+  "intent": "relay-orchestrator",
+  "tags": [
+    "discovery"
+  ],
+  "description": "Watches the vendors in your stack for new releases and posts the changes to your team Slack channel.",
+  "cloud": true,
+  "integrations": {
+    "slack": {}
+  },
+  "inputs": {
+    "VENDORS": {
+      "description": "Comma-separated npm packages to watch (e.g. \"next,react,@daytonaio/sdk\").",
+      "env": "VENDORS",
+      "default": "next,react,typescript"
+    },
+    "SLACK_CHANNEL": {
+      "description": "Team Slack channel id to post changes to.",
+      "env": "SLACK_CHANNEL"
+    }
+  },
+  "harnessSettings": {
+    "reasoning": "low",
+    "timeoutSeconds": 120
+  },
+  "memory": {
+    "enabled": true,
+    "scopes": [
+      "workspace"
+    ],
+    "ttlDays": 90
+  },
+  "onEvent": "./agent.ts"
+}

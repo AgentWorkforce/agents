@@ -11,6 +11,6 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["*/persona.ts", "*/agent.ts"],
+  "include": ["*/persona.ts", "*/agent.ts", "*/*.script.ts"],
   "exclude": ["node_modules"]
 }

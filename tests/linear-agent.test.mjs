@@ -80,6 +80,44 @@ test('Linear comment.create with markdown mention reaches harness without litera
   }]);
 });
 
+test('Linear comment.create with plain default mention reaches harness', async () => {
+  const runtime = ctx();
+  const linear = linearClient();
+
+  await handleLinearEvent(runtime, event({
+    data: {
+      id: 'comment-1',
+      issueId: 'issue-1',
+      body: '@agentrelay please implement this',
+    },
+  }), linear);
+
+  assert.equal(runtime.harnessCalls.length, 1);
+  assert.equal(linear.comments[0]?.issueId, 'issue-1');
+});
+
+test('Linear comment.create with configured plain mention alias reaches harness', async () => {
+  const runtime = ctx({
+    persona: {
+      id: 'linear-implementer',
+      inputs: { MENTION: '@build_bot, @fixit' },
+      inputSpecs: { MENTION: { env: 'MENTION', optional: true } },
+    },
+  });
+  const linear = linearClient();
+
+  await handleLinearEvent(runtime, event({
+    data: {
+      id: 'comment-1',
+      issueId: 'issue-1',
+      body: '@fixit please implement this',
+    },
+  }), linear);
+
+  assert.equal(runtime.harnessCalls.length, 1);
+  assert.equal(linear.comments[0]?.issueId, 'issue-1');
+});
+
 test('Linear comment.create without a mention logs a skip and does not run harness', async () => {
   const runtime = ctx();
   const linear = linearClient();

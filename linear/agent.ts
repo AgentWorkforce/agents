@@ -225,7 +225,7 @@ function matchingAlias(value: string, aliases: string[]): string | undefined {
 function matchingBodyAlias(body: string, aliases: string[]): string | undefined {
   const explicitMentions = [
     ...body.matchAll(/@\[([^\]]+)\]/gu),
-    ...body.matchAll(/@([A-Za-z0-9][\w .-]{1,80})/gu),
+    ...body.matchAll(/@([A-Za-z0-9][A-Za-z0-9_.-]*)/gu),
     ...body.matchAll(/\[([^\]]+)\]\((?:linear|https?):\/\/[^)]*(?:user|users)[^)]*\)/giu),
     ...body.matchAll(/<@([^>]+)>/gu),
   ].map((match) => match[1] ?? '');

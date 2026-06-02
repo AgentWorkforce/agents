@@ -6,14 +6,25 @@
  *     → compare to the version we saw last time (durable memory)
  *     → post any bumps to the team Slack channel
  */
-import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  draftFile,
+  encodeSegment,
+  resolveMountRoot,
+  writeJsonFile,
+  type IntegrationClientOptions,
+  type WorkforceCtx
+} from '@agentworkforce/runtime';
+
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
+}
 
 export default defineAgent({
   // Weekday mornings.
   schedules: [{ name: 'check', cron: '0 8 * * 1-5', tz: 'America/New_York' }],
   handler: async (ctx, event) => {
   if (event.source !== 'cron') return;
-  if (!ctx.slack) throw new Error('vendor-monitor requires the slack integration');
 
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (!channel) throw new Error('SLACK_CHANNEL is required');
@@ -33,7 +44,13 @@ export default defineAgent({
   }
 
   if (bumps.length > 0) {
-    await ctx.slack.post(channel, `:package: *Vendor updates*\n${bumps.join('\n')}`);
+    await writeJsonFile(
+      vfsClient(),
+      'slack',
+      'post',
+      `/slack/channels/${encodeSegment(channel)}/messages/${draftFile('message')}`,
+      { text: `:package: *Vendor updates*\n${bumps.join('\n')}` }
+    );
   }
   await saveVersions(ctx, { ...lastSeen, ...current });
   }

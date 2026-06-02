@@ -6,7 +6,19 @@
  *     → ask the model "is this a prospect call, and what did they ask for?"
  *     → if yes: file a Linear issue, then have the coding agent open a PR for it
  */
-import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  draftFile,
+  encodeSegment,
+  resolveMountRoot,
+  writeJsonFile,
+  type IntegrationClientOptions,
+  type WorkforceCtx
+} from '@agentworkforce/runtime';
+
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
+}
 
 interface Ask {
   isProspect: boolean;
@@ -21,7 +33,6 @@ export default defineAgent({
   // `event` to the declared granola trigger, so there's no clock case here).
   const notePath = readNotePath(event.payload);
   if (!notePath || !notePath.includes('/granola/notes/')) return; // ignore folders/other writes
-  if (!ctx.linear) throw new Error('granola-prospect requires the linear integration');
 
   const transcript = await readNote(ctx, notePath);
   if (!transcript) return;
@@ -33,18 +44,44 @@ export default defineAgent({
   }
 
   const teamId = await resolveTeamId(ctx);
-  const issue = await ctx.linear.createIssue({ teamId, title: ask.title, description: ask.summary });
-  ctx.log('info', 'granola-prospect.issue-created', { url: issue.url });
+  const client = vfsClient();
+  const created = await writeJsonFile(
+    client,
+    'linear',
+    'createIssue',
+    `/linear/issues/${draftFile('create issue')}`,
+    { teamId, title: ask.title, description: ask.summary }
+  );
+  // The writeback worker returns a receipt carrying the real issue URL/id once
+  // the Linear create lands. Without a receipt we can't link the issue or
+  // address a follow-up comment, so log and continue with the implementation.
+  const issueUrl = created.receipt?.url;
+  const issueId = created.receipt?.id ?? created.receipt?.identifier;
+  if (!issueUrl) {
+    ctx.log('warn', 'granola-prospect.issue.no-receipt', { draftPath: created.path });
+  } else {
+    ctx.log('info', 'granola-prospect.issue-created', { url: issueUrl });
+  }
 
   // The cloud materializes the github repo into the sandbox (ctx.sandbox.cwd)
   // via relayfile — no clone, no gh/git. The GitHub integration opens the PR.
   const run = await ctx.harness.run({
     cwd: ctx.sandbox.cwd,
-    prompt: `A prospect asked for the following. Comprehensively implement it (every change needed to fully address the ask), then open a GitHub pull request with your changes — the GitHub integration opens it, do not use git or the \`gh\` CLI. Put the PR URL on the last line.\n\nLinear issue: ${issue.url}\n\n${ask.summary}`
+    prompt: `A prospect asked for the following. Comprehensively implement it (every change needed to fully address the ask), then open a GitHub pull request with your changes — the GitHub integration opens it, do not use git or the \`gh\` CLI. Put the PR URL on the last line.\n\nLinear issue: ${issueUrl ?? '(pending)'}\n\n${ask.summary}`
   });
 
   const prUrl = run.output.match(/https?:\/\/\S*\/pull\/\d+/g)?.pop();
-  if (prUrl) await ctx.linear.comment(issue.id, `:rocket: Implementation PR: ${prUrl}`);
+  if (prUrl && issueId) {
+    await writeJsonFile(
+      client,
+      'linear',
+      'comment',
+      `/linear/issues/${encodeSegment(issueId)}/comments/${draftFile('comment')}`,
+      { body: `:rocket: Implementation PR: ${prUrl}` }
+    );
+  } else if (prUrl) {
+    ctx.log('warn', 'granola-prospect.comment-skipped.no-issue-id', { prUrl, draftPath: created.path });
+  }
   }
 });
 

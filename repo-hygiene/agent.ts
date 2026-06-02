@@ -2,13 +2,37 @@
  * repo-hygiene handler.
  *
  *   GitHub PR opened/synchronized
- *     -> read PR metadata + diff through Relayfile-backed ctx.github
+ *     -> read PR metadata + diff through the Relayfile-backed github VFS
  *     -> run a read-only hygiene diagnosis in the materialized repo
  *     -> post a concise PR comment
  *     -> create a Notion journal page for the run
  *     -> optionally post a Slack summary
  */
-import { defineAgent, type WorkforceCtx, type WorkforceProviderEvent } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  draftFile,
+  encodeSegment,
+  readJsonFile,
+  resolveMountRoot,
+  writeJsonFile,
+  type IntegrationClientOptions,
+  type WorkforceCtx,
+  type WorkforceProviderEvent
+} from '@agentworkforce/runtime';
+
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
+}
+
+interface GithubPrMeta {
+  title?: string;
+  body?: string;
+  author?: string;
+  base?: string;
+  head?: string;
+  diff?: string;
+  [key: string]: unknown;
+}
 
 interface PrRef {
   owner: string;
@@ -46,20 +70,30 @@ export default defineAgent({
   handler: async (ctx, event) => {
   if (event.source !== 'github') return;
   if (event.type !== 'pull_request.opened' && event.type !== 'pull_request.synchronize') return;
-  if (!ctx.github) throw new Error('repo-hygiene requires the github integration');
-  if (!ctx.notion) throw new Error('repo-hygiene requires the notion integration');
 
   const pr = readPr(event);
   if (!pr) return;
 
-  const details = await ctx.github.getPr(pr);
-  const report = await diagnose(ctx, pr, details.diff);
+  const client = vfsClient();
+  const details = await readJsonFile<GithubPrMeta>(
+    client,
+    'github',
+    'getPr',
+    `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/pulls/${pr.number}/meta.json`
+  );
+  const report = await diagnose(ctx, pr, details.diff ?? '');
   const body = renderPrComment(pr, report);
 
-  await ctx.github.comment(pr, body);
+  await writeJsonFile(
+    client,
+    'github',
+    'comment',
+    `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/issues/${pr.number}/comments/${draftFile('comment')}`,
+    { body }
+  );
   let notionUrl: string | undefined;
   try {
-    const notionPage = await writeNotionJournal(ctx, pr, event, report, body);
+    const notionPage = await writeNotionJournal(ctx, client, pr, event, report, body);
     notionUrl = notionPage.url;
     await rememberRun(ctx, pr, event, report, notionUrl);
   } catch (error) {
@@ -67,8 +101,14 @@ export default defineAgent({
   }
 
   const channel = input(ctx, 'SLACK_CHANNEL');
-  if (channel && ctx.slack) {
-    await ctx.slack.post(channel, renderSlackSummary(pr, report, notionUrl));
+  if (channel) {
+    await writeJsonFile(
+      client,
+      'slack',
+      'post',
+      `/slack/channels/${encodeSegment(channel)}/messages/${draftFile('message')}`,
+      { text: renderSlackSummary(pr, report, notionUrl) }
+    );
   }
   }
 });
@@ -249,41 +289,52 @@ function renderPrComment(pr: PrRef, report: HygieneReport): string {
 
 async function writeNotionJournal(
   ctx: WorkforceCtx,
+  client: IntegrationClientOptions,
   pr: PrRef,
   event: WorkforceProviderEvent,
   report: HygieneReport,
   prComment: string
-): Promise<{ id: string; url?: string }> {
+): Promise<{ id?: string; url?: string }> {
   const databaseId = input(ctx, 'NOTION_DATABASE_ID');
   if (!databaseId) throw new Error('NOTION_DATABASE_ID is required');
 
   const title = `${pr.owner}/${pr.repo}#${pr.number} hygiene - ${new Date(event.occurredAt).toISOString().slice(0, 10)}`;
-  const page = await ctx.notion!.createPage(
-    { database_id: databaseId },
+  const page = await writeJsonFile(
+    client,
+    'notion',
+    'createPage',
+    `/notion/databases/${encodeSegment(databaseId)}/pages/${draftFile('page')}`,
     {
-      Name: { title: [{ text: { content: title } }] },
-      Repository: { rich_text: [{ text: { content: `${pr.owner}/${pr.repo}` } }] },
-      PR: { number: pr.number },
-      Confidence: { select: { name: report.confidence } },
-      Findings: { number: report.findings.length },
-      Trigger: { rich_text: [{ text: { content: event.type } }] }
-    },
-    notionBlocks([
-      `PR: ${pr.url}`,
-      `Commit: ${pr.headSha ?? 'unknown'}`,
-      `Summary: ${report.summary}`,
-      '',
-      'Findings:',
-      ...(report.findings.length ? report.findings.map((f) => `- [${f.severity}] ${f.title}: ${f.recommendation}`) : ['- none']),
-      '',
-      'Follow-ups:',
-      ...(report.followUps.length ? report.followUps.map((f) => `- ${f}`) : ['- none']),
-      '',
-      'PR comment:',
-      prComment
-    ].join('\n'))
+      properties: {
+        Name: { title: [{ text: { content: title } }] },
+        Repository: { rich_text: [{ text: { content: `${pr.owner}/${pr.repo}` } }] },
+        PR: { number: pr.number },
+        Confidence: { select: { name: report.confidence } },
+        Findings: { number: report.findings.length },
+        Trigger: { rich_text: [{ text: { content: event.type } }] }
+      },
+      children: notionBlocks([
+        `PR: ${pr.url}`,
+        `Commit: ${pr.headSha ?? 'unknown'}`,
+        `Summary: ${report.summary}`,
+        '',
+        'Findings:',
+        ...(report.findings.length ? report.findings.map((f) => `- [${f.severity}] ${f.title}: ${f.recommendation}`) : ['- none']),
+        '',
+        'Follow-ups:',
+        ...(report.followUps.length ? report.followUps.map((f) => `- ${f}`) : ['- none']),
+        '',
+        'PR comment:',
+        prComment
+      ].join('\n'))
+    }
   );
-  return { id: page.id, url: page.url };
+  // Only surface a real Notion URL when the writeback worker returned one;
+  // page.path is the in-mount draft, not a clickable Notion link.
+  if (!page.receipt?.url) {
+    ctx.log('warn', 'repo-hygiene.notion-page.no-receipt', { draftPath: page.path });
+  }
+  return { id: page.receipt?.id, url: page.receipt?.url };
 }
 
 function notionBlocks(markdown: string): Array<Record<string, unknown>> {

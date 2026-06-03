@@ -22,11 +22,11 @@ test('reviewAuthorAllowlistDecision skips authors not in the allowlist', () => {
 test('reviewAuthorAllowlistDecision skips unresolved authors when configured', () => {
   assert.deepEqual(
     reviewAuthorAllowlistDecision(new Set(['khaliqgant']), ''),
-    { reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved' },
+    { reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved', notify: true },
   );
   assert.deepEqual(
     reviewAuthorAllowlistDecision(new Set(['khaliqgant']), 'unknown'),
-    { reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved' },
+    { reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved', notify: true },
   );
 });
 
@@ -74,6 +74,18 @@ test('readPr uses the pull request opener as author when present', () => {
     repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
     sender: { login: 'reviewer' },
   })?.author, 'WillWashburn');
+});
+
+test('readPr falls back to sender login for PR-shaped payloads when opener login is missing', () => {
+  assert.equal(readPr({
+    number: 27,
+    pull_request: {
+      number: 27,
+      html_url: 'https://github.com/AgentWorkforce/agents/pull/27',
+    },
+    repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
+    sender: { login: 'KhaliqGant' },
+  })?.author, 'KhaliqGant');
 });
 
 test('labelNames normalizes github label arrays defensively', () => {

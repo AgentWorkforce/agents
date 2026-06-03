@@ -30,7 +30,8 @@ export default definePersona({
     LINEAR_TEAM_ID: {
       description: 'Linear team to file prospect issues under (only needed if you have multiple teams).',
       env: 'LINEAR_TEAM_ID',
-      optional: true
+      optional: true,
+      picker: { provider: 'linear', resource: 'teams' }
     }
   },
 

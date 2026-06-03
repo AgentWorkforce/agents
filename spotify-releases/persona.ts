@@ -14,7 +14,11 @@ export default definePersona({
   integrations: { slack: {} },
 
   inputs: {
-    SLACK_USER: { description: 'Your Slack user id — releases are DMed here.', env: 'SLACK_USER' },
+    SLACK_USER: {
+      description: 'Your Slack user id — releases are DMed here.',
+      env: 'SLACK_USER',
+      picker: { provider: 'slack', resource: 'users' }
+    },
     SPOTIFY_TOKEN: { description: 'Spotify OAuth token with the user-follow-read scope.', env: 'SPOTIFY_TOKEN' }
   },
 

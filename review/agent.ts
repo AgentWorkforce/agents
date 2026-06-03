@@ -142,7 +142,7 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
 /** Lowercased PR author login, preferring the authoritative meta.json (string
  *  or `{ login }`) and falling back to the webhook payload. Returns '' when no
  *  login can be determined. */
-function resolveAuthorLogin(meta: PrMeta | undefined, pr: Pr): string {
+export function resolveAuthorLogin(meta: PrMeta | undefined, pr: Pr): string {
   const fromMeta = typeof meta?.author === 'string' ? meta.author : meta?.author?.login;
   return (fromMeta ?? pr.author ?? '').trim().toLowerCase();
 }
@@ -189,7 +189,7 @@ export function reviewAuthorAllowlistDecision(
   return null;
 }
 
-function labelNames(labels: unknown): string[] {
+export function labelNames(labels: unknown): string[] {
   if (!Array.isArray(labels)) return [];
   return labels
     .map((l) => (l && typeof (l as { name?: unknown }).name === 'string' ? (l as { name: string }).name.trim().toLowerCase() : ''))

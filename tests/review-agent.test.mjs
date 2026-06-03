@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { reviewAuthorAllowlistDecision } from '../.test-build/review/agent.js';
+import {
+  labelNames,
+  resolveAuthorLogin,
+  reviewAuthorAllowlistDecision,
+} from '../.test-build/review/agent.js';
 
 test('reviewAuthorAllowlistDecision lets configured authors through', () => {
   assert.equal(reviewAuthorAllowlistDecision(new Set(['willwashburn']), 'willwashburn'), null);
@@ -29,4 +33,21 @@ test('reviewAuthorAllowlistDecision leaves unset allowlists open to everyone', (
   assert.equal(reviewAuthorAllowlistDecision(new Set(), 'willwashburn'), null);
   assert.equal(reviewAuthorAllowlistDecision(new Set(), ''), null);
   assert.equal(reviewAuthorAllowlistDecision(new Set(), 'unknown'), null);
+});
+
+test('resolveAuthorLogin prefers normalized meta author shapes', () => {
+  assert.equal(resolveAuthorLogin({ author: ' WillWashburn ' }, { author: 'fallback' }), 'willwashburn');
+  assert.equal(resolveAuthorLogin({ author: { login: ' KhaliqGant ' } }, { author: 'fallback' }), 'khaliqgant');
+  assert.equal(resolveAuthorLogin({}, { author: ' FallBack ' }), 'fallback');
+});
+
+test('labelNames normalizes github label arrays defensively', () => {
+  assert.deepEqual(labelNames([
+    { name: ' No-Agent-Relay-Review ' },
+    { name: '' },
+    { name: 42 },
+    null,
+    { other: 'ignored' },
+  ]), ['no-agent-relay-review']);
+  assert.deepEqual(labelNames(undefined), []);
 });

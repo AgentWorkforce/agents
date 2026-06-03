@@ -5,11 +5,7 @@
     "review"
   ],
   "description": "Reviews new PRs, fixes the issues found (its own + other bots'), resolves failing CI and merge conflicts, pings you on Slack when ready, and merges once you approve.",
-  "cloud": true,
-  "integrations": {
-    "github": {},
-    "slack": {}
-  },
+  "skills": [],
   "inputs": {
     "SLACK_CHANNEL": {
       "description": "Slack channel to post review updates to (the message references the PR author).",
@@ -51,6 +47,19 @@
     "reasoning": "high",
     "timeoutSeconds": 2400,
     "dangerouslyBypassApprovalsAndSandbox": true
+  },
+  "cloud": true,
+  "integrations": {
+    "github": {
+      "source": {
+        "kind": "deployer_user"
+      }
+    },
+    "slack": {
+      "source": {
+        "kind": "deployer_user"
+      }
+    }
   },
   "onEvent": "./agent.ts"
 }

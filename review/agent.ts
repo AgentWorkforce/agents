@@ -180,12 +180,12 @@ function reviewAuthorAllowlist(ctx: WorkforceCtx): Set<string> {
 export function reviewAuthorAllowlistDecision(
   allow: Set<string>,
   author: string
-): { reason: string } | null {
+): { reason: string; notify?: boolean } | null {
   if (allow.size === 0) {
     return null;
   }
   if (!author || author === 'unknown') {
-    return { reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved' };
+    return { reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved', notify: true };
   }
   if (!allow.has(author)) {
     return { reason: `author @${author} is not in REVIEW_AUTHORS` };
@@ -310,6 +310,7 @@ export function readPr(payload: unknown): Pr | undefined {
     };
     check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
     repository?: { name?: string; owner?: { login?: string } };
+    sender?: { login?: string };
   } | null;
   const prRef = p?.pull_request ?? p?.check_run?.pull_requests?.[0];
   const number = prRef?.number ?? p?.number;
@@ -323,7 +324,7 @@ export function readPr(payload: unknown): Pr | undefined {
     repo,
     number,
     url: prRef?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}`,
-    author: p?.pull_request?.user?.login ?? 'unknown',
+    author: p?.pull_request?.user?.login ?? (p?.pull_request ? p?.sender?.login : undefined) ?? 'unknown',
     ...(headSha ? { headSha } : {}),
     ...(p?.pull_request?.state ? { state: p.pull_request.state } : {}),
     ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),

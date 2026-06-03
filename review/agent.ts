@@ -132,10 +132,11 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
   // Author allowlist: when REVIEW_AUTHORS is set, only review/fix PRs opened by
   // those logins (e.g. "only my own PRs"). Unset → review every author.
   // Fail closed when configured: if the author can't be resolved confidently,
-  // skip instead of risking a review on the wrong PR author.
+  // skip instead of risking a review on the wrong PR author. If the Relayfile
+  // PR meta has not synced yet, fall back to GitHub's authoritative pull API
+  // before making the fail-closed decision.
   const allow = reviewAuthorAllowlist(ctx);
-  const author = resolveAuthorLogin(meta, pr);
-  const allowlistSkip = reviewAuthorAllowlistDecision(allow, author);
+  const allowlistSkip = await reviewAuthorAllowlistDecisionForPr(ctx, allow, meta, pr);
   if (allowlistSkip) {
     return allowlistSkip;
   }
@@ -149,6 +150,77 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
 export function resolveAuthorLogin(meta: PrMeta | undefined, pr: Pr): string {
   const fromMeta = typeof meta?.author === 'string' ? meta.author : meta?.author?.login;
   return (fromMeta ?? pr.author ?? '').trim().toLowerCase();
+}
+
+type FetchFn = typeof fetch;
+
+export async function reviewAuthorAllowlistDecisionForPr(
+  ctx: WorkforceCtx,
+  allow: Set<string>,
+  meta: PrMeta | undefined,
+  pr: Pr,
+  fetchImpl: FetchFn = fetch
+): Promise<{ reason: string; notify?: boolean } | null> {
+  if (allow.size === 0) {
+    return null;
+  }
+  const author = await resolveAuthorLoginForReview(ctx, meta, pr, fetchImpl);
+  return reviewAuthorAllowlistDecision(allow, author);
+}
+
+export async function resolveAuthorLoginForReview(
+  ctx: WorkforceCtx,
+  meta: PrMeta | undefined,
+  pr: Pr,
+  fetchImpl: FetchFn = fetch
+): Promise<string> {
+  const author = resolveAuthorLogin(meta, pr);
+  if (!isUnresolvedAuthor(author)) {
+    return author;
+  }
+  const token = githubApiToken(ctx);
+  if (!token) {
+    return author;
+  }
+  return await fetchPullRequestAuthor(pr, token, fetchImpl) ?? author;
+}
+
+function isUnresolvedAuthor(author: string): boolean {
+  return !author || author === 'unknown';
+}
+
+function githubApiToken(ctx: WorkforceCtx): string | undefined {
+  return input(ctx, 'GITHUB_TOKEN')
+    ?? input(ctx, 'GH_TOKEN')
+    ?? input(ctx, 'GITHUB_API_TOKEN')
+    ?? input(ctx, 'GITHUB_PR_WORKSPACE_TOKEN');
+}
+
+async function fetchPullRequestAuthor(
+  pr: Pr,
+  token: string,
+  fetchImpl: FetchFn
+): Promise<string | undefined> {
+  try {
+    const res = await fetchImpl(
+      `https://api.github.com/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}`,
+      {
+        headers: {
+          accept: 'application/vnd.github+json',
+          authorization: `Bearer ${token}`,
+          'x-github-api-version': '2022-11-28'
+        }
+      }
+    );
+    if (!res.ok) {
+      return undefined;
+    }
+    const body = await res.json() as { user?: { login?: unknown } };
+    const login = typeof body.user?.login === 'string' ? body.user.login.trim().toLowerCase() : '';
+    return login || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function loadPrMeta(pr: Pr): Promise<PrMeta | undefined> {

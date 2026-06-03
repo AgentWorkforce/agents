@@ -5,6 +5,7 @@ import {
   labelNames,
   readPr,
   resolveAuthorLogin,
+  reviewAuthorAllowlistDecisionForPr,
   reviewAuthorAllowlistDecision,
 } from '../.test-build/review/agent.js';
 
@@ -34,6 +35,72 @@ test('reviewAuthorAllowlistDecision leaves unset allowlists open to everyone', (
   assert.equal(reviewAuthorAllowlistDecision(new Set(), 'willwashburn'), null);
   assert.equal(reviewAuthorAllowlistDecision(new Set(), ''), null);
   assert.equal(reviewAuthorAllowlistDecision(new Set(), 'unknown'), null);
+});
+
+test('reviewAuthorAllowlistDecisionForPr falls back to GitHub API when mounted PR author is not ready', async () => {
+  const calls = [];
+  const decision = await reviewAuthorAllowlistDecisionForPr(
+    ctxWithGithubToken('ghp_test'),
+    new Set(['khaliqgant']),
+    {},
+    prWithUnknownAuthor(),
+    async (url, init) => {
+      calls.push({ url, init });
+      return {
+        ok: true,
+        async json() {
+          return { user: { login: 'KhaliqGant' } };
+        },
+      };
+    },
+  );
+
+  assert.equal(decision, null);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://api.github.com/repos/AgentWorkforce/cloud/pulls/1803');
+  assert.equal(calls[0].init.headers.authorization, 'Bearer ghp_test');
+});
+
+test('reviewAuthorAllowlistDecisionForPr recognizes cloud pull-request workspace token env', async () => {
+  const calls = [];
+  const decision = await reviewAuthorAllowlistDecisionForPr(
+    {
+      persona: {
+        inputs: { GITHUB_PR_WORKSPACE_TOKEN: 'ghs_installation_test' },
+        inputSpecs: {},
+      },
+    },
+    new Set(['khaliqgant']),
+    {},
+    prWithUnknownAuthor(),
+    async (url, init) => {
+      calls.push({ url, init });
+      return {
+        ok: true,
+        async json() {
+          return { user: { login: 'khaliqgant' } };
+        },
+      };
+    },
+  );
+
+  assert.equal(decision, null);
+  assert.equal(calls[0].init.headers.authorization, 'Bearer ghs_installation_test');
+});
+
+test('reviewAuthorAllowlistDecisionForPr remains fail-closed when GitHub API author lookup fails', async () => {
+  const decision = await reviewAuthorAllowlistDecisionForPr(
+    ctxWithGithubToken('ghp_test'),
+    new Set(['khaliqgant']),
+    {},
+    prWithUnknownAuthor(),
+    async () => ({ ok: false, async json() { return {}; } }),
+  );
+
+  assert.deepEqual(decision, {
+    reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved',
+    notify: true,
+  });
 });
 
 test('resolveAuthorLogin prefers normalized meta author shapes', () => {
@@ -98,3 +165,22 @@ test('labelNames normalizes github label arrays defensively', () => {
   ]), ['no-agent-relay-review']);
   assert.deepEqual(labelNames(undefined), []);
 });
+
+function ctxWithGithubToken(token) {
+  return {
+    persona: {
+      inputs: { GITHUB_TOKEN: token },
+      inputSpecs: {},
+    },
+  };
+}
+
+function prWithUnknownAuthor() {
+  return {
+    owner: 'AgentWorkforce',
+    repo: 'cloud',
+    number: 1803,
+    url: 'https://github.com/AgentWorkforce/cloud/pull/1803',
+    author: 'unknown',
+  };
+}

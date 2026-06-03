@@ -7,7 +7,6 @@
  */
 import {
   defineAgent,
-  unwrapResourceRecord,
   type WorkforceCtx,
   type WorkforceProviderEvent,
 } from '@agentworkforce/runtime';
@@ -32,12 +31,12 @@ interface LinearIssue {
 interface LinearClientLike {
   getIssue<T>(issueId: string): Promise<T>;
   comment(issueId: string, body: string): Promise<unknown>;
-  agentActivity(
+  agentActivity?(
     sessionId: string,
     activity: { type: 'thought' | 'response' | 'elicitation' | 'action' | 'error'; body: string },
   ): Promise<unknown>;
-  respond(sessionId: string, body: string): Promise<unknown>;
-  acknowledge(sessionId: string): Promise<unknown>;
+  respond?(sessionId: string, body: string): Promise<unknown>;
+  acknowledge?(sessionId: string): Promise<unknown>;
 }
 
 interface ChatIntent {
@@ -155,10 +154,11 @@ function linearEventContext(event: WorkforceProviderEvent): LinearEventContext {
 }
 
 async function postThought(linear: LinearClientLike, sessionId: string): Promise<void> {
+  if (!linear.agentActivity) return;
   try {
     await linear.agentActivity(sessionId, { type: 'thought', body: 'Reading the thread and preparing a response.' });
   } catch {
-    await linear.acknowledge(sessionId);
+    await linear.acknowledge?.(sessionId);
   }
 }
 
@@ -167,7 +167,7 @@ async function replyToLinear(
   eventContext: LinearEventContext,
   body: string,
 ): Promise<void> {
-  if (eventContext.sessionId) {
+  if (eventContext.sessionId && linear.respond) {
     await linear.respond(eventContext.sessionId, body);
     return;
   }
@@ -756,6 +756,21 @@ function payloadKeys(payload: unknown): string[] {
 
 function linearRecordPayload(payload: unknown): unknown {
   return unwrapResourceRecord(payload);
+}
+
+function unwrapResourceRecord(payload: unknown): unknown {
+  const record = asRecord(payload);
+  if (!record) return payload;
+  if ('record' in record) return record.record;
+  const resource = asRecord(record.resource);
+  if (resource && 'payload' in resource) return resource.payload;
+  return payload;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 function logSkip(

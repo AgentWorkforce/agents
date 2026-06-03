@@ -127,15 +127,13 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
 
   // Author allowlist: when REVIEW_AUTHORS is set, only review/fix PRs opened by
   // those logins (e.g. "only my own PRs"). Unset → review every author.
-  // Fail open: if we couldn't determine a confident author (meta read failed
-  // and the payload had none), don't block — the gate only excludes a known
-  // author that isn't allowed.
+  // Fail closed when configured: if the author can't be resolved confidently,
+  // skip instead of risking a review on the wrong PR author.
   const allow = reviewAuthorAllowlist(ctx);
-  if (allow.size > 0) {
-    const author = resolveAuthorLogin(meta, pr);
-    if (author && author !== 'unknown' && !allow.has(author)) {
-      return { reason: `author @${author} is not in REVIEW_AUTHORS` };
-    }
+  const author = resolveAuthorLogin(meta, pr);
+  const allowlistSkip = reviewAuthorAllowlistDecision(allow, author);
+  if (allowlistSkip) {
+    return allowlistSkip;
   }
 
   return null;
@@ -144,7 +142,7 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
 /** Lowercased PR author login, preferring the authoritative meta.json (string
  *  or `{ login }`) and falling back to the webhook payload. Returns '' when no
  *  login can be determined. */
-function resolveAuthorLogin(meta: PrMeta | undefined, pr: Pr): string {
+export function resolveAuthorLogin(meta: PrMeta | undefined, pr: Pr): string {
   const fromMeta = typeof meta?.author === 'string' ? meta.author : meta?.author?.login;
   return (fromMeta ?? pr.author ?? '').trim().toLowerCase();
 }
@@ -175,7 +173,23 @@ function reviewAuthorAllowlist(ctx: WorkforceCtx): Set<string> {
   return new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
 }
 
-function labelNames(labels: unknown): string[] {
+export function reviewAuthorAllowlistDecision(
+  allow: Set<string>,
+  author: string
+): { reason: string } | null {
+  if (allow.size === 0) {
+    return null;
+  }
+  if (!author || author === 'unknown') {
+    return { reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved' };
+  }
+  if (!allow.has(author)) {
+    return { reason: `author @${author} is not in REVIEW_AUTHORS` };
+  }
+  return null;
+}
+
+export function labelNames(labels: unknown): string[] {
   if (!Array.isArray(labels)) return [];
   return labels
     .map((l) => (l && typeof (l as { name?: unknown }).name === 'string' ? (l as { name: string }).name.trim().toLowerCase() : ''))
@@ -283,7 +297,7 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 // The PR lives in different places per event: `pull_request` (opened /
 // synchronize / review / review_comment), `check_run.pull_requests[0]`
 // (check_run.completed), or the top-level `number`.
-function readPr(payload: unknown): Pr | undefined {
+export function readPr(payload: unknown): Pr | undefined {
   const p = payload as {
     number?: number;
     pull_request?: {
@@ -297,7 +311,6 @@ function readPr(payload: unknown): Pr | undefined {
     };
     check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
     repository?: { name?: string; owner?: { login?: string } };
-    sender?: { login?: string };
   } | null;
   const prRef = p?.pull_request ?? p?.check_run?.pull_requests?.[0];
   const number = prRef?.number ?? p?.number;
@@ -311,7 +324,7 @@ function readPr(payload: unknown): Pr | undefined {
     repo,
     number,
     url: prRef?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}`,
-    author: p?.pull_request?.user?.login ?? p?.sender?.login ?? 'unknown',
+    author: p?.pull_request?.user?.login ?? 'unknown',
     ...(headSha ? { headSha } : {}),
     ...(p?.pull_request?.state ? { state: p.pull_request.state } : {}),
     ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),

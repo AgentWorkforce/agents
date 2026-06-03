@@ -7,6 +7,7 @@
   "description": "A collection of proactive agents — showcase examples for Agent Workforce.",
   "scripts": {
     "test": "rm -rf .test-build && tsc --noEmit false --outDir .test-build && node --test tests/*.test.mjs; status=$?; rm -rf .test-build; exit $status",
+    "test:review": "node scripts/test.mjs tests/review-agent.test.mjs",
     "typecheck": "tsc --noEmit",
     "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done"
   },
@@ -18,6 +19,7 @@
   "devDependencies": {
     "@types/node": "^22",
     "agentworkforce": "^3.0.41",
+    "esbuild": "^0.25.12",
     "typescript": "^5.6.0"
   },
   "overrides": {

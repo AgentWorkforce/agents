@@ -9,6 +9,11 @@
  * The PR's repo is materialized into ctx.sandbox.cwd by cloud before the
  * harness runs. The agent fixes by editing files there; cloud commits and
  * pushes those edits after the harness exits — no git/gh in the harness.
+ *
+ * Slack policy: the channel only hears about a PR when it's a human's turn —
+ * checks green, every bot/reviewer comment resolved, nothing left for the agent
+ * to fix (the agent's READY sentinel). In-progress passes stay silent. The only
+ * other pings are operator/terminal signals: a failed harness run and a merge.
  */
 import {
   defineAgent,
@@ -85,7 +90,6 @@ export default defineAgent({
     const skip = await shouldSkipReview(ctx, pr);
     if (skip) {
       ctx.log?.('info', 'pr-reviewer skipped', { owner: pr.owner, repo: pr.repo, number: pr.number, reason: skip.reason });
-      if (skip.notify) await notifySkip(ctx, pr, skip.reason);
       return;
     }
     await reviewAndFix(ctx, pr);
@@ -104,7 +108,7 @@ export default defineAgent({
 // and an author allowlist. Prefer the live PR meta.json, but fall back to
 // fields that are present on pull_request webhook payloads; check_run.completed
 // payloads do not carry enough detail, so those fail open when meta is missing.
-async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: string; notify?: boolean } | null> {
+async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: string } | null> {
   const meta = await loadPrMeta(pr);
 
   // Already merged/closed by the time we got here — don't post a stale review
@@ -113,7 +117,7 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
   // tracked in AgentWorkforce/cloud#1659 / #1660.
   const state = (meta?.state ?? pr.state ?? '').trim().toLowerCase();
   if (meta?.merged === true || pr.merged === true || state === 'closed') {
-    return { reason: 'PR is already merged/closed', notify: true };
+    return { reason: 'PR is already merged/closed' };
   }
 
   // A disabling label turns the reviewer off entirely for this PR. `labels` is
@@ -196,15 +200,6 @@ export function labelNames(labels: unknown): string[] {
     .filter(Boolean);
 }
 
-async function notifySkip(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<void> {
-  const channel = input(ctx, 'SLACK_CHANNEL');
-  if (!channel) return;
-  await slackClient().post(
-    channel,
-    `:information_source: pr-reviewer skipped PR #${pr.number} in *${pr.owner}/${pr.repo}* — ${reason}: ${pr.url}`
-  );
-}
-
 async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   const run = await ctx.harness.run({
     cwd: ctx.sandbox.cwd,
@@ -217,7 +212,9 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
       `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; cloud commits`,
       `and pushes your file edits to the PR after this run. In your output, do not claim that fixes were pushed,`,
       `a GitHub review was submitted, or CI was verified; those are post-harness actions that cloud reports separately.`,
-      `When the PR is genuinely ready for a human after your local review and edits, end your output with READY on its own last line.`
+      `Only end your output with READY on its own last line when the PR genuinely needs a human now — meaning you have`,
+      `resolved or addressed every bot and reviewer comment, there are no failing checks left that you could fix, and the`,
+      `remaining decision requires human judgment. If anything is still red, unresolved, or in-progress, do NOT print READY.`
     ].join('\n')
   });
 
@@ -239,14 +236,16 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
     await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
   }
 
+  // Only ping Slack when the PR is actually a human's turn: checks green, all
+  // bot/reviewer comments resolved, nothing left for the agent to fix (the
+  // READY sentinel). Every in-progress pass — opened, new commits, failing CI,
+  // unresolved bot threads — stays silent so the channel isn't a play-by-play.
   const channel = input(ctx, 'SLACK_CHANNEL');
-  if (channel) {
+  if (channel && ready) {
     const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
     await slackClient().post(
       channel,
-      ready
-        ? `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
-        : `:eyes: ${who} — reviewing PR #${pr.number} in *${pr.owner}/${pr.repo}*, still working on it: ${pr.url}`
+      `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
     );
   }
 }

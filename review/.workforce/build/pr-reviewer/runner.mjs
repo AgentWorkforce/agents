@@ -14,10 +14,32 @@ import * as userModule from './agent.bundle.mjs';
 const require = createRequire(import.meta.url);
 const persona = require('./persona.json');
 
-const candidate = userModule.default ?? userModule.handler;
+// The agent.ts default export is a `defineAgent({...})` object carrying the
+// handler plus the listener declarations. A bare function default export is
+// accepted as a legacy fallback (treated as the handler with no listeners).
+const exported = userModule.default ?? userModule.handler;
+let candidate;
+let agentSpec;
+if (exported && exported.__workforceAgent) {
+  candidate = exported.handler;
+  agentSpec = {
+    ...(exported.triggers ? { triggers: exported.triggers } : {}),
+    ...(exported.schedules ? { schedules: exported.schedules } : {}),
+    ...(exported.watch ? { watch: exported.watch } : {})
+  };
+} else if (exported && typeof exported.handler === 'function') {
+  candidate = exported.handler;
+  agentSpec = {
+    ...(exported.triggers ? { triggers: exported.triggers } : {}),
+    ...(exported.schedules ? { schedules: exported.schedules } : {}),
+    ...(exported.watch ? { watch: exported.watch } : {})
+  };
+} else {
+  candidate = exported;
+}
 if (typeof candidate !== 'function') {
   throw new TypeError(
-    `workforce deploy bundle: ${persona.id} did not default-export a function. Did you forget \`export default handler(...)\`?`
+    `workforce deploy bundle: ${persona.id} did not default-export defineAgent({ ..., handler }). Did you forget \`export default defineAgent(...)\`?`
   );
 }
 const handler = candidate.__workforceHandler ? candidate : wrapHandler(candidate);
@@ -25,7 +47,7 @@ const handler = candidate.__workforceHandler ? candidate : wrapHandler(candidate
 const agent = readRuntimeContext('WORKFORCE_AGENT_CONTEXT');
 const deployment = readRuntimeContext('WORKFORCE_DEPLOYMENT_CONTEXT');
 
-await startRunner({ persona, agent, deployment, handler });
+await startRunner({ persona, agent, deployment, handler, ...(agentSpec ? { agentSpec } : {}) });
 
 function readRuntimeContext(name) {
   const raw = process.env[name];

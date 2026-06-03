@@ -5,11 +5,16 @@
     "review"
   ],
   "description": "Reviews new PRs, fixes the issues found (its own + other bots'), resolves failing CI and merge conflicts, pings you on Slack when ready, and merges once you approve.",
-  "skills": [],
+  "cloud": true,
+  "integrations": {
+    "github": {},
+    "slack": {}
+  },
   "inputs": {
     "SLACK_CHANNEL": {
       "description": "Slack channel to post review updates to (the message references the PR author).",
       "env": "SLACK_CHANNEL",
+      "optional": true,
       "picker": {
         "provider": "slack",
         "resource": "channels"
@@ -23,6 +28,20 @@
         "provider": "github",
         "resource": "users"
       }
+    },
+    "REVIEW_AUTHORS": {
+      "description": "Only review and auto-fix PRs opened by these GitHub logins (comma-separated). If unset, every author is reviewed.",
+      "env": "REVIEW_AUTHORS",
+      "optional": true,
+      "picker": {
+        "provider": "github",
+        "resource": "users"
+      }
+    },
+    "SKIP_LABELS": {
+      "description": "PR labels that disable the reviewer entirely (comma-separated). Defaults to \"no-agent-relay-review\".",
+      "env": "SKIP_LABELS",
+      "optional": true
     }
   },
   "harness": "codex",
@@ -32,36 +51,6 @@
     "reasoning": "high",
     "timeoutSeconds": 2400,
     "dangerouslyBypassApprovalsAndSandbox": true
-  },
-  "cloud": true,
-  "integrations": {
-    "github": {
-      "source": {
-        "kind": "deployer_user"
-      },
-      "triggers": [
-        {
-          "on": "pull_request.opened"
-        },
-        {
-          "on": "pull_request_review.submitted"
-        },
-        {
-          "on": "pull_request_review_comment.created"
-        },
-        {
-          "on": "check_run.completed"
-        },
-        {
-          "on": "pull_request.synchronize"
-        }
-      ]
-    },
-    "slack": {
-      "source": {
-        "kind": "deployer_user"
-      }
-    }
   },
   "onEvent": "./agent.ts"
 }

@@ -127,15 +127,13 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
 
   // Author allowlist: when REVIEW_AUTHORS is set, only review/fix PRs opened by
   // those logins (e.g. "only my own PRs"). Unset → review every author.
-  // Fail open: if we couldn't determine a confident author (meta read failed
-  // and the payload had none), don't block — the gate only excludes a known
-  // author that isn't allowed.
+  // Fail closed when configured: if the author can't be resolved confidently,
+  // skip instead of risking a review on the wrong PR author.
   const allow = reviewAuthorAllowlist(ctx);
-  if (allow.size > 0) {
-    const author = resolveAuthorLogin(meta, pr);
-    if (author && author !== 'unknown' && !allow.has(author)) {
-      return { reason: `author @${author} is not in REVIEW_AUTHORS` };
-    }
+  const author = resolveAuthorLogin(meta, pr);
+  const allowlistSkip = reviewAuthorAllowlistDecision(allow, author);
+  if (allowlistSkip) {
+    return allowlistSkip;
   }
 
   return null;
@@ -173,6 +171,22 @@ function skipLabelSet(ctx: WorkforceCtx): Set<string> {
 function reviewAuthorAllowlist(ctx: WorkforceCtx): Set<string> {
   const raw = input(ctx, 'REVIEW_AUTHORS') ?? '';
   return new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
+
+export function reviewAuthorAllowlistDecision(
+  allow: Set<string>,
+  author: string
+): { reason: string } | null {
+  if (allow.size === 0) {
+    return null;
+  }
+  if (!author || author === 'unknown') {
+    return { reason: 'REVIEW_AUTHORS is set but the PR author could not be resolved' };
+  }
+  if (!allow.has(author)) {
+    return { reason: `author @${author} is not in REVIEW_AUTHORS` };
+  }
+  return null;
 }
 
 function labelNames(labels: unknown): string[] {

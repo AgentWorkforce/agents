@@ -760,11 +760,11 @@ function linearRecordPayload(payload: unknown): unknown {
 
 function unwrapResourceRecord(payload: unknown): unknown {
   const record = asRecord(payload);
-  if (!record) return payload;
-  if ('record' in record) return record.record;
-  const resource = asRecord(record.resource);
-  if (resource && 'payload' in resource) return resource.payload;
-  return payload;
+  const resource = record && 'resource' in record ? record.resource : payload;
+  const resourceRecord = asRecord(resource);
+  if (resourceRecord && 'payload' in resourceRecord) return resourceRecord.payload;
+  if (resourceRecord && 'record' in resourceRecord) return resourceRecord.record;
+  return resource;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

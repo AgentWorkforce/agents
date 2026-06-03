@@ -218,6 +218,32 @@ test('AgentSessionEvent implement request delegates to workflow and posts PR lin
   assert.match(linear.activities.at(-1)?.activity.body, /https:\/\/github\.com\/AgentWorkforce\/cloud\/pull\/123/);
 });
 
+test('AgentSessionEvent falls back to issue comments when session methods are unavailable', async () => {
+  const runtime = ctx();
+  const linear = linearClient();
+  delete linear.agentActivity;
+  delete linear.respond;
+  delete linear.acknowledge;
+
+  await handleLinearEvent(runtime, event('AgentSessionEvent.prompted', {
+    resource: {
+      provider: 'linear',
+      objectType: 'comment',
+      payload: {
+        type: 'AgentSessionEvent',
+        action: 'prompted',
+        agentSession: { id: 'session-1', issue: { id: 'issue-1', identifier: 'AR-70' } },
+        agentActivity: { id: 'activity-1', body: 'What is the current plan?' },
+      },
+    },
+  }), linear);
+
+  assert.deepEqual(linear.activities, []);
+  assert.deepEqual(linear.comments, [{ issueId: 'issue-1', body: 'I can help with that.' }]);
+  assert.ok(runtime.memorySaves.some((entry) => entry.content === 'user: What is the current plan?'));
+  assert.ok(runtime.memorySaves.some((entry) => entry.content === 'assistant: I can help with that.'));
+});
+
 test('AppUserNotification.issueCommentMention uses comment fallback', async () => {
   const runtime = ctx();
   const linear = linearClient();
@@ -265,6 +291,28 @@ test('AppUserNotification without a mention logs a skip and does not reply', asy
   assert.ok(runtime.logs.some((log) =>
     log.message === 'linear comment skipped' &&
     log.attrs?.reason === 'comment did not mention agent'
+  ));
+});
+
+test('resource wrapper without payload is treated as the record', async () => {
+  const runtime = ctx();
+  const linear = linearClient();
+
+  await handleLinearEvent(runtime, event('AppUserNotification.issueCommentMention', {
+    resource: {
+      provider: 'linear',
+      objectType: 'comment',
+      body: '@agentrelay please explain this.',
+      issue_id: 'issue-1',
+      issue_identifier: 'AR-70',
+    },
+  }), linear);
+
+  assert.deepEqual(linear.comments, [{ issueId: 'issue-1', body: 'I can help with that.' }]);
+  assert.ok(runtime.logs.some((log) =>
+    log.message === 'linear event' &&
+    Array.isArray(log.attrs?.recordKeys) &&
+    log.attrs.recordKeys.includes('body')
   ));
 });
 

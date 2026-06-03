@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   labelNames,
+  readPr,
   resolveAuthorLogin,
   reviewAuthorAllowlistDecision,
 } from '../.test-build/review/agent.js';
@@ -39,6 +40,40 @@ test('resolveAuthorLogin prefers normalized meta author shapes', () => {
   assert.equal(resolveAuthorLogin({ author: ' WillWashburn ' }, { author: 'fallback' }), 'willwashburn');
   assert.equal(resolveAuthorLogin({ author: { login: ' KhaliqGant ' } }, { author: 'fallback' }), 'khaliqgant');
   assert.equal(resolveAuthorLogin({}, { author: ' FallBack ' }), 'fallback');
+});
+
+test('readPr does not treat check-run sender as the PR author', () => {
+  assert.deepEqual(readPr({
+    check_run: {
+      pull_requests: [{
+        number: 27,
+        html_url: 'https://github.com/AgentWorkforce/agents/pull/27',
+        head_sha: 'abc123',
+      }],
+    },
+    repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
+    sender: { login: 'allowed-bot' },
+  }), {
+    owner: 'AgentWorkforce',
+    repo: 'agents',
+    number: 27,
+    url: 'https://github.com/AgentWorkforce/agents/pull/27',
+    author: 'unknown',
+    headSha: 'abc123',
+  });
+});
+
+test('readPr uses the pull request opener as author when present', () => {
+  assert.equal(readPr({
+    number: 27,
+    pull_request: {
+      number: 27,
+      html_url: 'https://github.com/AgentWorkforce/agents/pull/27',
+      user: { login: 'WillWashburn' },
+    },
+    repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
+    sender: { login: 'reviewer' },
+  })?.author, 'WillWashburn');
 });
 
 test('labelNames normalizes github label arrays defensively', () => {

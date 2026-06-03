@@ -297,7 +297,7 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 // The PR lives in different places per event: `pull_request` (opened /
 // synchronize / review / review_comment), `check_run.pull_requests[0]`
 // (check_run.completed), or the top-level `number`.
-function readPr(payload: unknown): Pr | undefined {
+export function readPr(payload: unknown): Pr | undefined {
   const p = payload as {
     number?: number;
     pull_request?: {
@@ -311,7 +311,6 @@ function readPr(payload: unknown): Pr | undefined {
     };
     check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
     repository?: { name?: string; owner?: { login?: string } };
-    sender?: { login?: string };
   } | null;
   const prRef = p?.pull_request ?? p?.check_run?.pull_requests?.[0];
   const number = prRef?.number ?? p?.number;
@@ -325,7 +324,7 @@ function readPr(payload: unknown): Pr | undefined {
     repo,
     number,
     url: prRef?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}`,
-    author: p?.pull_request?.user?.login ?? p?.sender?.login ?? 'unknown',
+    author: p?.pull_request?.user?.login ?? 'unknown',
     ...(headSha ? { headSha } : {}),
     ...(p?.pull_request?.state ? { state: p.pull_request.state } : {}),
     ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),

@@ -20,7 +20,11 @@ export default definePersona({
       env: 'TOPICS',
       default: 'agents,ai,typescript,developer tools'
     },
-    SLACK_CHANNEL: { description: 'Slack channel id to post the digest to.', env: 'SLACK_CHANNEL' }
+    SLACK_CHANNEL: {
+      description: 'Slack channel id to post the digest to.',
+      env: 'SLACK_CHANNEL',
+      picker: { provider: 'slack', resource: 'channels' }
+    }
   },
 
   // ctx.llm uses this model to summarize the matching stories.

@@ -99,3 +99,26 @@ test('every relay-helpers provider a persona uses is mounted via trigger or non-
       'See the writing-agent-personas skill §1.',
   );
 });
+
+test('every cloud persona using ctx.llm opts into subscription credentials', async () => {
+  const dirs = personaDirs();
+  assert.ok(dirs.length >= 5, `expected to discover the persona set, found: ${dirs.join(', ')}`);
+
+  const violations = [];
+  for (const dir of dirs) {
+    const agentSource = readFileSync(join(repoRoot, dir, 'agent.ts'), 'utf8');
+    if (!/\bctx\.llm\.complete\s*\(/.test(agentSource)) continue;
+
+    const { default: persona } = await import(`../.test-build/${dir}/persona.js`);
+    if (persona.cloud && persona.useSubscription !== true) {
+      violations.push(`${dir}: calls ctx.llm.complete in cloud but does not set useSubscription: true`);
+    }
+  }
+
+  assert.deepEqual(
+    violations,
+    [],
+    `cloud personas with ctx.llm but no subscription credential consent:\n  ${violations.join('\n  ')}\n` +
+      'Fix: add useSubscription: true to the persona so cloud can resolve the deployer credential for ctx.llm.',
+  );
+});

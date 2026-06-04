@@ -12,13 +12,13 @@
     "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done"
   },
   "dependencies": {
-    "@agentworkforce/persona-kit": "^3.0.41",
-    "@agentworkforce/runtime": "^3.0.41",
+    "@agentworkforce/persona-kit": "^3.0.47",
+    "@agentworkforce/runtime": "^3.0.47",
     "@relayfile/relay-helpers": "0.3.33"
   },
   "devDependencies": {
     "@types/node": "^22",
-    "agentworkforce": "^3.0.41",
+    "agentworkforce": "^3.0.47",
     "esbuild": "^0.25.12",
     "typescript": "^5.6.0"
   },

@@ -41,9 +41,9 @@ curl -sS -X POST "$CLOUD_API_BASE/api/v1/workspaces/$WORKSPACE_ID/teams" \
 
 Multi-member roster for the deployed `cloud-team-issue` teamSolve agent
 (lead-outside-member-list shape: the lead is the deployed agent, the members
-are the launchable workers). Both members reference the `cloud-team-issue`
-persona slug — the only deployed teamSolve persona — and are distinguished by
-`name`/`role`.
+are the launchable workers). Members reference the deployed
+`cloud-team-implementer` and `cloud-team-reviewer` persona slugs and are
+distinguished by `name`/`role`.
 
 Binding this roster is one of **three** levers for team N>1 go-live; the other
 two live in cloud and the roster stays dormant until they flip:

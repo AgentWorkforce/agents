@@ -37,12 +37,12 @@ for (const teamDir of teamDirs) {
   });
 }
 
-test('cloud-team-issue roster references the deployed teamSolve persona', () => {
+test('cloud-team-issue roster references the deployed member personas', () => {
   const specPath = join(teamsRoot, 'cloud-team-issue', 'team.json');
   const spec = JSON.parse(readFileSync(specPath, 'utf8'));
   assert.deepEqual(
     spec.members.map((member) => member.persona?.slug ?? member.persona),
-    ['cloud-team-issue', 'cloud-team-issue'],
+    ['cloud-team-implementer', 'cloud-team-reviewer'],
   );
 });
 

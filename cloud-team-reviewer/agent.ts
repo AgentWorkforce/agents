@@ -20,5 +20,6 @@ export async function handleUnexpectedEvent(ctx: WorkforceCtx, event: WorkforceE
 }
 
 export default defineAgent({
+  launchedBy: 'team-dispatcher',
   handler: handleUnexpectedEvent
 });

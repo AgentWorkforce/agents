@@ -37,13 +37,38 @@ for (const teamDir of teamDirs) {
   });
 }
 
-test('cloud-team-issue roster references the deployed teamSolve persona', () => {
+test('cloud-team-issue roster references the deployed member personas', () => {
   const specPath = join(teamsRoot, 'cloud-team-issue', 'team.json');
   const spec = JSON.parse(readFileSync(specPath, 'utf8'));
   assert.deepEqual(
     spec.members.map((member) => member.persona?.slug ?? member.persona),
-    ['cloud-team-issue', 'cloud-team-issue'],
+    ['cloud-team-implementer', 'cloud-team-reviewer'],
   );
+});
+
+test('cloud-team-issue member persona slugs match deployable persona ids', async () => {
+  const specPath = join(teamsRoot, 'cloud-team-issue', 'team.json');
+  const spec = JSON.parse(readFileSync(specPath, 'utf8'));
+  const slugs = spec.members.map((member) => member.persona?.slug ?? member.persona);
+
+  for (const slug of slugs) {
+    const { default: persona } = await import(`../.test-build/${slug}/persona.js`);
+    assert.equal(persona.id, slug, `${slug} roster ref must match its persona id`);
+  }
+});
+
+test('cloud-team-issue member agents are launched by the dispatcher', async () => {
+  const specPath = join(teamsRoot, 'cloud-team-issue', 'team.json');
+  const spec = JSON.parse(readFileSync(specPath, 'utf8'));
+  const slugs = spec.members.map((member) => member.persona?.slug ?? member.persona);
+
+  for (const slug of slugs) {
+    const { default: agent } = await import(`../.test-build/${slug}/agent.js`);
+    assert.equal(agent.launchedBy, 'team-dispatcher', `${slug} agent must be dispatcher-launched`);
+    assert.equal(agent.triggers, undefined, `${slug} agent must not declare direct triggers`);
+    assert.equal(agent.schedules, undefined, `${slug} agent must not declare direct schedules`);
+    assert.equal(agent.watch, undefined, `${slug} agent must not declare direct watches`);
+  }
 });
 
 // Validator self-checks: prove each contract rule actually rejects, so a

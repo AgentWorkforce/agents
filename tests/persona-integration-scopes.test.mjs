@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { parseIntegrations } from '@agentworkforce/persona-kit';
+import { WRITEBACK_PATH_CATALOG } from '@relayfile/adapter-core/writeback-paths';
 
 /**
  * Class guard for the agents#40 trap, generalized: cloud mounts an
@@ -24,11 +25,21 @@ import { parseIntegrations } from '@agentworkforce/persona-kit';
  */
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
-const PROVIDERS = 'slack|linear|github|notion|jira|gmail|granola|fathom';
+// Provider names come from the writeback catalog itself, so a persona using
+// a newly-catalogued provider is guarded automatically (no hand-kept list).
+const PROVIDERS = Object.keys(WRITEBACK_PATH_CATALOG)
+  .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|');
 // Three usage shapes, all of which require the provider's subtree mounted:
 //   slackClient().post(...)                      — named factory client
 //   relayClient('linear') / providerClient(...)  — generic factory client
 //   writeJsonFile(c, 'notion', op, `/notion/…`)  — raw VFS helper w/ path literal
+//
+// Deliberate static-analysis trade-offs:
+//   - Dynamic provider args (`relayClient(someVar)`) are invisible — the
+//     guard can false-negative there; reviewers still check those by hand.
+//   - Matching raw source means comments/strings can false-positive — the
+//     safe direction for a guard (it forces a look, never hides a gap).
 const CLIENT_RE = new RegExp(`\\b(${PROVIDERS})Client\\s*\\(`, 'g');
 const GENERIC_CLIENT_RE = new RegExp(`\\b(?:relayClient|providerClient)\\s*\\(\\s*['"\`](${PROVIDERS})['"\`]`, 'g');
 const PATH_LITERAL_RE = new RegExp(`['"\`]/(${PROVIDERS})/`, 'g');

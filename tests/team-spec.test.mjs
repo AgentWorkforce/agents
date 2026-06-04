@@ -37,6 +37,15 @@ for (const teamDir of teamDirs) {
   });
 }
 
+test('cloud-team-issue roster references the deployed teamSolve persona', () => {
+  const specPath = join(teamsRoot, 'cloud-team-issue', 'team.json');
+  const spec = JSON.parse(readFileSync(specPath, 'utf8'));
+  assert.deepEqual(
+    spec.members.map((member) => member.persona?.slug ?? member.persona),
+    ['cloud-team-issue', 'cloud-team-issue'],
+  );
+});
+
 // Validator self-checks: prove each contract rule actually rejects, so a
 // future edit that loosens the validator cannot silently green the suite.
 const validSpec = {

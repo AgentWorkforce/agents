@@ -5,14 +5,14 @@
     {
       "name": "implementer",
       "persona": {
-        "slug": "cloud-team-implementer"
+        "slug": "cloud-team-issue"
       },
       "role": "implementer"
     },
     {
       "name": "reviewer",
       "persona": {
-        "slug": "cloud-team-reviewer"
+        "slug": "cloud-team-issue"
       },
       "role": "reviewer"
     }

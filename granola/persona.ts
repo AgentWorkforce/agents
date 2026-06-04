@@ -21,8 +21,15 @@ export default definePersona({
     // linear has no trigger here, so `scope` is the only thing that mounts
     // /linear — without it the issue creation and PR-link comment writes
     // are silent no-ops. Issues draft to /linear/issues and comments to
-    // /linear/issues/{issueId}/comments; one subtree covers both.
-    linear: { scope: { paths: '/linear/issues/**' } },
+    // /linear/issues/{issueId}/comments; the teams subtree backs the
+    // listLinearTeams() fallback when LINEAR_TEAM_ID is unset. (Scope
+    // values must be strings — one entry per subtree, not an array.)
+    linear: {
+      scope: {
+        issues: '/linear/issues/**',
+        teams: '/linear/teams/**'
+      }
+    },
     // The cloud materializes this repo into the sandbox (ctx.sandbox.cwd) via
     // relayfile — the agent never clones it.
     github: { scope: { repo: 'your-org/your-repo' } }

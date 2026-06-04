@@ -57,6 +57,20 @@ test('cloud-team-issue member persona slugs match deployable persona ids', async
   }
 });
 
+test('cloud-team-issue member agents are launched by the dispatcher', async () => {
+  const specPath = join(teamsRoot, 'cloud-team-issue', 'team.json');
+  const spec = JSON.parse(readFileSync(specPath, 'utf8'));
+  const slugs = spec.members.map((member) => member.persona?.slug ?? member.persona);
+
+  for (const slug of slugs) {
+    const { default: agent } = await import(`../.test-build/${slug}/agent.js`);
+    assert.equal(agent.launchedBy, 'team-dispatcher', `${slug} agent must be dispatcher-launched`);
+    assert.equal(agent.triggers, undefined, `${slug} agent must not declare direct triggers`);
+    assert.equal(agent.schedules, undefined, `${slug} agent must not declare direct schedules`);
+    assert.equal(agent.watch, undefined, `${slug} agent must not declare direct watches`);
+  }
+});
+
 // Validator self-checks: prove each contract rule actually rejects, so a
 // future edit that loosens the validator cannot silently green the suite.
 const validSpec = {

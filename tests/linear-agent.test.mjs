@@ -209,10 +209,13 @@ test('AgentSessionEvent implement request delegates to workflow and posts PR lin
   const workflowSource = await readFile('workflows/linear-chat-lead.ts', 'utf8');
   assert.match(workflowSource, /process\.env\.invocationArgs/);
   assert.match(workflowSource, /git clone --filter=blob:none/);
-  assert.match(workflowSource, /linear-create-pr\.cjs/);
+  assert.match(workflowSource, /CREATE_PR_SCRIPT_SOURCE/);
+  assert.match(workflowSource, /create-pr-\$\{randomUUID\(\)\}\.cjs/);
   assert.match(workflowSource, /randomUUID/);
   assert.match(workflowSource, /printf %s/);
-  assert.match(workflowSource, /rm -f "\$args_path"/);
+  assert.match(workflowSource, /rm -f "\$args_path" "\$script_path"/);
+  assert.match(workflowSource, /node "\$script_path" "\$args_path"/);
+  assert.doesNotMatch(workflowSource, /fileURLToPath/);
   assert.doesNotMatch(workflowSource, /CREATE_PR_SCRIPT_B64/);
   assert.doesNotMatch(workflowSource, /CREATE_PR_ARGS_B64/);
   assert.doesNotMatch(workflowSource, /base64 -d/);
@@ -228,6 +231,11 @@ test('AgentSessionEvent implement request delegates to workflow and posts PR lin
   assert.match(createPrScript, /baseBranch/);
   assert.doesNotMatch(createPrScript, /baseBranch: 'main'/);
   assert.doesNotMatch(createPrScript, /gh pr create/);
+  const embeddedScript = workflowSource.match(/const CREATE_PR_SCRIPT_SOURCE = `([\s\S]*?)`;\n\ntype OpenPrArgs/)?.[1];
+  assert.ok(embeddedScript);
+  const embeddedScriptSource = Function(`return \`${embeddedScript}\`;`)();
+  assert.equal(embeddedScriptSource.trim(), createPrScript.trim());
+  assert.doesNotThrow(() => Function(embeddedScriptSource));
 
   assert.deepEqual(runtime.workflowRuns[0].args.openPrArgs, {
     repoDir: './repo',

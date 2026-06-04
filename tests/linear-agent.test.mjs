@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -7,7 +7,6 @@ import test from 'node:test';
 import { linearClient as relayLinearClient } from '@relayfile/relay-helpers';
 
 import linearAgent, { handleLinearEvent } from '../.test-build/linear/agent.js';
-import { LINEAR_CREATE_PR_SCRIPT } from '../.test-build/linear/create-pr.script.js';
 
 function ctx(overrides = {}) {
   const logs = [];
@@ -183,31 +182,49 @@ test('AgentSessionEvent implement request delegates to workflow and posts PR lin
 
   assert.equal(runtime.workflowRuns.length, 1);
   assert.equal(runtime.workflowRuns[0].name, 'linear-chat-lead');
-  const workflowWrite = runtime.fileWrites.find((entry) => entry.path === 'workflows/linear-chat-lead.ts');
-  assert.ok(workflowWrite);
-  assert.match(workflowWrite.contents, /git clone --filter=blob:none/);
-  assert.match(workflowWrite.contents, /const CREATE_PR_SCRIPT_PATH = "\/tmp\/linear-chat-lead-create-pr\.cjs"/);
-  assert.match(workflowWrite.contents, /const CREATE_PR_ARGS_PATH = "\/tmp\/linear-chat-lead-open-pr\.args\.json"/);
-  assert.match(workflowWrite.contents, /printf %s ' \+ CREATE_PR_SCRIPT_B64 \+ ' \| base64 -d > ' \+ CREATE_PR_SCRIPT_PATH/);
-  assert.match(workflowWrite.contents, /printf %s ' \+ CREATE_PR_ARGS_B64 \+ ' \| base64 -d > ' \+ CREATE_PR_ARGS_PATH/);
-  assert.match(workflowWrite.contents, /node ' \+ CREATE_PR_SCRIPT_PATH \+ ' ' \+ CREATE_PR_ARGS_PATH/);
-  assert.doesNotMatch(workflowWrite.contents, /node -e/);
-  assert.doesNotMatch(workflowWrite.contents, /String\.raw/);
-  assert.doesNotMatch(workflowWrite.contents, /OPEN_PR_SCRIPT/);
-  assert.doesNotMatch(workflowWrite.contents, /shellQuote/);
-  assert.doesNotMatch(workflowWrite.contents, /PR_TITLE/);
-  assert.doesNotMatch(workflowWrite.contents, /PR_BODY/);
-  assert.doesNotMatch(workflowWrite.contents, /Resolve AR-70/);
-  assert.match(LINEAR_CREATE_PR_SCRIPT, /\/api\/v1\/github\/pull-request/);
-  assert.match(LINEAR_CREATE_PR_SCRIPT, /WORKFORCE_WORKSPACE_TOKEN/);
-  assert.doesNotMatch(LINEAR_CREATE_PR_SCRIPT, /gh pr create/);
-  const scriptB64 = workflowWrite.contents.match(/const CREATE_PR_SCRIPT_B64 = "([^"]+)";/)?.[1];
-  const argsB64 = workflowWrite.contents.match(/const CREATE_PR_ARGS_B64 = "([^"]+)";/)?.[1];
-  assert.ok(scriptB64);
-  assert.ok(argsB64);
-  assert.equal(Buffer.from(scriptB64, 'base64').toString('utf8'), LINEAR_CREATE_PR_SCRIPT);
-  const args = JSON.parse(Buffer.from(argsB64, 'base64').toString('utf8'));
-  assert.deepEqual(args, {
+  assert.deepEqual(runtime.fileWrites, []);
+  assert.deepEqual(runtime.workflowRuns[0].args, {
+    repo: 'AgentWorkforce/cloud',
+    repoOwner: 'AgentWorkforce',
+    repoName: 'cloud',
+    branch: 'codex/linear-ar-70',
+    issueTitle: 'Fix the failing Linear implementer',
+    issueBody: 'The chat lead should answer and delegate implementation when asked.',
+    userPrompt: 'Please implement this.',
+    issueId: 'issue-1',
+    issueIdentifier: 'AR-70',
+    issueUrl: 'https://linear.app/agentrelay/issue/AR-70',
+    openPrArgs: {
+      repoDir: './repo',
+      owner: 'AgentWorkforce',
+      repo: 'cloud',
+      branch: 'codex/linear-ar-70',
+      title: 'Resolve AR-70: Fix the failing Linear implementer',
+      body: [
+        'Linear issue: https://linear.app/agentrelay/issue/AR-70',
+        'Prompt:\nPlease implement this.',
+        'Implemented by linear-chat-lead delegation.',
+      ].join('\n\n'),
+    },
+  });
+
+  const workflowSource = await readFile('workflows/linear-chat-lead.ts', 'utf8');
+  assert.match(workflowSource, /process\.env\.invocationArgs/);
+  assert.match(workflowSource, /git clone --filter=blob:none/);
+  assert.match(workflowSource, /linear-create-pr\.cjs/);
+  assert.match(workflowSource, /printf %s/);
+  assert.doesNotMatch(workflowSource, /CREATE_PR_SCRIPT_B64/);
+  assert.doesNotMatch(workflowSource, /CREATE_PR_ARGS_B64/);
+  assert.doesNotMatch(workflowSource, /base64 -d/);
+  assert.doesNotMatch(workflowSource, /node -e/);
+  assert.doesNotMatch(workflowSource, /String\.raw/);
+
+  const createPrScript = await readFile('workflows/linear-create-pr.cjs', 'utf8');
+  assert.match(createPrScript, /\/api\/v1\/github\/pull-request/);
+  assert.match(createPrScript, /WORKFORCE_WORKSPACE_TOKEN/);
+  assert.doesNotMatch(createPrScript, /gh pr create/);
+
+  assert.deepEqual(runtime.workflowRuns[0].args.openPrArgs, {
     repoDir: './repo',
     owner: 'AgentWorkforce',
     repo: 'cloud',

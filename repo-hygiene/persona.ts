@@ -15,8 +15,13 @@ export default definePersona({
 
   integrations: {
     github: {},
-    notion: {},
-    slack: {}
+    // github above is mounted via the agent's triggers; notion and slack
+    // have no triggers, so `scope` is the only thing that mounts them —
+    // without it the Notion journal write and the Slack summary post are
+    // silent no-ops. The database is picked at deploy (NOTION_DATABASE_ID),
+    // so scope the databases subtree.
+    notion: { scope: { paths: '/notion/databases/**' } },
+    slack: { scope: { paths: '/slack/channels/**' } }
   },
 
   inputs: {

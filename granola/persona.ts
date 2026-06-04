@@ -18,7 +18,11 @@ export default definePersona({
     // `granola-relay:fetch-notes` sync, which writes each note to the VFS at
     // /granola/notes/<id>.json and fires a storage `file.created` event.
     granola: {},
-    linear: {},
+    // linear has no trigger here, so `scope` is the only thing that mounts
+    // /linear — without it the issue creation and PR-link comment writes
+    // are silent no-ops. Issues draft to /linear/issues and comments to
+    // /linear/issues/{issueId}/comments; one subtree covers both.
+    linear: { scope: { paths: '/linear/issues/**' } },
     // The cloud materializes this repo into the sandbox (ctx.sandbox.cwd) via
     // relayfile — the agent never clones it.
     github: { scope: { repo: 'your-org/your-repo' } }

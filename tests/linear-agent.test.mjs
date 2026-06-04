@@ -185,8 +185,6 @@ test('AgentSessionEvent implement request delegates to workflow and posts PR lin
   assert.deepEqual(runtime.fileWrites, []);
   assert.deepEqual(runtime.workflowRuns[0].args, {
     repo: 'AgentWorkforce/cloud',
-    repoOwner: 'AgentWorkforce',
-    repoName: 'cloud',
     branch: 'codex/linear-ar-70',
     issueTitle: 'Fix the failing Linear implementer',
     issueBody: 'The chat lead should answer and delegate implementation when asked.',
@@ -212,7 +210,9 @@ test('AgentSessionEvent implement request delegates to workflow and posts PR lin
   assert.match(workflowSource, /process\.env\.invocationArgs/);
   assert.match(workflowSource, /git clone --filter=blob:none/);
   assert.match(workflowSource, /linear-create-pr\.cjs/);
+  assert.match(workflowSource, /randomUUID/);
   assert.match(workflowSource, /printf %s/);
+  assert.match(workflowSource, /rm -f "\$args_path"/);
   assert.doesNotMatch(workflowSource, /CREATE_PR_SCRIPT_B64/);
   assert.doesNotMatch(workflowSource, /CREATE_PR_ARGS_B64/);
   assert.doesNotMatch(workflowSource, /base64 -d/);
@@ -222,6 +222,11 @@ test('AgentSessionEvent implement request delegates to workflow and posts PR lin
   const createPrScript = await readFile('workflows/linear-create-pr.cjs', 'utf8');
   assert.match(createPrScript, /\/api\/v1\/github\/pull-request/);
   assert.match(createPrScript, /WORKFORCE_WORKSPACE_TOKEN/);
+  assert.match(createPrScript, /lstatSync/);
+  assert.match(createPrScript, /isSymbolicLink/);
+  assert.match(createPrScript, /refs\/remotes\/origin\/HEAD/);
+  assert.match(createPrScript, /baseBranch/);
+  assert.doesNotMatch(createPrScript, /baseBranch: 'main'/);
   assert.doesNotMatch(createPrScript, /gh pr create/);
 
   assert.deepEqual(runtime.workflowRuns[0].args.openPrArgs, {

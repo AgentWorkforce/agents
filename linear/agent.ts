@@ -258,8 +258,6 @@ function workflowInputs(args: {
   repo: string;
 }): {
   repo: string;
-  repoOwner: string;
-  repoName: string;
   branch: string;
   issueTitle: string;
   issueBody: string;
@@ -283,8 +281,6 @@ function workflowInputs(args: {
   ].filter(Boolean).join('\n\n');
   return {
     repo: args.repo,
-    repoOwner: owner ?? 'AgentWorkforce',
-    repoName: name ?? 'cloud',
     branch,
     issueTitle: args.issue.title,
     issueBody: args.issue.description ?? '',

@@ -1,10 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { workflow } from '@agent-relay/sdk/workflows';
 
 const WORKFLOW_NAME = 'linear-chat-lead';
 const REPO_DIR = './repo';
-const CREATE_PR_ARGS_PATH = `/tmp/${WORKFLOW_NAME}-open-pr.args.json`;
 const CREATE_PR_SCRIPT_PATH = fileURLToPath(new URL('./linear-create-pr.cjs', import.meta.url));
+const createPrArgsPath = `/tmp/${WORKFLOW_NAME}-open-pr-${randomUUID()}.args.json`;
 
 type OpenPrArgs = {
   repoDir: string;
@@ -17,8 +18,6 @@ type OpenPrArgs = {
 
 type ImplementWorkflowArgs = {
   repo: string;
-  repoOwner: string;
-  repoName: string;
   branch: string;
   issueTitle: string;
   issueBody: string;
@@ -78,8 +77,10 @@ await workflow(WORKFLOW_NAME)
     dependsOn: ['implement'],
     command: [
       'set -e',
-      `printf %s ${shellArg(JSON.stringify(args.openPrArgs, null, 2))} > ${shellArg(CREATE_PR_ARGS_PATH)}`,
-      `node ${shellArg(CREATE_PR_SCRIPT_PATH)} ${shellArg(CREATE_PR_ARGS_PATH)}`,
+      `args_path=${shellArg(createPrArgsPath)}`,
+      'trap \'rm -f "$args_path"\' EXIT',
+      `printf %s ${shellArg(JSON.stringify(args.openPrArgs, null, 2))} > "$args_path"`,
+      `node ${shellArg(CREATE_PR_SCRIPT_PATH)} "$args_path"`,
     ].join(' && '),
     captureOutput: true,
     failOnError: true,
@@ -93,8 +94,6 @@ function readInvocationArgs(): ImplementWorkflowArgs {
   const openPrArgs = readObject(parsed.openPrArgs, 'openPrArgs');
   return {
     repo: readRequiredString(parsed, 'repo'),
-    repoOwner: readRequiredString(parsed, 'repoOwner'),
-    repoName: readRequiredString(parsed, 'repoName'),
     branch: readRequiredString(parsed, 'branch'),
     issueTitle: readRequiredString(parsed, 'issueTitle'),
     issueBody: readString(parsed.issueBody),

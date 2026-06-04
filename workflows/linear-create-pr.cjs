@@ -19,6 +19,7 @@
   if (!pullRequestAuthToken) throw new Error('WORKFORCE_WORKSPACE_TOKEN or CLOUD_API_ACCESS_TOKEN is required to open a PR');
 
   const baseSha = readBaseSha();
+  const baseBranch = readBaseBranch();
 
   function readRequiredString(record, key) {
     const value = record && record[key];
@@ -41,6 +42,14 @@
     return execFileSync('git', args, { cwd: repoDir, encoding: 'utf8' }).split('\n').filter(Boolean);
   }
 
+  function gitLinesOrEmpty(args) {
+    try {
+      return gitLines(args);
+    } catch {
+      return [];
+    }
+  }
+
   function readBaseSha() {
     const marker = path.join(repoDir, '.linear-chat-base-sha');
     if (fs.existsSync(marker)) {
@@ -48,6 +57,17 @@
       if (value) return value;
     }
     return gitLines(['rev-parse', 'HEAD'])[0];
+  }
+
+  function readBaseBranch() {
+    const remoteHead = gitLinesOrEmpty(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'])[0] || '';
+    const remoteHeadMatch = remoteHead.match(/^origin\/(.+)$/);
+    if (remoteHeadMatch) return remoteHeadMatch[1];
+    const branchAtBase = gitLinesOrEmpty(['branch', '-r', '--points-at', baseSha])
+      .map((line) => line.trim())
+      .find((line) => line.startsWith('origin/') && line !== 'origin/HEAD');
+    if (branchAtBase) return branchAtBase.replace(/^origin\//, '');
+    return 'main';
   }
 
   function collectDiffPaths() {
@@ -65,12 +85,21 @@
   }
 
   const { changed, deleted } = collectDiffPaths();
+  const absoluteRepoDir = path.resolve(repoDir);
   const files = [];
   for (const filePath of changed) {
     if (filePath.startsWith('.git/')) continue;
+    const absolutePath = path.resolve(absoluteRepoDir, filePath);
+    if (!isPathInside(absolutePath, absoluteRepoDir)) {
+      throw new Error('Refusing to read changed file outside repo: ' + filePath);
+    }
+    const stats = fs.lstatSync(absolutePath);
+    if (stats.isSymbolicLink()) {
+      throw new Error('Refusing to read symbolic link in PR payload: ' + filePath);
+    }
     files.push({
       path: filePath,
-      content: fs.readFileSync(path.join(repoDir, filePath)).toString('base64'),
+      content: fs.readFileSync(absolutePath).toString('base64'),
       encoding: 'base64',
     });
   }
@@ -82,7 +111,7 @@
   const response = await fetch(cloudApiUrl + '/api/v1/github/pull-request', {
     method: 'POST',
     headers: { authorization: 'Bearer ' + pullRequestAuthToken, 'content-type': 'application/json' },
-    body: JSON.stringify({ owner, repo, branch, baseSha, baseBranch: 'main', title, body, files }),
+    body: JSON.stringify({ owner, repo, branch, baseSha, baseBranch, title, body, files }),
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload.prUrl) {
@@ -90,6 +119,11 @@
   }
   console.log(payload.prUrl);
   console.log(branch);
+
+  function isPathInside(child, parent) {
+    const relative = path.relative(parent, child);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  }
 })().catch((error) => {
   console.error(error);
   process.exit(1);

@@ -114,7 +114,7 @@ test('persona declares a slack scope that survives persona-kit parsing and cover
   const scope = parsed?.slack?.scope;
   assert.ok(scope && Object.keys(scope).length > 0, 'slack integration must declare a non-empty scope or cloud mounts no /slack paths');
   const covers = Object.values(scope).some(
-    (value) => typeof value === 'string' && value.startsWith('/slack/channels'),
+    (value) => typeof value === 'string' && value.startsWith('/slack/channels/'),
   );
   assert.ok(covers, 'slack scope must cover /slack/channels/** so slackClient() drafts reach the writeback worker');
 });

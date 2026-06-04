@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+
+import { linearClient as relayLinearClient } from '@relayfile/relay-helpers';
 
 import linearAgent, { handleLinearEvent } from '../.test-build/linear/agent.js';
 import { LINEAR_CREATE_PR_SCRIPT } from '../.test-build/linear/create-pr.script.js';
@@ -366,4 +371,26 @@ test('real relayfile comment record still resolves mention and issue id', async 
     Array.isArray(log.attrs?.recordKeys) &&
     log.attrs.recordKeys.includes('body')
   ));
+});
+
+test('relay helper reads Linear issues from by-uuid alias without raw-id file', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'linear-chat-lead-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const issueId = '5d6f2e15-0f1d-45ed-826b-183265809202';
+  const issue = {
+    id: issueId,
+    identifier: 'AR-70',
+    title: 'Fix Linear by-uuid reads',
+  };
+
+  await mkdir(path.join(root, 'linear/issues/by-uuid'), { recursive: true });
+  await writeFile(
+    path.join(root, 'linear/issues/by-uuid', `${issueId}.json`),
+    JSON.stringify(issue),
+  );
+
+  assert.deepEqual(
+    await relayLinearClient({ relayfileMountRoot: root, writebackTimeoutMs: 0 }).getIssue(issueId),
+    issue,
+  );
 });

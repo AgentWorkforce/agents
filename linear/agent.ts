@@ -11,12 +11,8 @@ import {
   type WorkforceProviderEvent,
 } from '@agentworkforce/runtime';
 import { linearClient } from '@relayfile/relay-helpers';
-import { LINEAR_CREATE_PR_SCRIPT } from './create-pr.script.js';
 
 const IMPLEMENT_WORKFLOW_NAME = 'linear-chat-lead';
-const IMPLEMENT_WORKFLOW_PATH = `workflows/${IMPLEMENT_WORKFLOW_NAME}.ts`;
-const CREATE_PR_SCRIPT_PATH = `/tmp/${IMPLEMENT_WORKFLOW_NAME}-create-pr.cjs`;
-const CREATE_PR_ARGS_PATH = `/tmp/${IMPLEMENT_WORKFLOW_NAME}-open-pr.args.json`;
 const MEMORY_TAG = 'linear-agent-session';
 
 interface LinearIssue {
@@ -246,13 +242,11 @@ async function delegateImplementation(
     prompt: eventContext.body,
     repo,
   });
-  await ctx.files.write(IMPLEMENT_WORKFLOW_PATH, workflowSource(workflowArgs));
   const run = await ctx.workflow.run(IMPLEMENT_WORKFLOW_NAME, {
+    ...workflowArgs,
     issueId: issue.id ?? eventContext.issueId,
     issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
     issueUrl: issue.url,
-    repo,
   });
   const completion = await run.completion();
   return findPrUrl(String(completion.output ?? ''));
@@ -264,8 +258,6 @@ function workflowInputs(args: {
   repo: string;
 }): {
   repo: string;
-  repoOwner: string;
-  repoName: string;
   branch: string;
   issueTitle: string;
   issueBody: string;
@@ -289,8 +281,6 @@ function workflowInputs(args: {
   ].filter(Boolean).join('\n\n');
   return {
     repo: args.repo,
-    repoOwner: owner ?? 'AgentWorkforce',
-    repoName: name ?? 'cloud',
     branch,
     issueTitle: args.issue.title,
     issueBody: args.issue.description ?? '',
@@ -304,75 +294,6 @@ function workflowInputs(args: {
       body: prBody,
     },
   };
-}
-
-function workflowSource(args: ReturnType<typeof workflowInputs>): string {
-  const createPrScriptB64 = Buffer.from(LINEAR_CREATE_PR_SCRIPT, 'utf8').toString('base64');
-  const createPrArgsB64 = Buffer.from(JSON.stringify(args.openPrArgs, null, 2), 'utf8').toString('base64');
-  return `
-import { workflow } from '@agent-relay/sdk/workflows';
-
-const REPO_DIR = './repo';
-const REPO = ${JSON.stringify(args.repo)};
-const BRANCH = ${JSON.stringify(args.branch)};
-const ISSUE_TITLE = ${JSON.stringify(args.issueTitle)};
-const ISSUE_BODY = ${JSON.stringify(args.issueBody)};
-const USER_PROMPT = ${JSON.stringify(args.userPrompt)};
-const CREATE_PR_SCRIPT_PATH = ${JSON.stringify(CREATE_PR_SCRIPT_PATH)};
-const CREATE_PR_ARGS_PATH = ${JSON.stringify(CREATE_PR_ARGS_PATH)};
-const CREATE_PR_SCRIPT_B64 = ${JSON.stringify(createPrScriptB64)};
-const CREATE_PR_ARGS_B64 = ${JSON.stringify(createPrArgsB64)};
-
-await workflow('linear-chat-lead')
-  .description('Implement a Linear issue delegated by the chat lead')
-  .pattern('dag')
-  .timeout(4_500_000)
-  .agent('impl', { cli: 'codex', preset: 'worker', role: 'Implement the Linear issue and prepare a PR.', retries: 1, maxTokens: 32000 })
-  .step('clone', {
-    type: 'deterministic',
-    command: [
-      'set -e',
-      'rm -rf ' + REPO_DIR,
-      'git clone --filter=blob:none https://github.com/' + REPO + '.git ' + REPO_DIR,
-      'cd ' + REPO_DIR + ' && git checkout -B ' + BRANCH,
-      'cd ' + REPO_DIR + ' && git config user.email linear-chat-lead@agentworkforce.local',
-      'cd ' + REPO_DIR + ' && git config user.name linear-chat-lead',
-      'cd ' + REPO_DIR + ' && git rev-parse HEAD > .linear-chat-base-sha'
-    ].join(' && '),
-    captureOutput: true,
-    failOnError: true,
-    timeoutMs: 900000,
-  })
-  .step('implement', {
-    agent: 'impl',
-    dependsOn: ['clone'],
-    task: [
-      'Work in ' + REPO_DIR + ' on branch ' + BRANCH + '.',
-      'Linear issue: ' + ISSUE_TITLE,
-      'User prompt: ' + USER_PROMPT,
-      'Issue body:\\n' + ISSUE_BODY,
-      'Make the code changes needed to fully satisfy the Linear request.',
-      'Do not commit, push, or open a PR; the final deterministic step handles that.'
-    ].join('\\n\\n'),
-    verification: { type: 'exit_code' },
-    timeoutMs: 1_800_000,
-    retries: 1,
-  })
-  .step('open-pr', {
-    type: 'deterministic',
-    dependsOn: ['implement'],
-    command: [
-      'set -e',
-      'printf %s ' + CREATE_PR_SCRIPT_B64 + ' | base64 -d > ' + CREATE_PR_SCRIPT_PATH,
-      'printf %s ' + CREATE_PR_ARGS_B64 + ' | base64 -d > ' + CREATE_PR_ARGS_PATH,
-      'node ' + CREATE_PR_SCRIPT_PATH + ' ' + CREATE_PR_ARGS_PATH
-    ].join(' && '),
-    captureOutput: true,
-    failOnError: true,
-    timeoutMs: 300000,
-  })
-  .run();
-`;
 }
 
 async function recallSessionThread(ctx: WorkforceCtx, sessionId: string): Promise<string[]> {

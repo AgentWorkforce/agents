@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { parseIntegrations } from '@agentworkforce/persona-kit';
+
 import {
   labelNames,
   readPr,
@@ -97,4 +99,22 @@ test('labelNames normalizes github label arrays defensively', () => {
     { other: 'ignored' },
   ]), ['no-agent-relay-review']);
   assert.deepEqual(labelNames(undefined), []);
+});
+
+// Cloud only mounts an integration's relayfile subtree from its `scope` (or
+// from triggers — and this persona has github triggers only). A scope-less
+// `slack: {}` mounts nothing, so every slackClient() post was written to
+// unmounted local disk and silently dropped. persona-kit also discards empty
+// scope objects client-side, so the scope must survive parsing as a non-empty
+// string map covering the `/slack/channels/{channelId}/messages` writeback
+// path. This pins both halves.
+test('persona declares a slack scope that survives persona-kit parsing and covers the messages writeback path', async () => {
+  const { default: persona } = await import('../.test-build/review/persona.js');
+  const parsed = parseIntegrations(persona.integrations, 'integrations');
+  const scope = parsed?.slack?.scope;
+  assert.ok(scope && Object.keys(scope).length > 0, 'slack integration must declare a non-empty scope or cloud mounts no /slack paths');
+  const covers = Object.values(scope).some(
+    (value) => typeof value === 'string' && value.startsWith('/slack/channels'),
+  );
+  assert.ok(covers, 'slack scope must cover /slack/channels/** so slackClient() drafts reach the writeback worker');
 });

@@ -108,6 +108,17 @@ const rejectionCases = [
     needle: 'claimed by both',
   },
   {
+    label: 'owns selector claimed by an invalid empty-name member',
+    spec: {
+      ...validSpec,
+      members: [
+        { name: '', persona: 'persona-a', owns: [{ provider: 'github' }] },
+        { name: 'b', persona: 'persona-b', owns: [{ provider: 'github' }] },
+      ],
+    },
+    needle: 'claimed by both',
+  },
+  {
     label: 'non-integer token budget',
     spec: { ...validSpec, tokenBudget: 1.5 },
     needle: 'tokenBudget must be a positive 32-bit integer',

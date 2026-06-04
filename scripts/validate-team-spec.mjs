@@ -141,7 +141,7 @@ export function validateTeamSpec(spec, { expectedId } = {}) {
           }
           const key = stableJson(selector);
           const existingOwner = ownedSelectors.get(key);
-          if (existingOwner && existingOwner !== member.name) {
+          if (ownedSelectors.has(key) && existingOwner !== member.name) {
             errors.push(
               `owns selector ${key} is claimed by both "${existingOwner}" and "${member.name}"`,
             );

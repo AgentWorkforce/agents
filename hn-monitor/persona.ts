@@ -31,7 +31,11 @@ export default definePersona({
     }
   },
 
-  // ctx.llm uses this model to summarize the matching stories.
+  // ctx.llm uses this model to summarize the matching stories. The handler
+  // only gets a working ctx.llm when the deployment carries a credential:
+  // useSubscription is the standing consent that lets cloud resolve the
+  // deployer's active anthropic credential per fire (cloud#1896 fallback).
+  useSubscription: true,
   harness: 'claude',
   model: 'claude-haiku-4-5-20251001',
   systemPrompt: 'Summarize Hacker News stories into a short, skimmable Slack digest.',

@@ -46,6 +46,17 @@ test('cloud-team-issue roster references the deployed member personas', () => {
   );
 });
 
+test('cloud-team-issue member persona slugs match deployable persona ids', async () => {
+  const specPath = join(teamsRoot, 'cloud-team-issue', 'team.json');
+  const spec = JSON.parse(readFileSync(specPath, 'utf8'));
+  const slugs = spec.members.map((member) => member.persona?.slug ?? member.persona);
+
+  for (const slug of slugs) {
+    const { default: persona } = await import(`../.test-build/${slug}/persona.js`);
+    assert.equal(persona.id, slug, `${slug} roster ref must match its persona id`);
+  }
+});
+
 // Validator self-checks: prove each contract rule actually rejects, so a
 // future edit that loosens the validator cannot silently green the suite.
 const validSpec = {

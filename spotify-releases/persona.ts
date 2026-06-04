@@ -11,7 +11,12 @@ export default definePersona({
   description: 'Checks daily for new releases from artists you follow on Spotify and DMs you about them.',
   cloud: true,
 
-  integrations: { slack: {} },
+  integrations: {
+    // No slack trigger here (cron-only persona), so `scope` is the only
+    // thing that mounts /slack. DMs write to /slack/users/{userId}/messages,
+    // a different subtree than channel posts.
+    slack: { scope: { paths: '/slack/users/**' } }
+  },
 
   inputs: {
     SLACK_USER: {

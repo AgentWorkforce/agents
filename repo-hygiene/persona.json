@@ -11,8 +11,16 @@
   "useSubscription": true,
   "integrations": {
     "github": {},
-    "notion": {},
-    "slack": {}
+    "notion": {
+      "scope": {
+        "paths": "/notion/databases/**"
+      }
+    },
+    "slack": {
+      "scope": {
+        "paths": "/slack/channels/**"
+      }
+    }
   },
   "inputs": {
     "NOTION_DATABASE_ID": {

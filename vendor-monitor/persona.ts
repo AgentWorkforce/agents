@@ -11,7 +11,11 @@ export default definePersona({
   description: 'Watches the vendors in your stack for new releases and posts the changes to your team Slack channel.',
   cloud: true,
 
-  integrations: { slack: {} },
+  integrations: {
+    // No slack trigger here (cron-only persona), so `scope` is the only
+    // thing that mounts /slack — without it every post is a silent no-op.
+    slack: { scope: { paths: '/slack/channels/**' } }
+  },
 
   inputs: {
     VENDORS: {

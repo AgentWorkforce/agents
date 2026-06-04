@@ -13,6 +13,8 @@ it does). The persona compiles to `persona.json`; deploy with
 
 | Agent | Fires on | What it does |
 | --- | --- | --- |
+| [**cloud-team-implementer**](cloud-team-implementer/) | launched by a teamSolve lead roster | Implements the assigned issue in its own sandbox and opens one focused pull request. |
+| [**cloud-team-reviewer**](cloud-team-reviewer/) | launched by a teamSolve lead roster | Reviews a teammate's branch against the issue spec and returns verifiable, actionable findings. |
 | [**granola**](granola/) | a new Granola note (Nango sync → `file.created`) | Detects prospect calls, files a Linear issue with the ask, and opens a GitHub PR implementing it. |
 | [**hn-monitor**](hn-monitor/) | schedule (2×/day) | Scans Hacker News for your topics and posts a digest to Slack. |
 | [**linear**](linear/) | Linear `issue.create` (labelled) / `comment.create` | Implements the issue and opens a GitHub PR; comments the PR link back. |

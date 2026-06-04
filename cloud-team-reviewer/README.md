@@ -1,11 +1,10 @@
 Cloud Team Reviewer
 ===================
 
-The review member of a [teamSolve roster](../teams/README.md). When a team
-lead's trigger fires, the cloud team dispatcher launches each roster member
-into its own sandbox — this persona steers the review member: claude harness,
-high reasoning, and a review discipline built around verifiable, actionable
-findings.
+The review member of a teamSolve roster. When a team lead's trigger fires, the
+cloud team dispatcher launches each roster member into its own sandbox — this
+persona steers the review member: claude harness, high reasoning, and a review
+discipline built around verifiable, actionable findings.
 
 How it runs
 -----------

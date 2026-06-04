@@ -1,12 +1,11 @@
 Cloud Team Implementer
 ======================
 
-The implementation member of a [teamSolve roster](../teams/README.md). When a
-team lead's trigger fires (for example an issue labeled `team`), the cloud
-team dispatcher launches each roster member into its own sandbox — this
-persona is what steers the implementation member: codex harness, high
-reasoning, and a working agreement tuned for turning an issue spec into one
-focused branch and pull request.
+The implementation member of a teamSolve roster. When a team lead's trigger
+fires (for example an issue labeled `team`), the cloud team dispatcher launches
+each roster member into its own sandbox — this persona is what steers the
+implementation member: codex harness, high reasoning, and a working agreement
+tuned for turning an issue spec into one focused branch and pull request.
 
 How it runs
 -----------

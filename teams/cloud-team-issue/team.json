@@ -3,16 +3,16 @@
   "lead": "cloud-team-issue",
   "members": [
     {
-      "name": "cloud-team-issue-impl",
+      "name": "implementer",
       "persona": {
-        "slug": "cloud-team-issue"
+        "slug": "cloud-team-implementer"
       },
       "role": "implementer"
     },
     {
-      "name": "cloud-team-issue-reviewer",
+      "name": "reviewer",
       "persona": {
-        "slug": "cloud-team-issue"
+        "slug": "cloud-team-reviewer"
       },
       "role": "reviewer"
     }

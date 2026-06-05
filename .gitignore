@@ -3,3 +3,4 @@ node_modules/
 */.workforce/build/
 */persona.json
 .claude/
+memory/

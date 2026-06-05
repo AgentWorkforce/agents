@@ -326,7 +326,7 @@ export async function postSlackPrUpdate(
   ctx: WorkforceCtx,
   pr: Pr,
   text: string,
-  client: SlackThreadClient = slackClient()
+  client: SlackThreadClient = slackClient({ writebackTimeoutMs: 15_000 })
 ): Promise<void> {
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (!channel) return;

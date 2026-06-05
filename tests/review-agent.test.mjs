@@ -132,6 +132,87 @@ test('persona declares a slack scope that survives persona-kit parsing and cover
   assert.ok(covers, 'slack scope must cover /slack/channels/** so slackClient() drafts reach the writeback worker');
 });
 
+test('does not save thread ts to memory when Slack post returns no ts', async () => {
+  const memory = [];
+  const ctx = {
+    persona: {
+      inputSpecs: { SLACK_CHANNEL: { env: '__TEST_SLACK_CHANNEL__' } },
+      inputs: { SLACK_CHANNEL: 'C123' },
+    },
+    memory: {
+      async recall(_query, opts) {
+        return memory.filter((item) => opts.tags.every((tag) => item.tags.includes(tag)));
+      },
+      async save(content, opts) {
+        memory.push({ id: `memory-${memory.length + 1}`, content, tags: opts.tags, scope: opts.scope });
+      },
+    },
+    log() {},
+  };
+  const slack = {
+    async post(channel, text) {
+      return { channel, ts: '' }; // simulates VFS writeback timeout — no receipt
+    },
+    async reply() { throw new Error('should not reply when no thread was saved'); },
+  };
+  const pr = {
+    owner: 'AgentWorkforce',
+    repo: 'agents',
+    number: 93,
+    url: 'https://github.com/AgentWorkforce/agents/pull/93',
+    author: 'kjgbot',
+  };
+
+  await postSlackPrUpdate(ctx, pr, 'ready', slack);
+
+  assert.equal(memory.length, 0, 'no thread ts must be saved when post returns empty ts');
+});
+
+test('posts new top-level messages on every call when Slack post never returns ts', async () => {
+  const memory = [];
+  const ctx = {
+    persona: {
+      inputSpecs: { SLACK_CHANNEL: { env: '__TEST_SLACK_CHANNEL__' } },
+      inputs: { SLACK_CHANNEL: 'C123' },
+    },
+    memory: {
+      async recall(_query, opts) {
+        return memory.filter((item) => opts.tags.every((tag) => item.tags.includes(tag)));
+      },
+      async save(content, opts) {
+        memory.push({ id: `memory-${memory.length + 1}`, content, tags: opts.tags, scope: opts.scope });
+      },
+    },
+    log() {},
+  };
+  const calls = [];
+  const slack = {
+    async post(channel, text) {
+      calls.push({ kind: 'post', channel, text });
+      return { channel, ts: '' }; // every post times out — no receipt
+    },
+    async reply() { throw new Error('should not reply when no thread was saved'); },
+  };
+  const pr = {
+    owner: 'AgentWorkforce',
+    repo: 'agents',
+    number: 93,
+    url: 'https://github.com/AgentWorkforce/agents/pull/93',
+    author: 'kjgbot',
+  };
+
+  // Both calls should post a new top-level message; the second must NOT reply
+  // (no thread ts was saved from the first). This is the double-post symptom
+  // caused by the pre-fix 3s writeback timeout racing against the 5s VFS cycle.
+  await postSlackPrUpdate(ctx, pr, 'ready', slack);
+  await postSlackPrUpdate(ctx, pr, 'merged', slack);
+
+  assert.deepEqual(calls, [
+    { kind: 'post', channel: 'C123', text: 'ready' },
+    { kind: 'post', channel: 'C123', text: 'merged' },
+  ]);
+});
+
 test('postSlackPrUpdate starts one channel message per PR and threads later updates', async () => {
   const memory = [];
   const ctx = {

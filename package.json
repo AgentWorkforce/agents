@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@agentworkforce/persona-kit": "^3.0.47",
-    "@agentworkforce/runtime": "^3.0.47",
+    "@agentworkforce/runtime": "^3.0.49",
     "@relayfile/relay-helpers": "0.3.33"
   },
   "devDependencies": {

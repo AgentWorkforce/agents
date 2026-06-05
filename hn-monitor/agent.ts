@@ -37,7 +37,7 @@ export default defineAgent({
     return;
   }
 
-  await slackClient().post(channel, await summarize(ctx, fresh));
+  await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, await summarize(ctx, fresh));
   await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
   }
 });

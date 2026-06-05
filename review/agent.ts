@@ -257,10 +257,9 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `generated output against a throwaway fixture — tests that only assert on the generated string prove nothing`,
     `about its behavior.`,
     `If you cannot verify an edit (tests cannot run in this sandbox and you cannot make them run), do not leave it`,
-    `in the working tree: discard it with "git restore <file>" — the one exception to the no-git rule, because`,
-    `rewriting a file back from memory is error-prone — delete files you created, and present the proposed change as`,
-    `advisory text in your review instead. Anything left in the working tree is committed and pushed to the PR after`,
-    `you exit — an unverified push is worse than no push.`,
+    `in the working tree: revert your own file edits without git, delete files you created, and present the proposed`,
+    `change as advisory text in your review instead. Anything left in the working tree is committed and pushed to the`,
+    `PR after you exit — an unverified push is worse than no push.`,
     `Only end your output with READY on its own last line when the PR genuinely needs a human now — meaning you have`,
     `resolved or addressed every bot and reviewer comment, there are no failing checks left that you could fix, and the`,
     `remaining decision requires human judgment. If anything is still red, unresolved, or in-progress, do NOT print READY.`

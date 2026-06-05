@@ -65,5 +65,7 @@ export default definePersona({
     dangerouslyBypassApprovalsAndSandbox: true
   },
 
+  memory: { enabled: true, scopes: ['workspace'], ttlDays: 180 },
+
   onEvent: './agent.ts'
 });

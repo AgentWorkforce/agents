@@ -25,7 +25,7 @@ import {
 } from '@agentworkforce/runtime';
 import { githubClient, slackClient } from '@relayfile/relay-helpers';
 
-interface Pr {
+export interface Pr {
   owner: string;
   repo: string;
   number: number;
@@ -53,6 +53,7 @@ interface PrMeta {
 }
 
 const DEFAULT_SKIP_LABEL = 'no-agent-relay-review';
+const SLACK_THREAD_TAG = 'pr-reviewer:slack-thread';
 
 function vfsClient(): IntegrationClientOptions {
   return { relayfileMountRoot: resolveMountRoot({}) };
@@ -231,8 +232,9 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel && ready) {
     const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
-    await slackClient().post(
-      channel,
+    await postSlackPrUpdate(
+      ctx,
+      pr,
       `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
     );
   }
@@ -282,8 +284,9 @@ async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise
   await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, message);
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel) {
-    await slackClient().post(
-      channel,
+    await postSlackPrUpdate(
+      ctx,
+      pr,
       `:warning: pr-reviewer failed for PR #${pr.number} in *${pr.owner}/${pr.repo}*: ${reason}`
     );
   }
@@ -305,8 +308,81 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   }
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (channel) {
-    await slackClient().post(channel, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
+    await postSlackPrUpdate(ctx, pr, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
   }
+}
+
+interface SlackThreadMemory {
+  channel: string;
+  threadTs: string;
+}
+
+interface SlackThreadClient {
+  post(channel: string, text: string): Promise<{ channel: string; ts: string }>;
+  reply(channel: string, threadTs: string, text: string): Promise<{ channel: string; ts: string }>;
+}
+
+export async function postSlackPrUpdate(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  text: string,
+  client: SlackThreadClient = slackClient()
+): Promise<void> {
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (!channel) return;
+
+  const remembered = await recallSlackThread(ctx, pr, channel);
+  if (remembered) {
+    await client.reply(channel, remembered.threadTs, text);
+    return;
+  }
+
+  const posted = await client.post(channel, text);
+  if (posted.ts) {
+    await rememberSlackThread(ctx, pr, { channel, threadTs: posted.ts });
+  } else {
+    ctx.log?.('warn', 'pr-reviewer.slack-thread.no-receipt', {
+      owner: pr.owner,
+      repo: pr.repo,
+      number: pr.number,
+      channel,
+    });
+  }
+}
+
+async function recallSlackThread(ctx: WorkforceCtx, pr: Pr, channel: string): Promise<SlackThreadMemory | undefined> {
+  const [item] = await ctx.memory.recall(slackThreadQuery(pr, channel), {
+    scope: 'workspace',
+    tags: slackThreadTags(pr, channel),
+    limit: 1,
+  });
+  try {
+    const parsed = item ? JSON.parse(item.content) as Partial<SlackThreadMemory> : undefined;
+    return parsed?.channel === channel && parsed.threadTs
+      ? { channel, threadTs: parsed.threadTs }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function rememberSlackThread(ctx: WorkforceCtx, pr: Pr, thread: SlackThreadMemory): Promise<void> {
+  await ctx.memory.save(JSON.stringify(thread), {
+    scope: 'workspace',
+    tags: slackThreadTags(pr, thread.channel),
+  });
+}
+
+function slackThreadQuery(pr: Pr, channel: string): string {
+  return `Slack thread for PR ${pr.owner}/${pr.repo}#${pr.number} in ${channel}`;
+}
+
+function slackThreadTags(pr: Pr, channel: string): string[] {
+  return [
+    SLACK_THREAD_TAG,
+    `pr:${pr.owner}/${pr.repo}#${pr.number}`,
+    `slack:${channel}`,
+  ];
 }
 
 // ── parsing the github webhook payload ──────────────────────────────────────

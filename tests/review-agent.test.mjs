@@ -5,6 +5,7 @@ import { parseIntegrations } from '@agentworkforce/persona-kit';
 
 import {
   labelNames,
+  postSlackPrUpdate,
   readPr,
   resolveAuthorLogin,
   reviewHarnessPrompt,
@@ -129,4 +130,55 @@ test('persona declares a slack scope that survives persona-kit parsing and cover
     (value) => typeof value === 'string' && value.startsWith('/slack/channels/'),
   );
   assert.ok(covers, 'slack scope must cover /slack/channels/** so slackClient() drafts reach the writeback worker');
+});
+
+test('postSlackPrUpdate starts one channel message per PR and threads later updates', async () => {
+  const memory = [];
+  const ctx = {
+    persona: {
+      inputSpecs: { SLACK_CHANNEL: { env: '__TEST_SLACK_CHANNEL__' } },
+      inputs: { SLACK_CHANNEL: 'C123' },
+    },
+    memory: {
+      async recall(_query, opts) {
+        return memory.filter((item) => opts.tags.every((tag) => item.tags.includes(tag)));
+      },
+      async save(content, opts) {
+        memory.push({
+          id: `memory-${memory.length + 1}`,
+          content,
+          tags: opts.tags,
+          scope: opts.scope,
+          createdAt: new Date(0).toISOString(),
+        });
+      },
+    },
+    log() {},
+  };
+  const calls = [];
+  const slack = {
+    async post(channel, text) {
+      calls.push({ kind: 'post', channel, text });
+      return { channel, ts: '1710000000.123456' };
+    },
+    async reply(channel, threadTs, text) {
+      calls.push({ kind: 'reply', channel, threadTs, text });
+      return { channel, ts: '1710000001.123456' };
+    },
+  };
+  const pr = {
+    owner: 'AgentWorkforce',
+    repo: 'relayfile-adapters',
+    number: 158,
+    url: 'https://github.com/AgentWorkforce/relayfile-adapters/pull/158',
+    author: 'kjgbot',
+  };
+
+  await postSlackPrUpdate(ctx, pr, 'ready', slack);
+  await postSlackPrUpdate(ctx, pr, 'merged', slack);
+
+  assert.deepEqual(calls, [
+    { kind: 'post', channel: 'C123', text: 'ready' },
+    { kind: 'reply', channel: 'C123', threadTs: '1710000000.123456', text: 'merged' },
+  ]);
 });

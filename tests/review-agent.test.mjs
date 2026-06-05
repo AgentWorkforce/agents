@@ -7,6 +7,7 @@ import {
   labelNames,
   readPr,
   resolveAuthorLogin,
+  reviewHarnessPrompt,
   reviewAuthorAllowlistDecision,
 } from '../.test-build/review/agent.js';
 
@@ -99,6 +100,17 @@ test('labelNames normalizes github label arrays defensively', () => {
     { other: 'ignored' },
   ]), ['no-agent-relay-review']);
   assert.deepEqual(labelNames(undefined), []);
+});
+
+test('reviewHarnessPrompt forbids git except the explicit restore-only carve-out', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 47 });
+  assert.match(prompt, /Don't use git or the gh CLI/);
+  // "git restore <file>" is deliberately permitted for discarding unverified
+  // edits (agents#47 review): rewriting a file back from memory is error-prone,
+  // a restore from HEAD is not. It must be framed as the exception...
+  assert.match(prompt, /git restore <file>.*exception to the no-git rule/);
+  // ...and no destructive/state-mutating git verb may creep in.
+  assert.doesNotMatch(prompt, /\bgit\s+(checkout|reset|clean|commit|push|add|fetch|pull|rebase|merge|stash)\b/);
 });
 
 // Cloud only mounts an integration's relayfile subtree from its `scope` (or

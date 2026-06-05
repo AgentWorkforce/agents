@@ -322,6 +322,7 @@ function parsePrReadyState(stdout: string): PullRequestReadyState {
 export function prReadyStateAllowsHumanReview(state: PullRequestReadyState): boolean {
   if (state.mergeable !== 'MERGEABLE') return false;
   const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
+  if (checks.length === 0) return false;
   return checks.every(checkPassedAndComplete);
 }
 
@@ -344,6 +345,9 @@ function describeNotReadyState(state: PullRequestReadyState): string {
     return `mergeable=${String(state.mergeable ?? 'missing')}`;
   }
   const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
+  if (checks.length === 0) {
+    return 'statusCheckRollup is empty or missing';
+  }
   const blocked = checks.find((check) => !checkPassedAndComplete(check));
   if (!blocked || typeof blocked !== 'object') {
     return 'statusCheckRollup contains a non-passing check';

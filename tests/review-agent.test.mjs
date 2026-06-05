@@ -135,6 +135,17 @@ test('prReadyStateAllowsHumanReview downgrades READY while a check is pending', 
   }), false);
 });
 
+test('prReadyStateAllowsHumanReview requires check rollup data before allowing READY', () => {
+  assert.equal(prReadyStateAllowsHumanReview({
+    mergeable: 'MERGEABLE',
+    statusCheckRollup: [],
+  }), false);
+
+  assert.equal(prReadyStateAllowsHumanReview({
+    mergeable: 'MERGEABLE',
+  }), false);
+});
+
 test('prReadyStateAllowsHumanReview requires mergeable PRs with only completed passing checks', () => {
   assert.equal(prReadyStateAllowsHumanReview({
     mergeable: 'MERGEABLE',

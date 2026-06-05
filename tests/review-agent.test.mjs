@@ -6,6 +6,7 @@ import { parseIntegrations } from '@agentworkforce/persona-kit';
 import {
   labelNames,
   postSlackPrUpdate,
+  prReadyStateAllowsHumanReview,
   readPr,
   resolveAuthorLogin,
   reviewHarnessPrompt,
@@ -112,6 +113,43 @@ test('reviewHarnessPrompt forbids git except the explicit restore-only carve-out
   assert.match(prompt, /git restore <file>.*exception to the no-git rule/);
   // ...and no destructive/state-mutating git verb may creep in.
   assert.doesNotMatch(prompt, /\bgit\s+(checkout|reset|clean|commit|push|add|fetch|pull|rebase|merge|stash)\b/);
+});
+
+test('reviewHarnessPrompt only allows READY after checks complete, pass, and the PR is mergeable', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 100 });
+  assert.match(prompt, /every required CI check has completed/);
+  assert.match(prompt, /none are pending\s+or in-progress/);
+  assert.match(prompt, /all are passing/);
+  assert.match(prompt, /GitHub reports it as mergeable/);
+  assert.match(prompt, /If any check is still pending, in-progress, or failed, or if the PR\s+has merge conflicts, do NOT print READY/);
+  assert.doesNotMatch(prompt, /there are no failing checks left/);
+});
+
+test('prReadyStateAllowsHumanReview downgrades READY while a check is pending', () => {
+  assert.equal(prReadyStateAllowsHumanReview({
+    mergeable: 'MERGEABLE',
+    statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { __typename: 'StatusContext', context: 'deploy-preview', state: 'PENDING' },
+    ],
+  }), false);
+});
+
+test('prReadyStateAllowsHumanReview requires mergeable PRs with only completed passing checks', () => {
+  assert.equal(prReadyStateAllowsHumanReview({
+    mergeable: 'MERGEABLE',
+    statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { __typename: 'StatusContext', context: 'lint', state: 'NEUTRAL' },
+    ],
+  }), true);
+
+  assert.equal(prReadyStateAllowsHumanReview({
+    mergeable: 'CONFLICTING',
+    statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    ],
+  }), false);
 });
 
 // Cloud only mounts an integration's relayfile subtree from its `scope` (or

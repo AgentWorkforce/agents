@@ -24,6 +24,10 @@ import {
   type WorkforceCtx
 } from '@agentworkforce/runtime';
 import { githubClient, slackClient } from '@relayfile/relay-helpers';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 export interface Pr {
   owner: string;
@@ -216,14 +220,15 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   // READY sentinel (it's the slack/ready signal, not a review-body line) and
   // post whatever's left as a PR comment via the github VFS.
   const raw = (run.output ?? '').trimEnd();
-  const ready = lastLine(raw) === 'READY';
-  const body = ready ? stripLastLine(raw).trimEnd() : raw;
+  const harnessReady = lastLine(raw) === 'READY';
+  const body = harnessReady ? stripLastLine(raw).trimEnd() : raw;
   if (!body) {
     await failReviewRun(ctx, pr, 'The review harness produced no review output.');
   }
   if (body) {
     await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
   }
+  const ready = harnessReady ? await verifyReadyForHumanReview(ctx, pr) : false;
 
   // Only ping Slack when the PR is actually a human's turn: checks green, all
   // bot/reviewer comments resolved, nothing left for the agent to fix (the
@@ -264,9 +269,90 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `advisory text in your review instead. Anything left in the working tree is committed and pushed to the PR after`,
     `you exit — an unverified push is worse than no push.`,
     `Only end your output with READY on its own last line when the PR genuinely needs a human now — meaning you have`,
-    `resolved or addressed every bot and reviewer comment, there are no failing checks left that you could fix, and the`,
-    `remaining decision requires human judgment. If anything is still red, unresolved, or in-progress, do NOT print READY.`
+    `resolved or addressed every bot and reviewer comment, every required CI check has completed (none are pending`,
+    `or in-progress) and all are passing, the PR has no merge conflicts (GitHub reports it as mergeable), and the`,
+    `remaining decision requires human judgment. If any check is still pending, in-progress, or failed, or if the PR`,
+    `has merge conflicts, do NOT print READY.`
   ].join('\n');
+}
+
+async function verifyReadyForHumanReview(ctx: WorkforceCtx, pr: Pr): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('gh', [
+      'pr',
+      'view',
+      String(pr.number),
+      '--repo',
+      `${pr.owner}/${pr.repo}`,
+      '--json',
+      'mergeable,statusCheckRollup',
+    ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+    const state = parsePrReadyState(stdout);
+    const ready = prReadyStateAllowsHumanReview(state);
+    if (!ready) {
+      ctx.log?.('warn', 'pr-reviewer.ready-sentinel.downgraded', {
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+        reason: describeNotReadyState(state),
+      });
+    }
+    return ready;
+  } catch (error) {
+    ctx.log?.('warn', 'pr-reviewer.ready-sentinel.verification-failed', {
+      owner: pr.owner,
+      repo: pr.repo,
+      number: pr.number,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+interface PullRequestReadyState {
+  mergeable?: unknown;
+  statusCheckRollup?: unknown;
+}
+
+function parsePrReadyState(stdout: string): PullRequestReadyState {
+  const parsed = JSON.parse(stdout) as unknown;
+  return parsed && typeof parsed === 'object' ? parsed as PullRequestReadyState : {};
+}
+
+export function prReadyStateAllowsHumanReview(state: PullRequestReadyState): boolean {
+  if (state.mergeable !== 'MERGEABLE') return false;
+  const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
+  return checks.every(checkPassedAndComplete);
+}
+
+function checkPassedAndComplete(check: unknown): boolean {
+  if (!check || typeof check !== 'object') return false;
+  const record = check as Record<string, unknown>;
+  const state = normalizeState(record.state);
+  if (state) return state === 'SUCCESS' || state === 'NEUTRAL';
+  const status = normalizeState(record.status);
+  const conclusion = normalizeState(record.conclusion);
+  return status === 'COMPLETED' && (conclusion === 'SUCCESS' || conclusion === 'NEUTRAL');
+}
+
+function normalizeState(value: unknown): string | undefined {
+  return typeof value === 'string' ? value.trim().toUpperCase() : undefined;
+}
+
+function describeNotReadyState(state: PullRequestReadyState): string {
+  if (state.mergeable !== 'MERGEABLE') {
+    return `mergeable=${String(state.mergeable ?? 'missing')}`;
+  }
+  const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
+  const blocked = checks.find((check) => !checkPassedAndComplete(check));
+  if (!blocked || typeof blocked !== 'object') {
+    return 'statusCheckRollup contains a non-passing check';
+  }
+  const record = blocked as Record<string, unknown>;
+  const name = record.name ?? record.context ?? record.workflowName ?? 'unknown';
+  const stateText = record.state ?? record.status ?? 'missing';
+  const conclusionText = record.conclusion ?? 'missing';
+  return `check=${String(name)} state=${String(stateText)} conclusion=${String(conclusionText)}`;
 }
 
 async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<never> {

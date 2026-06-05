@@ -203,31 +203,7 @@ export function labelNames(labels: unknown): string[] {
 async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   const run = await ctx.harness.run({
     cwd: ctx.sandbox.cwd,
-    prompt: [
-      `Review pull request #${pr.number} in ${pr.owner}/${pr.repo}. The PR code is checked out in the current directory.`,
-      `Focus on the actual PR changes: read .workforce/pr.diff first, then .workforce/changed-files.txt and .workforce/context.json.`,
-      `Use the checked-out repo to trace the impact of this diff across callers, types, tests, config, and related files.`,
-      `Flag and fix breakage even when the affected file is outside the changed-file set, but do not do an unrelated full-repo audit.`,
-      `Then proactively FIX everything that needs changing — your own findings and any other bot reviews on the PR —`,
-      `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; cloud commits`,
-      `and pushes your file edits to the PR after this run. In your output, do not claim that fixes were pushed,`,
-      `a GitHub review was submitted, or CI was verified; those are post-harness actions that cloud reports separately.`,
-      `Validate every finding — yours or another bot's — against the CURRENT checkout before editing: review comments`,
-      `are often stale (already fixed by a later push). Reproduce the problem in the code as it is now, or skip it.`,
-      `Make the smallest fix that addresses a demonstrated problem. Do not rewrite, restructure, or "harden" working`,
-      `code beyond what the finding requires.`,
-      `Verify every edit before you finish: run the repo's tests for the files you touched (install dependencies if`,
-      `needed). When you change code that GENERATES commands, scripts, or queries, also execute a sample of the`,
-      `generated output against a throwaway fixture — tests that only assert on the generated string prove nothing`,
-      `about its behavior.`,
-      `If you cannot verify an edit (tests cannot run in this sandbox and you cannot make them run), discard it and`,
-      `present the proposed change as advisory text in your review instead: "git restore <file>" (the one permitted git`,
-      `use) for files you edited, delete files you created. Anything left in the working tree is committed and pushed`,
-      `to the PR after you exit — an unverified push is worse than no push.`,
-      `Only end your output with READY on its own last line when the PR genuinely needs a human now — meaning you have`,
-      `resolved or addressed every bot and reviewer comment, there are no failing checks left that you could fix, and the`,
-      `remaining decision requires human judgment. If anything is still red, unresolved, or in-progress, do NOT print READY.`
-    ].join('\n')
+    prompt: reviewHarnessPrompt(pr)
   });
 
   const exitCode = (run as { exitCode?: unknown }).exitCode;
@@ -260,6 +236,34 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
       `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
     );
   }
+}
+
+export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: number }): string {
+  return [
+    `Review pull request #${pr.number} in ${pr.owner}/${pr.repo}. The PR code is checked out in the current directory.`,
+    `Focus on the actual PR changes: read .workforce/pr.diff first, then .workforce/changed-files.txt and .workforce/context.json.`,
+    `Use the checked-out repo to trace the impact of this diff across callers, types, tests, config, and related files.`,
+    `Flag and fix breakage even when the affected file is outside the changed-file set, but do not do an unrelated full-repo audit.`,
+    `Then proactively FIX everything that needs changing — your own findings and any other bot reviews on the PR —`,
+    `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; cloud commits`,
+    `and pushes your file edits to the PR after this run. In your output, do not claim that fixes were pushed,`,
+    `a GitHub review was submitted, or CI was verified; those are post-harness actions that cloud reports separately.`,
+    `Validate every finding — yours or another bot's — against the CURRENT checkout before editing: review comments`,
+    `are often stale (already fixed by a later push). Reproduce the problem in the code as it is now, or skip it.`,
+    `Make the smallest fix that addresses a demonstrated problem. Do not rewrite, restructure, or "harden" working`,
+    `code beyond what the finding requires.`,
+    `Verify every edit before you finish: run the repo's tests for the files you touched (install dependencies if`,
+    `needed). When you change code that GENERATES commands, scripts, or queries, also execute a sample of the`,
+    `generated output against a throwaway fixture — tests that only assert on the generated string prove nothing`,
+    `about its behavior.`,
+    `If you cannot verify an edit (tests cannot run in this sandbox and you cannot make them run), do not leave it`,
+    `in the working tree. Revert your own edit with normal file editing tools, delete files you created, and present`,
+    `the proposed change as advisory text in your review instead. Anything left in the working tree is committed and`,
+    `pushed to the PR after you exit — an unverified push is worse than no push.`,
+    `Only end your output with READY on its own last line when the PR genuinely needs a human now — meaning you have`,
+    `resolved or addressed every bot and reviewer comment, there are no failing checks left that you could fix, and the`,
+    `remaining decision requires human judgment. If anything is still red, unresolved, or in-progress, do NOT print READY.`
+  ].join('\n');
 }
 
 async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<never> {

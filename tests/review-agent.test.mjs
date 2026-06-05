@@ -7,6 +7,7 @@ import {
   labelNames,
   readPr,
   resolveAuthorLogin,
+  reviewHarnessPrompt,
   reviewAuthorAllowlistDecision,
 } from '../.test-build/review/agent.js';
 
@@ -99,6 +100,13 @@ test('labelNames normalizes github label arrays defensively', () => {
     { other: 'ignored' },
   ]), ['no-agent-relay-review']);
   assert.deepEqual(labelNames(undefined), []);
+});
+
+test('reviewHarnessPrompt does not tell the harness to use git after forbidding it', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 47 });
+  assert.match(prompt, /Don't use git or the gh CLI/);
+  assert.doesNotMatch(prompt, /\bgit\s+(restore|checkout|reset)\b/);
+  assert.match(prompt, /Revert your own edit with normal file editing tools/);
 });
 
 // Cloud only mounts an integration's relayfile subtree from its `scope` (or

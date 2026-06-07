@@ -10,7 +10,7 @@
 import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
 import { slackClient } from '@relayfile/relay-helpers';
 
-interface Story {
+export interface Story {
   id: number;
   title: string;
   url: string;
@@ -37,19 +37,24 @@ export default defineAgent({
     return;
   }
 
-  // Claim the stories as seen BEFORE posting. Cron delivery is at-least-once: a
-  // single tick can re-invoke this handler (cloud re-runs a delivery whose lease
-  // expires before it reports done — see AgentWorkforce/cloud#1990). Recording
-  // first means the re-invocation loads these ids as already-seen and stays
-  // silent, instead of posting the digest twice. The trade is that a failed post
-  // drops that digest rather than risking a duplicate — the right call for a
-  // low-stakes twice-daily summary. (This is a stopgap; the durable fix is
-  // idempotent cron delivery in cloud#1990.)
-  const digest = await summarize(ctx, fresh);
-  await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
-  await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, digest);
+  await postFreshStories(ctx, channel, seen, fresh);
   }
 });
+
+export async function postFreshStories(ctx: WorkforceCtx, channel: string, seen: number[], fresh: Story[]): Promise<void> {
+  // Claim the stories as seen BEFORE any long work. Cron delivery is
+  // at-least-once: a single tick can re-invoke this handler (cloud re-runs a
+  // delivery whose lease expires before it reports done — see
+  // AgentWorkforce/cloud#1990). Recording first means the re-invocation loads
+  // these ids as already-seen and stays silent, instead of posting the digest
+  // twice. The trade is that a failed summary/post drops that digest rather
+  // than risking a duplicate — the right call for a low-stakes twice-daily
+  // summary. (This is a stopgap; the durable fix is idempotent cron delivery in
+  // cloud#1990.)
+  await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
+  const digest = await summarize(ctx, fresh);
+  await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, digest);
+}
 
 /** Top ~30 front-page stories via the public HN Algolia API. Returns [] on
  *  any network/parse failure so a transient outage doesn't crash the run. */

@@ -4,6 +4,7 @@ import test from 'node:test';
 import { parseIntegrations } from '@agentworkforce/persona-kit';
 
 import {
+  announceReadyOnce,
   labelNames,
   postSlackPrUpdate,
   prReadyStateAllowsHumanReview,
@@ -362,3 +363,128 @@ test('postSlackPrUpdate starts one channel message per PR and threads later upda
     { kind: 'reply', channel: 'C123', threadTs: '1710000000.123456', text: 'merged' },
   ]);
 });
+
+test('announceReadyOnce posts once for the same head sha', async () => {
+  const memory = [];
+  const ctx = readyAnnouncementTestCtx(memory);
+  const calls = [];
+  const slack = readyAnnouncementSlack(calls);
+  const pr = readyAnnouncementPr();
+
+  await announceReadyOnce(ctx, pr, slack);
+  await announceReadyOnce(ctx, pr, slack);
+
+  assert.equal(readyAnnouncementMarkers(memory, 'reservation').length, 1);
+  assert.equal(readyAnnouncementMarkers(memory, 'announced').length, 1);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].text, /ready for your review/);
+});
+
+test('announceReadyOnce chooses one marker when same-head runs overlap', async () => {
+  const memory = [];
+  let saves = 0;
+  let releaseSaves;
+  const bothSaved = new Promise((resolve) => {
+    releaseSaves = resolve;
+  });
+  const ctx = readyAnnouncementTestCtx(memory, {
+    async afterSave() {
+      saves += 1;
+      if (saves === 2) releaseSaves();
+      await bothSaved;
+    },
+  });
+  const calls = [];
+  const slack = readyAnnouncementSlack(calls);
+  const pr = readyAnnouncementPr();
+
+  await Promise.all([
+    announceReadyOnce(ctx, pr, slack),
+    announceReadyOnce(ctx, pr, slack),
+  ]);
+
+  assert.equal(readyAnnouncementMarkers(memory, 'reservation').length, 2);
+  assert.equal(readyAnnouncementMarkers(memory, 'announced').length, 1);
+  assert.equal(calls.length, 1);
+});
+
+test('announceReadyOnce retries when the winning Slack post fails before announcement is saved', async () => {
+  const memory = [];
+  const ctx = readyAnnouncementTestCtx(memory);
+  const calls = [];
+  const pr = readyAnnouncementPr();
+  const failingSlack = {
+    async post() {
+      throw new Error('slack unavailable');
+    },
+    async reply() {
+      throw new Error('should not reply');
+    },
+  };
+
+  await assert.rejects(() => announceReadyOnce(ctx, pr, failingSlack), /slack unavailable/);
+  assert.equal(readyAnnouncementMarkers(memory, 'announced').length, 0);
+
+  await announceReadyOnce(ctx, pr, readyAnnouncementSlack(calls));
+
+  assert.equal(calls.length, 1);
+  assert.equal(readyAnnouncementMarkers(memory, 'announced').length, 1);
+});
+
+function readyAnnouncementMarkers(memory, kind) {
+  return memory.filter((item) => {
+    if (!item.tags.includes('pr-reviewer:ready-announced')) return false;
+    return JSON.parse(item.content).kind === kind;
+  });
+}
+
+function readyAnnouncementTestCtx(memory, hooks = {}) {
+  return {
+    persona: {
+      inputSpecs: { SLACK_CHANNEL: { env: '__TEST_SLACK_CHANNEL__' } },
+      inputs: { SLACK_CHANNEL: 'C123' },
+    },
+    memory: {
+      async recall(_query, opts) {
+        return memory.filter((item) => opts.tags.every((tag) => item.tags.includes(tag)));
+      },
+      async save(content, opts) {
+        const id = `memory-${memory.length + 1}`;
+        memory.push({
+          id,
+          content,
+          tags: opts.tags,
+          scope: opts.scope,
+          createdAt: new Date(memory.length).toISOString(),
+        });
+        await hooks.afterSave?.();
+        return { id };
+      },
+    },
+    log() {},
+  };
+}
+
+function readyAnnouncementSlack(calls) {
+  return {
+    async post(channel, text) {
+      calls.push({ kind: 'post', channel, text });
+      return { channel, ts: '1710000000.123456' };
+    },
+    async reply(channel, threadTs, text) {
+      calls.push({ kind: 'reply', channel, threadTs, text });
+      return { channel, ts: '1710000001.123456' };
+    },
+  };
+}
+
+function readyAnnouncementPr() {
+  return {
+    owner: 'AgentWorkforce',
+    repo: 'agents',
+    number: 50,
+    url: 'https://github.com/AgentWorkforce/agents/pull/50',
+    author: 'khaliqgant',
+    headSha: '9b1ecb4022bf574885b50376db65a827ddedce3b',
+  };
+}

@@ -3,3 +3,7 @@ node_modules/
 */.workforce/build/
 */persona.json
 .claude/
+
+# Relay VFS runtime state — rewritten on every reconcile cycle, never commit it
+.relay/
+memory/workspace/.relay/

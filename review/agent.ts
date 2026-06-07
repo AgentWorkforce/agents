@@ -234,15 +234,56 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   // bot/reviewer comments resolved, nothing left for the agent to fix (the
   // READY sentinel). Every in-progress pass — opened, new commits, failing CI,
   // unresolved bot threads — stays silent so the channel isn't a play-by-play.
-  const channel = input(ctx, 'SLACK_CHANNEL');
-  if (channel && ready) {
-    const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
-    await postSlackPrUpdate(
-      ctx,
-      pr,
-      `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
-    );
+  if (ready) {
+    await announceReadyOnce(ctx, pr);
   }
+}
+
+// Announce "ready for your review" at most once per head commit. Re-reviews
+// fire on many webhooks (a later check completing, a new bot comment) and the
+// PR is no more "ready" than the last time we said so — re-announcing is the
+// duplicate-reminder noise. A genuinely new head SHA (fresh commits that pass)
+// is worth a new note, and postSlackPrUpdate threads it under the PR's first
+// message so the channel stays a single conversation per PR.
+const READY_ANNOUNCED_TAG = 'pr-reviewer:ready-announced';
+
+async function announceReadyOnce(ctx: WorkforceCtx, pr: Pr): Promise<void> {
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (!channel) return;
+  if (pr.headSha && (await alreadyAnnouncedReady(ctx, pr))) return;
+  const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
+  await postSlackPrUpdate(
+    ctx,
+    pr,
+    `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
+  );
+  if (pr.headSha) await rememberReadyAnnounced(ctx, pr);
+}
+
+function readyAnnouncedTags(pr: Pr): string[] {
+  return [READY_ANNOUNCED_TAG, `pr:${pr.owner}/${pr.repo}#${pr.number}`];
+}
+
+async function alreadyAnnouncedReady(ctx: WorkforceCtx, pr: Pr): Promise<boolean> {
+  const items = await ctx.memory.recall(`pr-reviewer ready announced for ${pr.owner}/${pr.repo}#${pr.number}`, {
+    scope: 'workspace',
+    tags: readyAnnouncedTags(pr),
+    limit: 5,
+  });
+  return items.some((item) => {
+    try {
+      return (JSON.parse(item.content) as { headSha?: string }).headSha === pr.headSha;
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function rememberReadyAnnounced(ctx: WorkforceCtx, pr: Pr): Promise<void> {
+  await ctx.memory.save(JSON.stringify({ headSha: pr.headSha }), {
+    scope: 'workspace',
+    tags: readyAnnouncedTags(pr),
+  });
 }
 
 export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: number }): string {
@@ -259,6 +300,12 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `are often stale (already fixed by a later push). Reproduce the problem in the code as it is now, or skip it.`,
     `Make the smallest fix that addresses a demonstrated problem. Do not rewrite, restructure, or "harden" working`,
     `code beyond what the finding requires.`,
+    `Account for every bot and reviewer comment explicitly in your output under an "## Addressed comments" heading:`,
+    `one bullet per comment naming the bot/reviewer and what they raised, followed by either the file:line where you`,
+    `fixed it (e.g. "fixed in src/foo.ts:42") or, if you did not change anything, a one-line reason (stale —`,
+    `already handled by a later commit, or invalid because <reason>). This is how the comment authors and the human`,
+    `see that each thread was handled and exactly where, so be specific with the path and line; do not say a comment`,
+    `was addressed without pointing to the fix.`,
     `Verify every edit before you finish: run the repo's tests for the files you touched (install dependencies if`,
     `needed). When you change code that GENERATES commands, scripts, or queries, also execute a sample of the`,
     `generated output against a throwaway fixture — tests that only assert on the generated string prove nothing`,
@@ -285,7 +332,7 @@ async function verifyReadyForHumanReview(ctx: WorkforceCtx, pr: Pr): Promise<boo
       '--repo',
       `${pr.owner}/${pr.repo}`,
       '--json',
-      'mergeable,statusCheckRollup',
+      'state,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup',
     ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
     const state = parsePrReadyState(stdout);
     const ready = prReadyStateAllowsHumanReview(state);
@@ -310,7 +357,10 @@ async function verifyReadyForHumanReview(ctx: WorkforceCtx, pr: Pr): Promise<boo
 }
 
 interface PullRequestReadyState {
+  state?: unknown;
   mergeable?: unknown;
+  mergeStateStatus?: unknown;
+  reviewDecision?: unknown;
   statusCheckRollup?: unknown;
 }
 
@@ -319,9 +369,29 @@ function parsePrReadyState(stdout: string): PullRequestReadyState {
   return parsed && typeof parsed === 'object' ? parsed as PullRequestReadyState : {};
 }
 
+/** Whether the PR is still open. A missing `state` is treated as open so the
+ *  check stays backward-compatible with callers that don't query it; only an
+ *  explicit non-OPEN value (MERGED/CLOSED) blocks the ready ping. */
+function prIsOpen(state: PullRequestReadyState): boolean {
+  const s = normalizeState(state.state);
+  return s === undefined || s === 'OPEN';
+}
+
 export function prReadyStateAllowsHumanReview(state: PullRequestReadyState): boolean {
+  // Never announce "ready for review" on a PR that merged or closed between the
+  // harness run and this check — that's the stale "ready" ping on a done PR.
+  if (!prIsOpen(state)) return false;
+  // A draft PR isn't up for review yet.
+  if (normalizeState(state.mergeStateStatus) === 'DRAFT') return false;
+  // No merge conflicts.
   if (state.mergeable !== 'MERGEABLE') return false;
+  // A reviewer or bot still asking for changes means it isn't the human's turn.
+  if (normalizeState(state.reviewDecision) === 'CHANGES_REQUESTED') return false;
+  // Require at least one check, all complete and passing. An empty rollup means
+  // checks haven't registered yet (still pending) — not "no checks to worry
+  // about" — so treat it as not-ready rather than letting `every` pass vacuously.
   const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
+  if (checks.length === 0) return false;
   return checks.every(checkPassedAndComplete);
 }
 
@@ -340,10 +410,22 @@ function normalizeState(value: unknown): string | undefined {
 }
 
 function describeNotReadyState(state: PullRequestReadyState): string {
+  if (!prIsOpen(state)) {
+    return `state=${String(state.state ?? 'missing')}`;
+  }
+  if (normalizeState(state.mergeStateStatus) === 'DRAFT') {
+    return 'mergeStateStatus=DRAFT';
+  }
   if (state.mergeable !== 'MERGEABLE') {
     return `mergeable=${String(state.mergeable ?? 'missing')}`;
   }
+  if (normalizeState(state.reviewDecision) === 'CHANGES_REQUESTED') {
+    return 'reviewDecision=CHANGES_REQUESTED';
+  }
   const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
+  if (checks.length === 0) {
+    return 'no status checks reported yet';
+  }
   const blocked = checks.find((check) => !checkPassedAndComplete(check));
   if (!blocked || typeof blocked !== 'object') {
     return 'statusCheckRollup contains a non-passing check';

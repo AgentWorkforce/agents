@@ -152,6 +152,46 @@ test('prReadyStateAllowsHumanReview requires mergeable PRs with only completed p
   }), false);
 });
 
+test('prReadyStateAllowsHumanReview never reports a merged or closed PR ready', () => {
+  const passingChecks = [{ __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'MERGED', mergeable: 'MERGEABLE', statusCheckRollup: passingChecks,
+  }), false);
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'CLOSED', mergeable: 'MERGEABLE', statusCheckRollup: passingChecks,
+  }), false);
+  // An explicit OPEN state still passes when everything else is green.
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: passingChecks,
+  }), true);
+});
+
+test('prReadyStateAllowsHumanReview treats an empty (not-yet-registered) check rollup as not ready', () => {
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [],
+  }), false);
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE',
+  }), false);
+});
+
+test('prReadyStateAllowsHumanReview holds back drafts and changes-requested PRs', () => {
+  const passingChecks = [{ __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', mergeStateStatus: 'DRAFT', statusCheckRollup: passingChecks,
+  }), false);
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', reviewDecision: 'CHANGES_REQUESTED', statusCheckRollup: passingChecks,
+  }), false);
+});
+
+test('reviewHarnessPrompt requires accounting for each bot/reviewer comment with a location', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 7 });
+  assert.match(prompt, /## Addressed comments/);
+  assert.match(prompt, /file:line where you/);
+  assert.match(prompt, /do not say a comment\s+was addressed without pointing to the fix/);
+});
+
 // Cloud only mounts an integration's relayfile subtree from its `scope` (or
 // from triggers — and this persona has github triggers only). A scope-less
 // `slack: {}` mounts nothing, so every slackClient() post was written to

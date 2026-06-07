@@ -167,12 +167,33 @@ test('prReadyStateAllowsHumanReview never reports a merged or closed PR ready', 
 });
 
 test('prReadyStateAllowsHumanReview treats an empty (not-yet-registered) check rollup as not ready', () => {
+  // Empty rollup + not CLEAN = checks queued but not yet registered → pending.
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', statusCheckRollup: [],
+  }), false);
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', mergeStateStatus: 'UNKNOWN',
+  }), false);
+  // No mergeStateStatus at all is also not-ready (can't confirm nothing's pending).
   assert.equal(prReadyStateAllowsHumanReview({
     state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [],
   }), false);
+});
+
+test('prReadyStateAllowsHumanReview allows a no-CI repo (empty rollup) only when GitHub reports CLEAN', () => {
   assert.equal(prReadyStateAllowsHumanReview({
-    state: 'OPEN', mergeable: 'MERGEABLE',
-  }), false);
+    state: 'OPEN', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [],
+  }), true);
+});
+
+test('prReadyStateAllowsHumanReview treats skipped checks as non-blocking', () => {
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { __typename: 'CheckRun', name: 'e2e-conditional', status: 'COMPLETED', conclusion: 'SKIPPED' },
+      { __typename: 'StatusContext', context: 'optional-gate', state: 'SKIPPED' },
+    ],
+  }), true);
 });
 
 test('prReadyStateAllowsHumanReview holds back drafts and changes-requested PRs', () => {

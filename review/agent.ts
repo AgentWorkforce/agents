@@ -332,9 +332,15 @@ async function verifyReadyForHumanReview(ctx: WorkforceCtx, pr: Pr): Promise<boo
       '--repo',
       `${pr.owner}/${pr.repo}`,
       '--json',
-      'state,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup',
+      'state,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid',
     ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
     const state = parsePrReadyState(stdout);
+    // Populate the head SHA from GitHub's authoritative current head. Some
+    // webhook payloads (e.g. check_run.completed) don't carry it, and without a
+    // SHA the ready-announce dedupe can't key on the commit and would re-ping.
+    if (typeof state.headRefOid === 'string' && state.headRefOid.trim()) {
+      pr.headSha = state.headRefOid.trim();
+    }
     const ready = prReadyStateAllowsHumanReview(state);
     if (!ready) {
       ctx.log?.('warn', 'pr-reviewer.ready-sentinel.downgraded', {
@@ -362,6 +368,7 @@ interface PullRequestReadyState {
   mergeStateStatus?: unknown;
   reviewDecision?: unknown;
   statusCheckRollup?: unknown;
+  headRefOid?: unknown;
 }
 
 function parsePrReadyState(stdout: string): PullRequestReadyState {
@@ -387,22 +394,29 @@ export function prReadyStateAllowsHumanReview(state: PullRequestReadyState): boo
   if (state.mergeable !== 'MERGEABLE') return false;
   // A reviewer or bot still asking for changes means it isn't the human's turn.
   if (normalizeState(state.reviewDecision) === 'CHANGES_REQUESTED') return false;
-  // Require at least one check, all complete and passing. An empty rollup means
-  // checks haven't registered yet (still pending) — not "no checks to worry
-  // about" — so treat it as not-ready rather than letting `every` pass vacuously.
+  // Checks must all be complete and passing. An *empty* rollup is ambiguous: it
+  // can mean "no CI configured" (fine to proceed) or "checks queued but not yet
+  // registered" (still pending — the original bug where `every` passed
+  // vacuously). Disambiguate with GitHub's own mergeStateStatus: only an empty
+  // rollup on a CLEAN PR (nothing blocking) counts as ready; a transient
+  // pre-registration window reports UNSTABLE/BLOCKED/UNKNOWN, not CLEAN.
   const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
-  if (checks.length === 0) return false;
+  if (checks.length === 0) return normalizeState(state.mergeStateStatus) === 'CLEAN';
   return checks.every(checkPassedAndComplete);
 }
 
+// A check that's complete and not blocking. SUCCESS and NEUTRAL pass; SKIPPED
+// passes too — a conditionally-skipped job is GitHub's "not applicable", not a
+// failure, and must not pin the PR out of "ready" forever (it also mirrors the
+// trigger's ciFailed(), which treats skipped as non-failing).
 function checkPassedAndComplete(check: unknown): boolean {
   if (!check || typeof check !== 'object') return false;
   const record = check as Record<string, unknown>;
   const state = normalizeState(record.state);
-  if (state) return state === 'SUCCESS' || state === 'NEUTRAL';
+  if (state) return state === 'SUCCESS' || state === 'NEUTRAL' || state === 'SKIPPED';
   const status = normalizeState(record.status);
   const conclusion = normalizeState(record.conclusion);
-  return status === 'COMPLETED' && (conclusion === 'SUCCESS' || conclusion === 'NEUTRAL');
+  return status === 'COMPLETED' && (conclusion === 'SUCCESS' || conclusion === 'NEUTRAL' || conclusion === 'SKIPPED');
 }
 
 function normalizeState(value: unknown): string | undefined {
@@ -424,7 +438,7 @@ function describeNotReadyState(state: PullRequestReadyState): string {
   }
   const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
   if (checks.length === 0) {
-    return 'no status checks reported yet';
+    return `no status checks reported and mergeStateStatus=${String(state.mergeStateStatus ?? 'missing')} (not CLEAN)`;
   }
   const blocked = checks.find((check) => !checkPassedAndComplete(check));
   if (!blocked || typeof blocked !== 'object') {

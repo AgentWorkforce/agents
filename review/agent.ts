@@ -247,40 +247,106 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 // message so the channel stays a single conversation per PR.
 const READY_ANNOUNCED_TAG = 'pr-reviewer:ready-announced';
 
-async function announceReadyOnce(ctx: WorkforceCtx, pr: Pr): Promise<void> {
+export async function announceReadyOnce(ctx: WorkforceCtx, pr: Pr, client?: SlackThreadClient): Promise<void> {
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (!channel) return;
-  if (pr.headSha && (await alreadyAnnouncedReady(ctx, pr))) return;
+  const reservation = pr.headSha ? await reserveReadyAnnouncement(ctx, pr) : undefined;
+  if (pr.headSha && !reservation) return;
   const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
-  await postSlackPrUpdate(
-    ctx,
-    pr,
-    `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`
-  );
+  try {
+    await postSlackPrUpdate(
+      ctx,
+      pr,
+      `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`,
+      client
+    );
+  } catch (error) {
+    if (pr.headSha && reservation && 'id' in reservation && typeof reservation.id === 'string') {
+      await forgetReadyAnnouncementReservation(ctx, pr, reservation.id, 'failed');
+    }
+    throw error;
+  }
   if (pr.headSha) await rememberReadyAnnounced(ctx, pr);
 }
 
 function readyAnnouncedTags(pr: Pr): string[] {
-  return [READY_ANNOUNCED_TAG, `pr:${pr.owner}/${pr.repo}#${pr.number}`];
+  return [
+    READY_ANNOUNCED_TAG,
+    `pr:${pr.owner}/${pr.repo}#${pr.number}`,
+    ...(pr.headSha ? [`head:${pr.headSha}`] : []),
+  ];
 }
 
 async function alreadyAnnouncedReady(ctx: WorkforceCtx, pr: Pr): Promise<boolean> {
+  return (await readyAnnouncementItems(ctx, pr, 'announced')).length > 0;
+}
+
+async function reserveReadyAnnouncement(ctx: WorkforceCtx, pr: Pr): Promise<{ id: string } | {} | undefined> {
+  if (await alreadyAnnouncedReady(ctx, pr)) return undefined;
+  const saved = await rememberReadyAnnouncementReservation(ctx, pr);
+  if (!saved?.id) return {};
+  const [winner] = await readyAnnouncementItems(ctx, pr, 'reservation');
+  if (!winner || winner.id === saved.id) return saved;
+  await forgetReadyAnnouncementReservation(ctx, pr, saved.id, 'cancelled');
+  return undefined;
+}
+
+async function readyAnnouncementItems(ctx: WorkforceCtx, pr: Pr, kind: 'announced' | 'reservation') {
   const items = await ctx.memory.recall(`pr-reviewer ready announced for ${pr.owner}/${pr.repo}#${pr.number}`, {
     scope: 'workspace',
     tags: readyAnnouncedTags(pr),
-    limit: 5,
+    limit: 100,
   });
-  return items.some((item) => {
+  const parsed = items.flatMap((item) => {
     try {
-      return (JSON.parse(item.content) as { headSha?: string }).headSha === pr.headSha;
+      const content = JSON.parse(item.content) as { headSha?: string; kind?: string; reservationId?: string };
+      return content.headSha === pr.headSha ? [{ item, content }] : [];
     } catch {
-      return false;
+      return [];
     }
   });
+  const inactiveReservationIds = new Set(
+    parsed
+      .filter(({ content }) => content.kind === 'failed' || content.kind === 'cancelled')
+      .map(({ content }) => content.reservationId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)
+  );
+  return parsed
+    .filter(({ item, content }) => {
+      try {
+        return content.kind === kind && !inactiveReservationIds.has(item.id);
+      } catch {
+        return false;
+      }
+    })
+    .map(({ item }) => item)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 }
 
-async function rememberReadyAnnounced(ctx: WorkforceCtx, pr: Pr): Promise<void> {
-  await ctx.memory.save(JSON.stringify({ headSha: pr.headSha }), {
+async function rememberReadyAnnounced(ctx: WorkforceCtx, pr: Pr): Promise<{ id: string } | void> {
+  return await saveReadyAnnouncementMarker(ctx, pr, 'announced');
+}
+
+async function rememberReadyAnnouncementReservation(ctx: WorkforceCtx, pr: Pr): Promise<{ id: string } | void> {
+  return await saveReadyAnnouncementMarker(ctx, pr, 'reservation');
+}
+
+async function forgetReadyAnnouncementReservation(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  reservationId: string,
+  kind: 'failed' | 'cancelled'
+): Promise<{ id: string } | void> {
+  return await saveReadyAnnouncementMarker(ctx, pr, kind, reservationId);
+}
+
+async function saveReadyAnnouncementMarker(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  kind: 'announced' | 'reservation' | 'failed' | 'cancelled',
+  reservationId?: string
+): Promise<{ id: string } | void> {
+  return await ctx.memory.save(JSON.stringify({ headSha: pr.headSha, kind, ...(reservationId ? { reservationId } : {}) }), {
     scope: 'workspace',
     tags: readyAnnouncedTags(pr),
   });

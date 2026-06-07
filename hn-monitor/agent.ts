@@ -37,8 +37,17 @@ export default defineAgent({
     return;
   }
 
-  await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, await summarize(ctx, fresh));
+  // Claim the stories as seen BEFORE posting. Cron delivery is at-least-once: a
+  // single tick can re-invoke this handler (cloud re-runs a delivery whose lease
+  // expires before it reports done — see AgentWorkforce/cloud#1990). Recording
+  // first means the re-invocation loads these ids as already-seen and stays
+  // silent, instead of posting the digest twice. The trade is that a failed post
+  // drops that digest rather than risking a duplicate — the right call for a
+  // low-stakes twice-daily summary. (This is a stopgap; the durable fix is
+  // idempotent cron delivery in cloud#1990.)
+  const digest = await summarize(ctx, fresh);
   await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
+  await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, digest);
   }
 });
 

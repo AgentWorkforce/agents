@@ -7,19 +7,39 @@
  * model navigates `./linear` on demand (see persona.systemPrompt) instead of
  * having the whole board pre-loaded into context.
  *
- * The handler is thin: it gates the event, reconstructs the thread's
- * conversation history from memory (multi-turn), hands the turn to the harness,
- * posts the harness's reply to Slack, and records the turn. DMs are not handled.
+ * The handler gates the event, reconstructs the thread's conversation history
+ * from memory (multi-turn), hands the turn to the harness, then posts the reply.
+ * DMs are not handled.
+ *
+ * Board WRITES do NOT go through the harness's filesystem. The mounted `./linear`
+ * tree is for READS only — the harness once "created" an issue by hand-writing a
+ * JSON file into it (inventing an `AR-NN` ref + UUID), which is not a Linear
+ * mutation and silently created nothing while the reply claimed success. Instead
+ * the harness resolves ids from the VFS and emits a fenced `linear-actions`
+ * block; this handler executes those actions through `linearClient()` (the real
+ * writeback: draft → `issueCreate` → receipt) and reports the CONFIRMED Linear
+ * url. Unconfirmed writes are surfaced, never claimed as done.
  */
 import {
   defineAgent,
   type WorkforceCtx,
   type WorkforceProviderEvent,
 } from '@agentworkforce/runtime';
-import { slackClient } from '@relayfile/relay-helpers';
+import { linearClient, slackClient } from '@relayfile/relay-helpers';
 
 const MEMORY_TAG = 'linear-slack';
 const HISTORY_LIMIT = 8;
+
+// The harness appends board mutations as a single fenced block of JSON actions
+// (an array, or one object). Reads stay in the VFS; only writes ride this rail.
+const LINEAR_ACTION_FENCE = /```linear-actions\s*\n([\s\S]*?)```/;
+// Allow-listed Linear IssueCreateInput fields. Whitelisting (vs forwarding the
+// raw object) keeps a stray read-only field — `id`/`identifier` — from tripping
+// the adapter's `rejectReadOnlyFields` and failing the whole create.
+const CREATE_ISSUE_FIELDS = [
+  'teamId', 'title', 'description', 'projectId', 'priority',
+  'assigneeId', 'stateId', 'labelIds', 'dueDate', 'estimate', 'parentId', 'cycleId',
+] as const;
 
 interface SlackMessage {
   channel: string;
@@ -34,6 +54,25 @@ interface SlackMessage {
 interface SlackClientLike {
   post(channel: string, text: string): Promise<{ channel: string; ts: string }>;
   reply(channel: string, threadTs: string, text: string): Promise<{ channel: string; ts: string }>;
+}
+
+/**
+ * The slice of `linearClient()` this handler uses for writes. Both calls go
+ * through the VFS writeback (draft → mutation → receipt) and return
+ * `{ id, url }` — but they FALL BACK to the draft path when no receipt arrives
+ * (relay-helpers `created()` swallows the timeout), so a `url` that isn't an
+ * http(s) link means "Linear never confirmed it." Callers must check.
+ */
+interface LinearWriteClient {
+  createIssue(
+    args: { teamId: string; title: string } & Record<string, unknown>,
+  ): Promise<{ id: string; url: string }>;
+  comment(issueId: string, body: string): Promise<{ id: string; url: string }>;
+}
+
+interface LinearAction {
+  action: string;
+  [key: string]: unknown;
 }
 
 export default defineAgent({
@@ -55,7 +94,7 @@ export default defineAgent({
     ],
   },
   handler: async (ctx, event) => {
-    await handleSlackEvent(ctx, event, slackClient());
+    await handleSlackEvent(ctx, event, slackClient(), linearClient());
   },
 });
 
@@ -63,6 +102,7 @@ export async function handleSlackEvent(
   ctx: WorkforceCtx,
   event: WorkforceProviderEvent,
   slack: SlackClientLike,
+  linear: LinearWriteClient,
 ): Promise<void> {
   if (event.source !== 'slack') {
     logSkip(ctx, event, 'non-slack event source');
@@ -130,9 +170,95 @@ export async function handleSlackEvent(
     return;
   }
 
-  await postReply(slack, msg, reply);
+  // Split any board-mutation block off the prose and run it through the real
+  // Linear writeback. The user-facing reply is the harness prose plus the
+  // CONFIRMED outcome of each action — never the harness's own success claim.
+  const { prose, actions, malformed } = extractActions(reply);
+  const outcomes = malformed
+    ? ['⚠️ I tried to update the board but my action block was malformed — nothing was changed.']
+    : await executeLinearActions(ctx, linear, actions);
+
+  const finalReply = [prose, ...outcomes].map((s) => s.trim()).filter(Boolean).join('\n\n')
+    || "I looked but don't have anything to add on that.";
+
+  await postReply(slack, msg, finalReply);
   await rememberTurn(ctx, convKey, 'user', text);
-  await rememberTurn(ctx, convKey, 'assistant', reply);
+  await rememberTurn(ctx, convKey, 'assistant', finalReply);
+}
+
+/** Pull the fenced `linear-actions` block out of the reply, leaving the prose. */
+function extractActions(reply: string): { prose: string; actions: LinearAction[]; malformed: boolean } {
+  const match = reply.match(LINEAR_ACTION_FENCE);
+  if (!match) return { prose: reply, actions: [], malformed: false };
+  const prose = reply.replace(LINEAR_ACTION_FENCE, '').trim();
+  try {
+    const parsed = JSON.parse(match[1].trim());
+    const actions = Array.isArray(parsed) ? parsed : [parsed];
+    // Drop anything that isn't a tagged action object.
+    const valid = actions.filter(
+      (a): a is LinearAction => Boolean(a) && typeof a === 'object' && typeof a.action === 'string',
+    );
+    return { prose, actions: valid, malformed: false };
+  } catch {
+    return { prose, actions: [], malformed: true };
+  }
+}
+
+/**
+ * Execute board mutations and return one CONFIRMED-or-flagged line each. A write
+ * counts as done only when Linear hands back a real http(s) url; the draft-path
+ * fallback (no receipt) is reported as unconfirmed so we never fabricate success.
+ */
+async function executeLinearActions(
+  ctx: WorkforceCtx,
+  linear: LinearWriteClient,
+  actions: LinearAction[],
+): Promise<string[]> {
+  const outcomes: string[] = [];
+  for (const action of actions) {
+    try {
+      if (action.action === 'create_issue') {
+        const teamId = str(action.teamId);
+        const title = str(action.title);
+        if (!teamId || !title) {
+          outcomes.push(`⚠️ Couldn't create the issue — missing \`${!teamId ? 'teamId' : 'title'}\`. Can you confirm it?`);
+          continue;
+        }
+        const { url } = await linear.createIssue({ ...pick(action, CREATE_ISSUE_FIELDS), teamId, title });
+        outcomes.push(confirm(ctx, 'create_issue', url, `✅ Created the issue: ${url}`));
+      } else if (action.action === 'comment') {
+        const missing = !str(action.issueId) ? 'issueId' : !str(action.body) ? 'body' : null;
+        if (missing) {
+          outcomes.push(`⚠️ Couldn't add the comment — missing \`${missing}\`.`);
+          continue;
+        }
+        const { url } = await linear.comment(String(action.issueId), String(action.body));
+        outcomes.push(confirm(ctx, 'comment', url, `✅ Added the comment: ${url}`));
+      } else {
+        outcomes.push(`⚠️ I can't do "${action.action}" yet — only creating issues and commenting.`);
+      }
+    } catch (err) {
+      ctx.log?.('error', 'linear-slack.action.failed', { action: action.action, error: errorMessage(err) });
+      outcomes.push(`⚠️ "${action.action}" failed: ${errorMessage(err)}`);
+    }
+  }
+  return outcomes;
+}
+
+/** A receipt url proves the mutation landed; the draft-path fallback does not. */
+function confirm(ctx: WorkforceCtx, action: string, url: string, okMessage: string): string {
+  if (/^https?:\/\//i.test(url)) return okMessage;
+  ctx.log?.('error', 'linear-slack.action.unconfirmed', { action, url });
+  return '⚠️ I submitted that to Linear but it never confirmed (no writeback receipt) — please double-check the board before relying on it.';
+}
+
+/** Copy only the allow-listed keys whose values are present. */
+function pick(source: LinearAction, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) out[key] = source[key];
+  }
+  return out;
 }
 
 /**

@@ -38,6 +38,7 @@ export interface Pr {
   headSha?: string;
   state?: string;
   merged?: boolean;
+  draft?: boolean;
   labels?: unknown;
 }
 
@@ -48,6 +49,7 @@ export interface Pr {
 interface PrMeta {
   state?: string; // 'open' | 'closed'
   merged?: boolean;
+  draft?: boolean; // a held PR — the author isn't asking for review yet
   // The materialized meta.json has carried `author` both as a bare login
   // string and as an object — accept either so the allowlist isn't silently
   // bypassed by a shape mismatch.
@@ -123,6 +125,17 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
   const state = (meta?.state ?? pr.state ?? '').trim().toLowerCase();
   if (meta?.merged === true || pr.merged === true || state === 'closed') {
     return { reason: 'PR is already merged/closed' };
+  }
+
+  // A draft PR is held by its author — they aren't asking for review yet, and an
+  // auto-push into a work-in-progress branch is unwanted. Gate on it
+  // PREEMPTIVELY: the draft flag is set the instant the PR is opened as a draft,
+  // so it closes the window the skip label misses (a label has to be applied by
+  // hand, and the bot can fire before it lands). Read both the authoritative
+  // meta.json and the webhook payload's draft flag; mark-ready-for-review fires
+  // a `pull_request.synchronize`/`ready_for_review` event that re-opens the gate.
+  if (meta?.draft === true || pr.draft === true) {
+    return { reason: 'PR is a draft' };
   }
 
   // A disabling label turns the reviewer off entirely for this PR. `labels` is
@@ -366,16 +379,34 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `are often stale (already fixed by a later push). Reproduce the problem in the code as it is now, or skip it.`,
     `Make the smallest fix that addresses a demonstrated problem. Do not rewrite, restructure, or "harden" working`,
     `code beyond what the finding requires.`,
+    `Stay within this PR's purpose (.workforce/pr.diff is the change; use .workforce/context.json for available PR`,
+    `metadata). A reviewer suggestion that changes files or behavior unrelated to`,
+    `that purpose — refactoring a module`,
+    `the PR doesn't touch, renaming resources in an adapter the PR never edits, a cross-cutting "while you're here"`,
+    `cleanup — does NOT belong in this PR: record it as an advisory note under a "## Advisory Notes" heading in your review and leave the code unchanged.`,
+    `Folding an unrelated change into the PR is how you break an unrelated package's build; when in doubt, scope out.`,
     `Account for every bot and reviewer comment explicitly in your output under an "## Addressed comments" heading:`,
     `one bullet per comment naming the bot/reviewer and what they raised, followed by either the file:line where you`,
     `fixed it (e.g. "fixed in src/foo.ts:42") or, if you did not change anything, a one-line reason (stale —`,
     `already handled by a later commit, or invalid because <reason>). This is how the comment authors and the human`,
     `see that each thread was handled and exactly where, so be specific with the path and line; do not say a comment`,
     `was addressed without pointing to the fix.`,
-    `Verify every edit before you finish: run the repo's tests for the files you touched (install dependencies if`,
-    `needed). When you change code that GENERATES commands, scripts, or queries, also execute a sample of the`,
-    `generated output against a throwaway fixture — tests that only assert on the generated string prove nothing`,
-    `about its behavior.`,
+    `Verify every edit before you finish, and verify it the way CI does — not just the unit test next to the file.`,
+    `Run the repo's canonical build and test command end to end (read package.json / turbo.json / the CI workflow to`,
+    `find what CI actually runs, focusing only on build/test/typecheck steps; install dependencies if needed) so you catch breakage DOWNSTREAM of the file you`,
+    `edited. In a monorepo, editing one source file can break a generated/committed artifact (a catalog, lockfile,`,
+    `snapshot, or generated types) or a different package that imports it: when a finding makes you touch a source`,
+    `that feeds a generated file, regenerate that file with the repo's own generator and rebuild the packages that`,
+    `consume it. A green "tests for the file I touched" while the full build/test is red is exactly the failure that`,
+    `ships — the working tree must pass the full command with your edits in place. When you change code that`,
+    `GENERATES commands, scripts, or queries, also execute a sample of the generated output against a throwaway`,
+    `fixture — tests that only assert on the generated string prove nothing about its behavior.`,
+    `Never make a check pass by weakening the test: do not delete it, skip it, loosen an assertion, narrow its`,
+    `inputs, or replace a real assertion with a trivially-true one. A test that no longer fails when the behavior it`,
+    `guards regresses is worse than no test, and it passes CI while hiding the bug. When an edit makes a test fail,`,
+    `fix the CODE; only change a test's EXPECTATION when the test encoded the OLD, now-intentionally-changed contract`,
+    `and the new expected value is demonstrably correct — and say which in your "## Addressed comments" notes. If you`,
+    `cannot make a test genuinely pass, leave the code unfixed and raise it as advisory rather than gutting the test.`,
     `If you cannot verify an edit (tests cannot run in this sandbox and you cannot make them run), do not leave it`,
     `in the working tree: discard it with "git restore <file>" — the one exception to the no-git rule, because`,
     `rewriting a file back from memory is error-prone — delete files you created, and present the proposed change as`,
@@ -647,6 +678,7 @@ export function readPr(payload: unknown): Pr | undefined {
       head?: { sha?: string };
       state?: string;
       merged?: boolean;
+      draft?: boolean;
       labels?: unknown;
     };
     check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
@@ -669,6 +701,7 @@ export function readPr(payload: unknown): Pr | undefined {
     ...(headSha ? { headSha } : {}),
     ...(p?.pull_request?.state ? { state: p.pull_request.state } : {}),
     ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),
+    ...(typeof p?.pull_request?.draft === 'boolean' ? { draft: p.pull_request.draft } : {}),
     ...(p?.pull_request?.labels !== undefined ? { labels: p.pull_request.labels } : {})
   };
 }

@@ -54,7 +54,21 @@ interface SlackMessage {
 interface SlackClientLike {
   post(channel: string, text: string): Promise<{ channel: string; ts: string }>;
   reply(channel: string, threadTs: string, text: string): Promise<{ channel: string; ts: string }>;
+  react(channel: string, messageTs: string, emoji: string): Promise<void>;
 }
+
+// Reacted onto the teammate's message the instant the handler picks up the turn,
+// so the channel gets an acknowledgement within seconds of box-boot instead of
+// sitting silent for the minutes-long harness run.
+const ACK_EMOJI = 'eyes';
+
+// How long writes wait for a writeback receipt. The relay-helpers default is 3s
+// — too short for the cloud worker's round-trip, so `post()` returned `ts: ''`
+// and `createIssue()` returned the draft-path fallback even when the write
+// actually landed (2026-06-09: the issue was created but the reply never
+// posted). A longer window keeps the handler — and the box — alive until the
+// receipt arrives, so the reply both confirms and flushes before teardown.
+const WRITEBACK_TIMEOUT_MS = 12_000;
 
 /**
  * The slice of `linearClient()` this handler uses for writes. Both calls go
@@ -94,7 +108,8 @@ export default defineAgent({
     ],
   },
   handler: async (ctx, event) => {
-    await handleSlackEvent(ctx, event, slackClient(), linearClient());
+    const opts = { writebackTimeoutMs: WRITEBACK_TIMEOUT_MS };
+    await handleSlackEvent(ctx, event, slackClient(opts), linearClient(opts));
   },
 });
 
@@ -141,6 +156,14 @@ export async function handleSlackEvent(
     return;
   }
 
+  // Acknowledge before the long harness run. Fire-and-forget: the draft is
+  // written synchronously (so the 👀 is queued immediately), and we DON'T await
+  // the receipt — the harness starts right away while the reaction flushes in
+  // the background. Best-effort; never fail the turn over a reaction.
+  void Promise.resolve(slack.react(msg.channel, msg.ts, ACK_EMOJI)).catch((err) =>
+    ctx.log?.('warn', 'linear-slack.ack.failed', { error: errorMessage(err) }),
+  );
+
   const convKey = `${msg.channel}:${msg.threadTs ?? msg.ts}`;
   const history = await recallThread(ctx, convKey);
 
@@ -160,13 +183,7 @@ export async function handleSlackEvent(
     reply = isTransientLlmError(err)
       ? "I'm getting rate-limited by the model right now — give me a moment and ask again."
       : 'Sorry, I hit an unexpected error working on that. Please try again.';
-    // Best-effort apology — we're already in the error path, so don't let an
-    // undelivered apology mask the original failure; just log it loudly.
-    try {
-      await postReply(slack, msg, reply);
-    } catch (postErr) {
-      ctx.log?.('error', 'linear-slack.reply.undelivered', { error: errorMessage(postErr) });
-    }
+    await postReply(ctx, slack, msg, reply);
     return;
   }
 
@@ -181,7 +198,7 @@ export async function handleSlackEvent(
   const finalReply = [prose, ...outcomes].map((s) => s.trim()).filter(Boolean).join('\n\n')
     || "I looked but don't have anything to add on that.";
 
-  await postReply(slack, msg, finalReply);
+  await postReply(ctx, slack, msg, finalReply);
   await rememberTurn(ctx, convKey, 'user', text);
   await rememberTurn(ctx, convKey, 'assistant', finalReply);
 }
@@ -225,7 +242,11 @@ async function executeLinearActions(
           continue;
         }
         const { url } = await linear.createIssue({ ...pick(action, CREATE_ISSUE_FIELDS), teamId, title });
-        outcomes.push(confirm(ctx, 'create_issue', url, `✅ Created the issue: ${url}`));
+        outcomes.push(confirm(
+          ctx, 'create_issue', url,
+          `✅ Created the issue: ${url}`,
+          '📝 Submitting that issue to Linear now — it should appear on the board within a minute or two.',
+        ));
       } else if (action.action === 'comment') {
         const missing = !str(action.issueId) ? 'issueId' : !str(action.body) ? 'body' : null;
         if (missing) {
@@ -233,7 +254,11 @@ async function executeLinearActions(
           continue;
         }
         const { url } = await linear.comment(String(action.issueId), String(action.body));
-        outcomes.push(confirm(ctx, 'comment', url, `✅ Added the comment: ${url}`));
+        outcomes.push(confirm(
+          ctx, 'comment', url,
+          `✅ Added the comment: ${url}`,
+          '📝 Posting that comment to Linear now — it should appear shortly.',
+        ));
       } else {
         outcomes.push(`⚠️ I can't do "${action.action}" yet — only creating issues and commenting.`);
       }
@@ -245,11 +270,16 @@ async function executeLinearActions(
   return outcomes;
 }
 
-/** A receipt url proves the mutation landed; the draft-path fallback does not. */
-function confirm(ctx: WorkforceCtx, action: string, url: string, okMessage: string): string {
+/**
+ * A receipt url (http) proves the mutation landed and we link it. The draft-path
+ * fallback means the receipt didn't return inside the wait window — the write
+ * still flushes (creates land via the mirror within ~minutes), so we report it
+ * as pending rather than failed, and log it for triage.
+ */
+function confirm(ctx: WorkforceCtx, action: string, url: string, okMessage: string, pendingMessage: string): string {
   if (/^https?:\/\//i.test(url)) return okMessage;
-  ctx.log?.('error', 'linear-slack.action.unconfirmed', { action, url });
-  return '⚠️ I submitted that to Linear but it never confirmed (no writeback receipt) — please double-check the board before relying on it.';
+  ctx.log?.('warn', 'linear-slack.action.unconfirmed', { action, url });
+  return pendingMessage;
 }
 
 /** Copy only the allow-listed keys whose values are present. */
@@ -262,25 +292,30 @@ function pick(source: LinearAction, keys: readonly string[]): Record<string, unk
 }
 
 /**
- * Post the reply and CONFIRM it was delivered. `slackClient` doesn't call the
- * Slack API — it writes a draft into the VFS mount and polls for a writeback
- * receipt. When the receipt never arrives (writeback path not mounted, mount
- * degraded, box torn down before flush) it RESOLVES with an empty `ts` instead
- * of throwing — relay-helpers swallows the timeout. An empty `ts` therefore
- * means "Slack never got this." Throw so the runtime logs `handler.error` and
- * the dropped reply is visible, instead of a silent no-op that logs
- * `handler.ok` with nothing in the channel (linear-slack investigation
- * 2026-06-09: a whole turn's reply was orphaned as an unflushed draft).
+ * Post the reply. `slackClient` doesn't call the Slack API — it writes a draft
+ * into the VFS mount and polls up to `WRITEBACK_TIMEOUT_MS` for a receipt,
+ * returning an empty `ts` if none arrives.
+ *
+ * An empty `ts` is NOT proof of a drop: the `/slack/channels` scope is mounted
+ * (build-time guard) and the draft still flushes at box cleanup, so a missing
+ * receipt usually just means the worker's round-trip outran the wait. We log it
+ * loudly for triage but DO NOT throw — an earlier version threw here, which
+ * crashed the turn and tore the box down before the draft could flush, eating
+ * the reply entirely (2026-06-09: issue created, channel silent). The genuine
+ * "nothing mounts /slack" failure is caught at build time by
+ * tests/persona-integration-scopes, not here.
  */
-async function postReply(slack: SlackClientLike, msg: SlackMessage, text: string): Promise<void> {
+async function postReply(
+  ctx: WorkforceCtx,
+  slack: SlackClientLike,
+  msg: SlackMessage,
+  text: string,
+): Promise<void> {
   const result = msg.threadTs
     ? await slack.reply(msg.channel, msg.threadTs, text)
     : await slack.post(msg.channel, text);
   if (!result?.ts) {
-    throw new Error(
-      `slack ${msg.threadTs ? 'reply' : 'post'} to ${msg.channel} was not delivered ` +
-        '(writeback returned no receipt — is the /slack/channels subtree mounted?)',
-    );
+    ctx.log?.('warn', 'linear-slack.reply.no-receipt', { channel: msg.channel, threaded: Boolean(msg.threadTs) });
   }
 }
 

@@ -23,10 +23,13 @@ function ctx(overrides = {}) {
 
 function slackSpy() {
   const posts = [];
+  const reactions = [];
   return {
     posts,
+    reactions,
     async post(channel, text) { posts.push({ channel, text }); return { channel, ts: 'ts-1' }; },
     async reply(channel, threadTs, text) { posts.push({ channel, threadTs, text }); return { channel, ts: 'ts-1' }; },
+    async react(channel, messageTs, emoji) { reactions.push({ channel, messageTs, emoji }); },
   };
 }
 
@@ -69,6 +72,8 @@ test('create_issue action runs through linearClient and reports the CONFIRMED ur
 
   await handleSlackEvent(runtime, slackEvent('make an issue to remove the dashboard'), slack, linear);
 
+  // a fast 👀 ack lands on the teammate's message before the slow work
+  assert.deepEqual(slack.reactions, [{ channel: 'C0B9287EP6Y', messageTs: '1781004465.912899', emoji: 'eyes' }]);
   // the real Linear writeback was invoked with allow-listed fields + required ids
   assert.equal(linear.created.length, 1);
   assert.deepEqual(linear.created[0], {
@@ -96,7 +101,7 @@ test('an unconfirmed create (no receipt → draft-path fallback) is flagged, nev
 
   const posted = slack.posts.at(-1).text;
   assert.doesNotMatch(posted, /✅/);
-  assert.match(posted, /never confirmed|double-check/i);
+  assert.match(posted, /appear on the board|minute or two|Submitting/i);
   assert.ok(runtime.logs.some((l) => l.message === 'linear-slack.action.unconfirmed'));
 });
 

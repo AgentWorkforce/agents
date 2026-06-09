@@ -94,6 +94,33 @@ test('readPr falls back to sender login for PR-shaped payloads when opener login
   })?.author, 'KhaliqGant');
 });
 
+test('readPr surfaces the draft flag so the draft gate can hold off', () => {
+  // The draft flag feeds shouldSkipReview's preemptive draft gate — a held PR
+  // must not be auto-reviewed/pushed. Read it off the pull_request payload.
+  assert.equal(readPr({
+    number: 27,
+    pull_request: {
+      number: 27,
+      html_url: 'https://github.com/AgentWorkforce/agents/pull/27',
+      user: { login: 'WillWashburn' },
+      draft: true,
+    },
+    repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
+  })?.draft, true);
+  // A non-draft PR carries draft:false (not undefined) so the gate can tell
+  // "explicitly ready" from "unknown".
+  assert.equal(readPr({
+    number: 28,
+    pull_request: {
+      number: 28,
+      html_url: 'https://github.com/AgentWorkforce/agents/pull/28',
+      user: { login: 'WillWashburn' },
+      draft: false,
+    },
+    repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
+  })?.draft, false);
+});
+
 test('labelNames normalizes github label arrays defensively', () => {
   assert.deepEqual(labelNames([
     { name: ' No-Agent-Relay-Review ' },
@@ -129,6 +156,10 @@ test('reviewHarnessPrompt keeps fixes within the PR scope and verifies CI-deep',
   assert.match(prompt, /canonical build and test command end to end/);
   assert.match(prompt, /regenerate that file with the repo's own generator/);
   assert.match(prompt, /the working tree must pass the full command with your edits in place/);
+  // Anti-hollow guard: don't make a check pass by gutting the test.
+  assert.match(prompt, /Never make a check pass by weakening the test/);
+  assert.match(prompt, /worse than no test/);
+  assert.match(prompt, /only change a test's EXPECTATION when the test encoded the OLD/);
 });
 
 test('reviewHarnessPrompt only allows READY after checks complete, pass, and the PR is mergeable', () => {

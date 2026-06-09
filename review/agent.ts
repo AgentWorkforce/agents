@@ -38,6 +38,7 @@ export interface Pr {
   headSha?: string;
   state?: string;
   merged?: boolean;
+  draft?: boolean;
   labels?: unknown;
 }
 
@@ -48,6 +49,7 @@ export interface Pr {
 interface PrMeta {
   state?: string; // 'open' | 'closed'
   merged?: boolean;
+  draft?: boolean; // a held PR — the author isn't asking for review yet
   // The materialized meta.json has carried `author` both as a bare login
   // string and as an object — accept either so the allowlist isn't silently
   // bypassed by a shape mismatch.
@@ -123,6 +125,17 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
   const state = (meta?.state ?? pr.state ?? '').trim().toLowerCase();
   if (meta?.merged === true || pr.merged === true || state === 'closed') {
     return { reason: 'PR is already merged/closed' };
+  }
+
+  // A draft PR is held by its author — they aren't asking for review yet, and an
+  // auto-push into a work-in-progress branch is unwanted. Gate on it
+  // PREEMPTIVELY: the draft flag is set the instant the PR is opened as a draft,
+  // so it closes the window the skip label misses (a label has to be applied by
+  // hand, and the bot can fire before it lands). Read both the authoritative
+  // meta.json and the webhook payload's draft flag; mark-ready-for-review fires
+  // a `pull_request.synchronize`/`ready_for_review` event that re-opens the gate.
+  if (meta?.draft === true || pr.draft === true) {
+    return { reason: 'PR is a draft' };
   }
 
   // A disabling label turns the reviewer off entirely for this PR. `labels` is
@@ -388,6 +401,12 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `ships — the working tree must pass the full command with your edits in place. When you change code that`,
     `GENERATES commands, scripts, or queries, also execute a sample of the generated output against a throwaway`,
     `fixture — tests that only assert on the generated string prove nothing about its behavior.`,
+    `Never make a check pass by weakening the test: do not delete it, skip it, loosen an assertion, narrow its`,
+    `inputs, or replace a real assertion with a trivially-true one. A test that no longer fails when the behavior it`,
+    `guards regresses is worse than no test, and it passes CI while hiding the bug. When an edit makes a test fail,`,
+    `fix the CODE; only change a test's EXPECTATION when the test encoded the OLD, now-intentionally-changed contract`,
+    `and the new expected value is demonstrably correct — and say which in your "## Addressed comments" notes. If you`,
+    `cannot make a test genuinely pass, leave the code unfixed and raise it as advisory rather than gutting the test.`,
     `If you cannot verify an edit (tests cannot run in this sandbox and you cannot make them run), do not leave it`,
     `in the working tree: discard it with "git restore <file>" — the one exception to the no-git rule, because`,
     `rewriting a file back from memory is error-prone — delete files you created, and present the proposed change as`,
@@ -659,6 +678,7 @@ export function readPr(payload: unknown): Pr | undefined {
       head?: { sha?: string };
       state?: string;
       merged?: boolean;
+      draft?: boolean;
       labels?: unknown;
     };
     check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
@@ -681,6 +701,7 @@ export function readPr(payload: unknown): Pr | undefined {
     ...(headSha ? { headSha } : {}),
     ...(p?.pull_request?.state ? { state: p.pull_request.state } : {}),
     ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),
+    ...(typeof p?.pull_request?.draft === 'boolean' ? { draft: p.pull_request.draft } : {}),
     ...(p?.pull_request?.labels !== undefined ? { labels: p.pull_request.labels } : {})
   };
 }

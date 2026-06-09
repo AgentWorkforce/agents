@@ -116,6 +116,21 @@ test('reviewHarnessPrompt forbids git except the explicit restore-only carve-out
   assert.doesNotMatch(prompt, /\bgit\s+(checkout|reset|clean|commit|push|add|fetch|pull|rebase|merge|stash)\b/);
 });
 
+test('reviewHarnessPrompt keeps fixes within the PR scope and verifies CI-deep', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 162 });
+  // Scope discipline: out-of-scope reviewer suggestions become advisory notes,
+  // not edits folded into this PR (the dropbox/linear scope-creep that broke an
+  // unrelated build in agents#162's downstream relayfile-adapters PR).
+  assert.match(prompt, /Stay within this PR's purpose/);
+  assert.match(prompt, /record it as an advisory note in your review and leave the code unchanged/);
+  // Verification must be CI-deep (full build/test), not just the touched file,
+  // and must regenerate generated/committed artifacts the edit feeds.
+  assert.match(prompt, /verify it the way CI does/);
+  assert.match(prompt, /canonical build and test command end to end/);
+  assert.match(prompt, /regenerate that file with the repo's own generator/);
+  assert.match(prompt, /the working tree must pass the full command with your edits in place/);
+});
+
 test('reviewHarnessPrompt only allows READY after checks complete, pass, and the PR is mergeable', () => {
   const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 100 });
   assert.match(prompt, /every required CI check has completed/);

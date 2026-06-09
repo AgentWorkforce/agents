@@ -149,6 +149,7 @@ test('reviewHarnessPrompt keeps fixes within the PR scope and verifies CI-deep',
   // not edits folded into this PR (the dropbox/linear scope-creep that broke an
   // unrelated build in agents#162's downstream relayfile-adapters PR).
   assert.match(prompt, /Stay within this PR's purpose/);
+  assert.match(prompt, /use \.workforce\/context\.json for available PR\s+metadata/);
   assert.match(prompt, /record it as an advisory note under a "## Advisory Notes" heading in your review and leave the code unchanged/);
   // Verification must be CI-deep (full build/test), not just the touched file,
   // and must regenerate generated/committed artifacts the edit feeds.

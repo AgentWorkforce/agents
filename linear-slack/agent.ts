@@ -23,7 +23,7 @@
 import {
   defineAgent,
   type WorkforceCtx,
-  type WorkforceProviderEvent,
+  type WorkforceEvent,
 } from '@agentworkforce/runtime';
 import { linearClient, slackClient } from '@relayfile/relay-helpers';
 
@@ -115,16 +115,16 @@ export default defineAgent({
 
 export async function handleSlackEvent(
   ctx: WorkforceCtx,
-  event: WorkforceProviderEvent,
+  event: WorkforceEvent,
   slack: SlackClientLike,
   linear: LinearWriteClient,
 ): Promise<void> {
-  if (event.source !== 'slack') {
+  if (!event.type.startsWith('slack.')) {
     logSkip(ctx, event, 'non-slack event source');
     return;
   }
 
-  const msg = readSlackMessage(event.payload);
+  const msg = readSlackMessage((await event.expand('full')).data);
   if (!msg) {
     logSkip(ctx, event, 'unparseable slack payload');
     return;
@@ -412,7 +412,7 @@ function errorMessage(error: unknown): string {
 
 function logSkip(
   ctx: WorkforceCtx,
-  event: WorkforceProviderEvent,
+  event: WorkforceEvent,
   reason: string,
   attrs: Record<string, unknown> = {},
 ): void {

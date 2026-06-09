@@ -79,20 +79,22 @@ export default defineAgent({
     ]
   },
   handler: async (ctx, event) => {
-  if (event.source !== 'github') return;
+  // `event` is narrowed to the declared github.* triggers. The provider
+  // payload is reached via expand (no synchronous `event.payload` in v4).
+  const data = (await event.expand('full')).data;
 
   // An approval from an authorized reviewer ends the loop: merge and stop.
-  if (event.type === 'pull_request_review.submitted' && isApproval(event.payload) && isAuthorizedApprover(ctx, event.payload)) {
-    const pr = readPr(event.payload);
+  if (event.type === 'github.pull_request_review.submitted' && isApproval(data) && isAuthorizedApprover(ctx, data)) {
+    const pr = readPr(data);
     if (pr) await mergePr(ctx, pr);
     return;
   }
 
   // A check run that finished without failing needs no action.
-  if (event.type === 'check_run.completed' && !ciFailed(event.payload)) return;
+  if (event.type === 'github.check_run.completed' && !ciFailed(data)) return;
 
   // Everything else is a reason to (re)review and push fixes.
-  const pr = readPr(event.payload);
+  const pr = readPr(data);
   if (pr) {
     const skip = await shouldSkipReview(ctx, pr);
     if (skip) {
@@ -100,7 +102,7 @@ export default defineAgent({
       return;
     }
     await reviewAndFix(ctx, pr);
-  } else if (event.type === 'check_run.completed') {
+  } else if (event.type === 'github.check_run.completed') {
     // GitHub sometimes emits check_run.completed with pull_requests: [] for
     // fork PRs and org-level checks; surface so a "silent no-op" isn't
     // mistaken for "PR review skipped on purpose".

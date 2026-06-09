@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { handleSlackEvent } from '../.test-build/linear-slack/agent.js';
+import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 
 function ctx(overrides = {}) {
   const logs = [];
@@ -51,12 +52,15 @@ function linearSpy(overrides = {}) {
 }
 
 function slackEvent(text) {
-  return {
-    source: 'slack',
+  // v4: a real relay SDK AgentEvent (payload reached via expand). Build it the
+  // way the runner does — from a cloud gateway envelope.
+  return envelopeToAgentEvent({
     id: 'evt-1',
-    type: 'message.created',
-    payload: { channel: 'C0B9287EP6Y', ts: '1781004465.912899', text, user: 'U1', is_bot: false },
-  };
+    workspace: 'ws-test',
+    type: 'slack.message.created',
+    occurredAt: '2026-06-01T00:00:00.000Z',
+    resource: { channel: 'C0B9287EP6Y', ts: '1781004465.912899', text, user: 'U1', is_bot: false },
+  });
 }
 
 const ACTION = (obj) => '```linear-actions\n' + JSON.stringify(obj) + '\n```';

@@ -7,6 +7,7 @@ import test from 'node:test';
 import { linearClient as relayLinearClient } from '@relayfile/relay-helpers';
 
 import linearAgent, { handleLinearEvent } from '../.test-build/linear/agent.js';
+import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 
 function ctx(overrides = {}) {
   const logs = [];
@@ -101,15 +102,17 @@ function linearClient() {
 }
 
 function event(type, payload) {
-  return {
-    source: 'linear',
+  // v4: a real relay SDK AgentEvent. `type` is given in suffix form
+  // (`AgentSessionEvent.prompted`); cloud delivers it provider-qualified, so
+  // prefix `linear.`. The payload is reached via `event.expand('full')`.
+  return envelopeToAgentEvent({
     id: `evt-${type}`,
+    workspace: 'workspace-1',
+    type: `linear.${type}`,
     occurredAt: '2026-06-02T19:00:00.000Z',
     attempt: 1,
-    workspaceId: 'workspace-1',
-    type,
-    payload,
-  };
+    resource: payload,
+  });
 }
 
 test('declares version-skew-tolerant Linear trigger path coverage', () => {

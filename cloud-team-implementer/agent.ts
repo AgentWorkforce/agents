@@ -9,13 +9,13 @@
  * and duplicate PRs for the same issue — so this handler declares no
  * triggers and only logs if cloud ever routes an event to it directly.
  */
-import { defineAgent, type WorkforceCtx, type WorkforceEvent } from '@agentworkforce/runtime';
+import { defineAgent, isCronTickEvent, type WorkforceCtx, type WorkforceEvent } from '@agentworkforce/runtime';
 
 export async function handleUnexpectedEvent(ctx: WorkforceCtx, event: WorkforceEvent): Promise<void> {
   ctx.log('warn', 'cloud-team-implementer received a direct event; members are launched by the team dispatcher, not by subscriptions', {
     eventId: event.id,
-    source: event.source,
-    type: 'type' in event ? event.type : undefined
+    source: isCronTickEvent(event) ? 'cron' : event.resource.provider,
+    type: event.type
   });
 }
 

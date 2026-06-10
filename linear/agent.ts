@@ -8,7 +8,7 @@
 import {
   defineAgent,
   type WorkforceCtx,
-  type WorkforceProviderEvent,
+  type WorkforceEvent,
 } from '@agentworkforce/runtime';
 import { linearClient } from '@relayfile/relay-helpers';
 
@@ -73,36 +73,38 @@ export default defineAgent({
 
 export async function handleLinearEvent(
   ctx: WorkforceCtx,
-  event: WorkforceProviderEvent,
+  event: WorkforceEvent,
   linear: LinearClientLike,
 ): Promise<void> {
+  // v4: the provider payload is reached via expand (no sync `event.payload`).
+  const payload = (await event.expand('full')).data;
   ctx.log?.('info', 'linear event', {
     eventId: event.id,
     type: event.type,
-    payloadKeys: payloadKeys(event.payload),
-    recordKeys: payloadKeys(linearRecordPayload(event.payload)),
-    hasIssueId: Boolean(readIssueId(event.payload, event.type)),
-    hasSessionId: Boolean(readSessionId(event.payload)),
+    payloadKeys: payloadKeys(payload),
+    recordKeys: payloadKeys(linearRecordPayload(payload)),
+    hasIssueId: Boolean(readIssueId(payload, event.type)),
+    hasSessionId: Boolean(readSessionId(payload)),
   });
 
-  if (event.source !== 'linear') {
+  if (!event.type.startsWith('linear.')) {
     logSkip(ctx, event, 'non-linear event source');
     return;
   }
 
-  if (isOwnEvent(ctx, event)) {
+  if (isOwnEvent(ctx, event, payload)) {
     logSkip(ctx, event, 'own activity');
     return;
   }
 
-  const eventContext = linearEventContext(event);
+  const eventContext = linearEventContext(event, payload);
   if (!eventContext.issueId) {
     logSkip(ctx, event, 'missing issue id');
     return;
   }
 
   if (eventContext.fallbackComment) {
-    const mention = commentMentionsAgent(ctx, event.payload);
+    const mention = commentMentionsAgent(ctx, payload);
     if (!mention.matched) {
       logSkip(ctx, event, mention.reason, mention.attrs);
       return;
@@ -138,14 +140,16 @@ export async function handleLinearEvent(
   await rememberTurn(ctx, eventContext, 'assistant', intent.reply);
 }
 
-function linearEventContext(event: WorkforceProviderEvent): LinearEventContext {
-  const record = linearRecordPayload(event.payload) as Record<string, unknown>;
+function linearEventContext(event: WorkforceEvent, payload: unknown): LinearEventContext {
+  const record = linearRecordPayload(payload) as Record<string, unknown>;
   return {
     record,
-    issueId: readIssueId(event.payload, event.type),
-    sessionId: readSessionId(event.payload),
-    body: readPromptBody(event.payload),
-    fallbackComment: event.type === 'AppUserNotification.issueCommentMention' || event.type === 'comment.create',
+    issueId: readIssueId(payload, event.type),
+    sessionId: readSessionId(payload),
+    body: readPromptBody(payload),
+    fallbackComment:
+      event.type === 'linear.AppUserNotification.issueCommentMention' ||
+      event.type === 'linear.comment.create',
   };
 }
 
@@ -175,7 +179,7 @@ async function replyToLinear(
 
 async function classifyIntent(
   ctx: WorkforceCtx,
-  event: WorkforceProviderEvent,
+  event: WorkforceEvent,
   eventContext: LinearEventContext,
   issue: LinearIssue,
   history: string[],
@@ -219,7 +223,7 @@ function parseChatIntent(response: string, eventType: string, body: string): Cha
 }
 
 function inferIntent(eventType: string, body: string): ChatIntent['intent'] {
-  if (eventType === 'issue.create') return 'implement';
+  if (eventType === 'linear.issue.create') return 'implement';
   return /\b(implement|fix|ship|code|open\s+(?:a\s+)?pr|pull request)\b/iu.test(body)
     ? 'implement'
     : 'chat';
@@ -369,7 +373,7 @@ function readIssueId(payload: unknown, eventType?: string): string | undefined {
     p?.issueId ??
     p?.issue_id ??
     p?.issue?.id ??
-    (eventType === 'comment.create' ? undefined : p?.data?.id ?? rec?.id)
+    (eventType === 'linear.comment.create' ? undefined : p?.data?.id ?? rec?.id)
   );
 }
 
@@ -430,12 +434,12 @@ function commentBody(payload: unknown): string {
   );
 }
 
-function isOwnEvent(ctx: WorkforceCtx, event: WorkforceProviderEvent): boolean {
-  if (event.type === 'comment.create') {
-    return isOwnComment(ctx, event.payload);
+function isOwnEvent(ctx: WorkforceCtx, event: WorkforceEvent, payload: unknown): boolean {
+  if (event.type === 'linear.comment.create') {
+    return isOwnComment(ctx, payload);
   }
-  const rec = linearRecordPayload(event.payload) as { agentActivity?: unknown } | null;
-  return commentAuthorMatchesAgent(ctx, rec?.agentActivity ?? event.payload);
+  const rec = linearRecordPayload(payload) as { agentActivity?: unknown } | null;
+  return commentAuthorMatchesAgent(ctx, rec?.agentActivity ?? payload);
 }
 
 /** True if a comment event is the agent's own PR-link reply (loop guard). */
@@ -696,7 +700,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function logSkip(
   ctx: WorkforceCtx,
-  event: WorkforceProviderEvent,
+  event: WorkforceEvent,
   reason: string,
   attrs: Record<string, unknown> = {},
 ): void {

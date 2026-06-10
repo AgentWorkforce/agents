@@ -12,8 +12,8 @@
     "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done"
   },
   "dependencies": {
-    "@agentworkforce/persona-kit": "^3.0.47",
-    "@agentworkforce/runtime": "^3.0.49",
+    "@agentworkforce/persona-kit": "^4.0.0",
+    "@agentworkforce/runtime": "^4.0.0",
     "@relayfile/relay-helpers": "0.3.33"
   },
   "devDependencies": {

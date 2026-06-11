@@ -1,0 +1,4 @@
+[
+  { "id": "acme", "name": "Acme Corp", "description": "Enterprise customer; data-export integration. Domain acme.com." },
+  { "id": "globex", "name": "Globex", "description": "Mid-market; onboarding in progress. Domain globex.io." }
+]

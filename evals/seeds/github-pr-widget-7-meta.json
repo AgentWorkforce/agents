@@ -1,0 +1,8 @@
+{
+  "number": 7,
+  "title": "Add CSV export endpoint",
+  "state": "open",
+  "draft": false,
+  "labels": [],
+  "diff": "diff --git a/src/export.ts b/src/export.ts\nindex 1111111..2222222 100644\n--- a/src/export.ts\n+++ b/src/export.ts\n@@ -1,3 +1,12 @@\n-export function noop() {}\n+import { db } from './db';\n+\n+export async function exportCsv(accountId: string): Promise<string> {\n+  const rows = await db.activity.findMany({ where: { accountId } });\n+  const header = 'id,type,at\\n';\n+  const body = rows.map((r) => `${r.id},${r.type},${r.at}`).join('\\n');\n+  // NOTE: no pagination — will OOM on large accounts\n+  return header + body;\n+}\n"
+}

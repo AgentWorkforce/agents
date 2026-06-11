@@ -7,3 +7,12 @@ node_modules/
 # Relay VFS runtime state — rewritten on every reconcile cycle, never commit it
 .relay/
 memory/workspace/.relay/
+
+# Eval run artifacts
+.evals/
+# Safety net: stray provider draft trees a mis-pointed mount root can leave behind
+/slack/
+/linear/
+/github/
+/notion/
+/google-mail/

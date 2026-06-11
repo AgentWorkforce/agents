@@ -104,6 +104,10 @@ function agentEntry(agent) {
   return path.join(agentDir(agent), 'agent.ts');
 }
 
+function resolveHandler(mod) {
+  return mod.handler ?? mod.default?.handler ?? mod.default;
+}
+
 function withCaseEnv(persona, inputs, extraEnv, fn) {
   const updates = new Map(Object.entries(extraEnv ?? {}));
   for (const [key, spec] of Object.entries(persona.inputs ?? {})) {
@@ -168,7 +172,7 @@ async function runSimulate(testCase) {
     const rec = await withCaseEnv(persona, testCase.inputs ?? {}, { RELAYFILE_MOUNT_ROOT: tmp, WORKSPACE_ROOT: tmp }, () =>
       simulateInvocation({
         persona,
-        handler: mod.default?.handler ?? mod.default,
+        handler: resolveHandler(mod),
         envelopes: [buildEnvelope(testCase)],
         agent: { inputValues: testCase.inputs ?? {} },
         files,
@@ -199,6 +203,12 @@ function opencodeRun(prompt, cwd) {
     maxBuffer: 16 * 1024 * 1024,
     env: { ...process.env },
   });
+  if (res.error) {
+    throw new Error(`Failed to execute opencode: ${res.error.message}`);
+  }
+  if (res.status !== 0) {
+    throw new Error(`opencode exited with code ${res.status}: ${res.stderr || res.stdout}`);
+  }
   const raw = (res.stdout ?? '').replace(/\x1b\[[0-9;]*m/g, '');
   // Drop opencode's banner/status lines ("> build · model", "@ ...") and keep the reply.
   const lines = raw.split('\n').filter((l) => l.trim() && !/^[>@]/.test(l.trim()));
@@ -279,8 +289,10 @@ async function runLive(testCase) {
   try {
     const mod = await tsImport(pathToFileURL(agentEntry(testCase.agent)).href, import.meta.url);
     if (!event) throw new Error('envelopeToAgentEvent returned null (unsupported envelope)');
-    const handler = mod.default?.handler ?? mod.default;
-    await withCaseEnv(personaSpec, testCase.inputs ?? {}, { RELAYFILE_MOUNT_ROOT: mount, WORKSPACE_ROOT: mount }, () => handler(ctx, event));
+    const handler = resolveHandler(mod);
+    process.env.RELAYFILE_MOUNT_ROOT = mount;
+    process.env.WORKSPACE_ROOT = mount;
+    await withCaseEnv(personaSpec, testCase.inputs ?? {}, {}, () => handler(ctx, event));
   } catch (err) {
     status = 'failed';
     error = err instanceof Error ? err.message : String(err);
@@ -351,7 +363,7 @@ async function main() {
     // A case may deliberately expect a failure (e.g. a required-input guard throw);
     // only treat an unexpected failed status as an automatic fail.
     const expectsFailure = (testCase.expect?.status ?? null) === 'failed';
-    const passed = checks.every((c) => c.pass) && (expectsFailure || outcome.status !== 'failed') && (verdict ? verdict.pass !== false : true);
+    const passed = checks.every((c) => c.pass) && (expectsFailure || outcome.status !== 'failed') && (verdict ? verdict.pass === true : true);
     results.push({ id: testCase.id, agent: testCase.agent, kind: testCase.kind, passed, checks, outcome, verdict });
     const tag = passed ? 'PASS' : 'FAIL';
     console.log(`${tag}  ${checks.map((c) => `${c.pass ? '✓' : '✗'}${c.name}`).join(' ')}${verdict ? `  judge:${verdict.pass}` : ''}${outcome.error ? `  ERR:${outcome.error.slice(0, 80)}` : ''}`);

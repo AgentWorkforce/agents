@@ -165,7 +165,7 @@ async function runSimulate(testCase) {
     }
     const persona = JSON.parse(readFileSync(personaPath(testCase.agent), 'utf8'));
     const mod = await tsImport(pathToFileURL(agentEntry(testCase.agent)).href, import.meta.url);
-    const rec = await withCaseEnv(persona, testCase.inputs ?? {}, { RELAYFILE_MOUNT_ROOT: tmp }, () =>
+    const rec = await withCaseEnv(persona, testCase.inputs ?? {}, { RELAYFILE_MOUNT_ROOT: tmp, WORKSPACE_ROOT: tmp }, () =>
       simulateInvocation({
         persona,
         handler: mod.default?.handler ?? mod.default,
@@ -280,7 +280,7 @@ async function runLive(testCase) {
     const mod = await tsImport(pathToFileURL(agentEntry(testCase.agent)).href, import.meta.url);
     if (!event) throw new Error('envelopeToAgentEvent returned null (unsupported envelope)');
     const handler = mod.default?.handler ?? mod.default;
-    await withCaseEnv(personaSpec, testCase.inputs ?? {}, { RELAYFILE_MOUNT_ROOT: mount }, () => handler(ctx, event));
+    await withCaseEnv(personaSpec, testCase.inputs ?? {}, { RELAYFILE_MOUNT_ROOT: mount, WORKSPACE_ROOT: mount }, () => handler(ctx, event));
   } catch (err) {
     status = 'failed';
     error = err instanceof Error ? err.message : String(err);

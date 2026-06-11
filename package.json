@@ -26,6 +26,7 @@
     "typescript": "^5.6.0"
   },
   "overrides": {
+    "@relayfile/adapter-linear": "0.3.11",
     "@opentelemetry/otlp-transformer": {
       "protobufjs": "^8.5.0"
     }

@@ -163,6 +163,32 @@ test('reviewHarnessPrompt keeps fixes within the PR scope and verifies CI-deep',
   assert.match(prompt, /only change a test's EXPECTATION when the test encoded the OLD/);
 });
 
+test('reviewHarnessPrompt limits auto-edits to mechanical changes', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 266 });
+  assert.match(prompt, /Auto-edit only lint, formatting, spelling, typo, import-order, or other mechanical non-semantic changes/);
+  assert.match(prompt, /Do not auto-edit semantic or safety-critical logic/);
+  assert.match(prompt, /leave a clear suggestion or review comment instead of changing files/);
+  assert.match(prompt, /PR already has a human review or approval/);
+  assert.match(prompt, /suggestion\/comment-only/);
+});
+
+test('reviewHarnessPrompt forbids safety-default and lifecycle edits', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'factory-sdk', number: 264 });
+  assert.match(prompt, /Never change semantic or safety defaults/);
+  assert.match(prompt, /fail-closed states into fail-open states/);
+  assert.match(prompt, /"timeout", "pending", throw, or undefined becoming "acked", true, \{\}/);
+  assert.match(prompt, /swap truthiness checks for presence checks/);
+  assert.match(prompt, /guard default values/);
+  assert.match(prompt, /Never touch lifecycle, termination, reaper, in-flight, dispatch, broker ownership, or process-cleanup code/);
+});
+
+test('reviewHarnessPrompt forbids self-justifying test edits', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 243 });
+  assert.match(prompt, /Never add or modify tests to make your own change pass/);
+  assert.match(prompt, /If a change needs a new or updated test, that is a\s+human decision/);
+  assert.match(prompt, /describe the needed test in your review and leave the working tree unchanged/);
+});
+
 test('reviewHarnessPrompt only allows READY after checks complete, pass, and the PR is mergeable', () => {
   const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 100 });
   assert.match(prompt, /every required CI check has completed/);

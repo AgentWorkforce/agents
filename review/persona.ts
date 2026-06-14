@@ -12,6 +12,20 @@ export default definePersona({
   description: 'Reviews new PRs, applies only lint/format/typo fixes, comments on logic or safety findings, pings you on Slack when ready, and merges once you approve.',
   cloud: true,
 
+  // Opt-in, comment-driven merge-conflict resolution. Distinct from cloud's
+  // deterministic `conflictAutofix` (which only does a clean rebase and aborts
+  // on real textual conflicts): `conflictResolve` is the LLM path — cloud merges
+  // the base branch into the working tree, the harness resolves the conflict
+  // markers (see conflictResolveHarnessPrompt in agent.ts), and cloud finalizes
+  // and pushes the merge commit. It engages ONLY when an authorized commenter
+  // posts the directive (see CONFLICT_DIRECTIVE_PATTERN), never on ordinary PR
+  // events. Inert until cloud models this capability + the merge-in-tree setup
+  // (tracked in AgentWorkforce/cloud): with no merge, the harness finds no
+  // markers and makes no change.
+  capabilities: {
+    conflictResolve: { directive: '@relay fix conflicts', resolveMarkers: true }
+  },
+
   integrations: {
     github: {},
     slack: {

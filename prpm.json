@@ -1,0 +1,14 @@
+{
+  "name": "trigger-autocomplete-catalog",
+  "version": "1.0.0",
+  "description": "Cloud/relayfile guidance for registering provider webhook/event triggers in @relayfile/adapter-core's KNOWN_TRIGGER_CATALOG before shipping an integration.",
+  "format": "claude",
+  "subtype": "skill",
+  "organization": "agent-relay",
+  "private": true,
+  "license": "Proprietary",
+  "repository": "https://github.com/AgentWorkforce/cloud",
+  "files": [
+    ".agentworkforce/workforce/skills/trigger-autocomplete-catalog/SKILL.md"
+  ]
+}

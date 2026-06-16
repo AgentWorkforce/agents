@@ -3,7 +3,8 @@
  * to the finish line.
  *
  *   an authorized approval (pull_request_review.submitted) → merge the PR.
- *   a check run that finished green (check_run.completed)   → nothing to do.
+ *   merge-on-green label + green checks + bot approvals     → merge the PR.
+ *   a check run that finished green (check_run.completed)   → maybe merge-on-green, otherwise nothing to do.
  *   anything else — opened, new commits (synchronize), a
  *   review comment, failed CI, changes requested            → (re)review and fix.
  *
@@ -60,6 +61,8 @@ interface PrMeta {
 }
 
 const DEFAULT_SKIP_LABEL = 'no-agent-relay-review';
+const MERGE_ON_GREEN_LABEL = 'merge-on-green';
+const AGENT_WORKFORCE_ORG = 'agentworkforce';
 const SLACK_THREAD_TAG = 'pr-reviewer:slack-thread';
 
 function vfsClient(): IntegrationClientOptions {
@@ -76,17 +79,44 @@ export default defineAgent({
       { on: 'pull_request_review.submitted' },
       { on: 'pull_request_review_comment.created' },
       { on: 'check_run.completed' },
-      { on: 'pull_request.synchronize' }
+      { on: 'pull_request.synchronize' },
+      { on: 'issues.labeled' },
+      { on: 'status' }
+    ],
+    slack: [
+      {
+        on: 'message.created',
+        paths: ['/slack/channels/${SLACK_CHANNEL}/**']
+      }
     ]
   },
   handler: async (ctx, event) => {
-  // `event` is narrowed to the declared github.* triggers. The provider
+  // `event` is narrowed to the declared provider triggers. The provider
   // payload is reached via expand (no synchronous `event.payload` in v4).
   const data = (await event.expand('full')).data;
 
+  if (event.type.startsWith('slack.')) {
+    await handleSlackMergeRequest(ctx, data);
+    return;
+  }
+
+  const pr = readPr(data);
+
+  if (pr && mergeOnGreenEventType(event.type)) {
+    const outcome = await maybeMergeOnGreen(ctx, pr);
+    if (outcome === 'merged') return;
+    if (event.type === 'github.issues.labeled' || event.type === 'github.status') return;
+  } else if (event.type === 'github.status') {
+    const statusPrs = await readPrsForCommitStatus(ctx, data);
+    for (const statusPr of statusPrs) {
+      const outcome = await maybeMergeOnGreen(ctx, statusPr);
+      if (outcome === 'merged') return;
+    }
+    return;
+  }
+
   // An approval from an authorized reviewer ends the loop: merge and stop.
   if (event.type === 'github.pull_request_review.submitted' && isApproval(data) && isAuthorizedApprover(ctx, data)) {
-    const pr = readPr(data);
     if (pr) await mergePr(ctx, pr);
     return;
   }
@@ -95,7 +125,7 @@ export default defineAgent({
   if (event.type === 'github.check_run.completed' && !ciFailed(data)) return;
 
   // Everything else is a reason to (re)review and apply safe mechanical fixes.
-  const pr = readPr(data);
+  // `pr` was read above for the merge-on-green path and is reused here.
   if (pr) {
     const skip = await shouldSkipReview(ctx, pr);
     if (skip) {
@@ -111,6 +141,64 @@ export default defineAgent({
   }
   }
 });
+
+function mergeOnGreenEventType(eventType: string): boolean {
+  return eventType === 'github.issues.labeled' ||
+    eventType === 'github.status' ||
+    eventType === 'github.check_run.completed' ||
+    eventType === 'github.pull_request_review.submitted' ||
+    eventType === 'github.pull_request.synchronize' ||
+    eventType === 'github.pull_request.opened';
+}
+
+type MergeOnGreenOutcome = 'merged' | 'ready' | 'blocked' | 'pending' | 'skipped';
+
+interface MergeOnGreenDecision {
+  outcome: MergeOnGreenOutcome;
+  reasons: string[];
+  pr?: Pr;
+  state?: PullRequestReadyState;
+}
+
+async function maybeMergeOnGreen(ctx: WorkforceCtx, pr: Pr): Promise<MergeOnGreenOutcome> {
+  const decision = await mergeOnGreenDecision(ctx, pr);
+  if (decision.outcome !== 'ready' || !decision.pr) {
+    logMergeOnGreenDecision(ctx, decision, pr);
+    return decision.outcome;
+  }
+  await mergePr(ctx, decision.pr);
+  return 'merged';
+}
+
+async function mergeOnGreenDecision(ctx: WorkforceCtx, pr: Pr): Promise<MergeOnGreenDecision> {
+  if (!mergeOnGreenRepoAllowed(pr)) {
+    return { outcome: 'skipped', reasons: [`${pr.owner}/${pr.repo} is outside AgentWorkforce`], pr };
+  }
+  const state = await readMergeOnGreenState(ctx, pr);
+  const currentPr = {
+    ...pr,
+    ...(typeof state.headRefOid === 'string' && state.headRefOid.trim() ? { headSha: state.headRefOid.trim() } : {}),
+    ...(typeof state.state === 'string' ? { state: state.state.toLowerCase() } : {}),
+    ...(typeof state.isDraft === 'boolean' ? { draft: state.isDraft } : {}),
+  };
+  const gate = evaluateMergeOnGreenState(state);
+  return { outcome: gate.outcome, reasons: gate.reasons, pr: currentPr, state };
+}
+
+function mergeOnGreenRepoAllowed(pr: Pr): boolean {
+  return pr.owner.trim().toLowerCase() === AGENT_WORKFORCE_ORG;
+}
+
+function logMergeOnGreenDecision(ctx: WorkforceCtx, decision: MergeOnGreenDecision, pr: Pr): void {
+  if (decision.outcome === 'skipped') return;
+  ctx.log?.('info', 'pr-reviewer.merge-on-green.held', {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    outcome: decision.outcome,
+    reasons: decision.reasons,
+  });
+}
 
 // ── review gate ─────────────────────────────────────────────────────────────
 // Decide whether to (re)review/fix this PR at all. Returns a skip reason, or
@@ -476,16 +564,62 @@ async function verifyReadyForHumanReview(ctx: WorkforceCtx, pr: Pr): Promise<boo
 
 interface PullRequestReadyState {
   state?: unknown;
+  isDraft?: unknown;
+  labels?: unknown;
   mergeable?: unknown;
   mergeStateStatus?: unknown;
   reviewDecision?: unknown;
+  reviewRequests?: unknown;
+  latestReviews?: unknown;
   statusCheckRollup?: unknown;
   headRefOid?: unknown;
+  url?: unknown;
 }
 
 function parsePrReadyState(stdout: string): PullRequestReadyState {
   const parsed = JSON.parse(stdout) as unknown;
   return parsed && typeof parsed === 'object' ? parsed as PullRequestReadyState : {};
+}
+
+async function readMergeOnGreenState(ctx: WorkforceCtx, pr: Pr): Promise<PullRequestReadyState> {
+  const { stdout } = await execFileAsync('gh', [
+    'pr',
+    'view',
+    String(pr.number),
+    '--repo',
+    `${pr.owner}/${pr.repo}`,
+    '--json',
+    'state,isDraft,labels,mergeable,mergeStateStatus,reviewRequests,latestReviews,statusCheckRollup,headRefOid,url',
+  ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+  return parsePrReadyState(stdout);
+}
+
+async function readPrsForCommitStatus(ctx: WorkforceCtx, payload: unknown): Promise<Pr[]> {
+  const p = payload as {
+    sha?: string;
+    repository?: { name?: string; owner?: { login?: string } };
+  } | null;
+  const owner = p?.repository?.owner?.login;
+  const repo = p?.repository?.name;
+  const sha = p?.sha;
+  if (!owner || !repo || !sha) return [];
+  const { stdout } = await execFileAsync('gh', [
+    'api',
+    `/repos/${owner}/${repo}/commits/${sha}/pulls`,
+    '--jq',
+    '.[] | {number,html_url,head:{sha:.head.sha},user:{login:.user.login},state,merged,draft}',
+  ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+  return stdout
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        return readPr({ repository: { name: repo, owner: { login: owner } }, pull_request: JSON.parse(line) }) ?? [];
+      } catch {
+        return [];
+      }
+    });
 }
 
 /** Whether the PR is still open. A missing `state` is treated as open so the
@@ -515,6 +649,145 @@ export function prReadyStateAllowsHumanReview(state: PullRequestReadyState): boo
   const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
   if (checks.length === 0) return normalizeState(state.mergeStateStatus) === 'CLEAN';
   return checks.every(checkPassedAndComplete);
+}
+
+interface MergeOnGreenGate {
+  outcome: Exclude<MergeOnGreenOutcome, 'merged' | 'skipped'>;
+  reasons: string[];
+}
+
+export function evaluateMergeOnGreenState(state: PullRequestReadyState): MergeOnGreenGate {
+  const reasons: string[] = [];
+  if (!prIsOpen(state)) reasons.push(`PR is ${String(state.state ?? 'not open')}`);
+  if (state.isDraft === true || normalizeState(state.mergeStateStatus) === 'DRAFT') reasons.push('PR is a draft');
+  if (!mergeOnGreenLabels(state.labels).has(MERGE_ON_GREEN_LABEL)) reasons.push(`PR is missing the "${MERGE_ON_GREEN_LABEL}" label`);
+  if (state.mergeable === 'CONFLICTING') reasons.push('PR has merge conflicts');
+  const checkReason = mergeOnGreenChecksReason(state);
+  if (checkReason) reasons.push(checkReason);
+  const reviewReason = mergeOnGreenBotReviewReason(state);
+  if (reviewReason) reasons.push(reviewReason);
+
+  if (reasons.length === 0) return { outcome: 'ready', reasons: [] };
+  const blocked = reasons.some((reason) =>
+    /failed|error|changes requested|requested changes|conflict|closed|merged|draft/i.test(reason)
+  );
+  return { outcome: blocked ? 'blocked' : 'pending', reasons };
+}
+
+function mergeOnGreenLabels(labels: unknown): Set<string> {
+  return new Set(labelNames(labels));
+}
+
+function mergeOnGreenChecksReason(state: PullRequestReadyState): string | null {
+  const checks = Array.isArray(state.statusCheckRollup) ? state.statusCheckRollup : [];
+  if (checks.length === 0) {
+    return normalizeState(state.mergeStateStatus) === 'CLEAN'
+      ? null
+      : 'checks are not reported as complete yet';
+  }
+  const blocked = checks.find((check) => !checkPassedAndComplete(check));
+  if (!blocked || typeof blocked !== 'object') return null;
+  const record = blocked as Record<string, unknown>;
+  const name = String(record.name ?? record.context ?? record.workflowName ?? 'unknown');
+  const stateText = String(record.state ?? record.status ?? 'missing');
+  const conclusionText = String(record.conclusion ?? 'missing');
+  if (stateText.toUpperCase() === 'PENDING' || stateText.toUpperCase() === 'IN_PROGRESS') {
+    return `check "${name}" is still ${stateText.toLowerCase()}`;
+  }
+  if (stateText.toUpperCase() !== 'COMPLETED' && record.status !== undefined) {
+    return `check "${name}" is still ${stateText.toLowerCase()}`;
+  }
+  return `check "${name}" is not passing (${stateText}/${conclusionText})`;
+}
+
+function mergeOnGreenBotReviewReason(state: PullRequestReadyState): string | null {
+  const latest = latestReviewsByAuthor(state.latestReviews);
+  for (const [login, review] of latest) {
+    const author = reviewAuthor(review);
+    if (!isBotLogin(author.login, author.type)) continue;
+    if (normalizeState(review.state) === 'CHANGES_REQUESTED') {
+      return `bot @${login} requested changes`;
+    }
+  }
+  for (const login of requestedBotReviewLogins(state.reviewRequests)) {
+    const review = latest.get(login);
+    if (normalizeState(review?.state) !== 'APPROVED') {
+      return `bot @${login} has not approved yet`;
+    }
+  }
+  return null;
+}
+
+function requestedBotReviewLogins(reviewRequests: unknown): string[] {
+  if (!Array.isArray(reviewRequests)) return [];
+  const logins = new Set<string>();
+  for (const request of reviewRequests) {
+    if (!request || typeof request !== 'object') continue;
+    const record = request as Record<string, unknown>;
+    const reviewer = record.requestedReviewer && typeof record.requestedReviewer === 'object'
+      ? record.requestedReviewer as Record<string, unknown>
+      : record;
+    const login = readLogin(reviewer.login);
+    const type = typeof reviewer.type === 'string'
+      ? reviewer.type
+      : typeof reviewer.__typename === 'string'
+        ? reviewer.__typename
+        : undefined;
+    if (login && isBotLogin(login, type)) logins.add(login);
+  }
+  return [...logins].sort();
+}
+
+function latestReviewsByAuthor(reviews: unknown): Map<string, Record<string, unknown>> {
+  const latest = new Map<string, Record<string, unknown>>();
+  if (!Array.isArray(reviews)) return latest;
+  for (const review of reviews) {
+    if (!review || typeof review !== 'object') continue;
+    const record = review as Record<string, unknown>;
+    const author = reviewAuthor(record);
+    if (!author.login) continue;
+    const existing = latest.get(author.login);
+    if (!existing || reviewTimestamp(record) >= reviewTimestamp(existing)) {
+      latest.set(author.login, record);
+    }
+  }
+  return latest;
+}
+
+function reviewAuthor(review: Record<string, unknown> | undefined): { login: string; type?: string } {
+  if (!review) return { login: '' };
+  const author = review.author && typeof review.author === 'object'
+    ? review.author as Record<string, unknown>
+    : review.user && typeof review.user === 'object'
+      ? review.user as Record<string, unknown>
+      : {};
+  return {
+    login: readLogin(author.login),
+    type: typeof author.type === 'string'
+      ? author.type
+      : typeof author.__typename === 'string'
+        ? author.__typename
+        : undefined,
+  };
+}
+
+function reviewTimestamp(review: Record<string, unknown>): number {
+  const date = typeof review.submittedAt === 'string'
+    ? review.submittedAt
+    : typeof review.submitted_at === 'string'
+      ? review.submitted_at
+      : '';
+  const ms = Date.parse(date);
+  if (Number.isFinite(ms)) return ms;
+  return typeof review.id === 'number' ? review.id : 0;
+}
+
+function readLogin(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function isBotLogin(login: string, type?: string): boolean {
+  return type === 'Bot' || type === 'BotUser' || login.endsWith('[bot]');
 }
 
 // A check that's complete and not blocking. SUCCESS and NEUTRAL pass; SKIPPED
@@ -606,6 +879,15 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   }
 }
 
+interface SlackMessage {
+  channel: string;
+  ts: string;
+  threadTs?: string;
+  text: string;
+  isBot: boolean;
+  subtype?: string;
+}
+
 interface SlackThreadMemory {
   channel: string;
   threadTs: string;
@@ -614,6 +896,118 @@ interface SlackThreadMemory {
 interface SlackThreadClient {
   post(channel: string, text: string): Promise<{ channel: string; ts: string }>;
   reply(channel: string, threadTs: string, text: string): Promise<{ channel: string; ts: string }>;
+}
+
+export async function handleSlackMergeRequest(
+  ctx: WorkforceCtx,
+  payload: unknown,
+  client: SlackThreadClient = slackClient({ writebackTimeoutMs: 15_000 }),
+  decide: (ctx: WorkforceCtx, pr: Pr) => Promise<MergeOnGreenDecision> = mergeOnGreenDecision,
+  merge: (ctx: WorkforceCtx, pr: Pr) => Promise<void> = mergePr
+): Promise<void> {
+  const msg = readSlackMessage(payload);
+  if (!msg || msg.isBot || msg.subtype) return;
+  const configuredChannel = input(ctx, 'SLACK_CHANNEL');
+  if (configuredChannel && msg.channel !== configuredChannel) return;
+  const request = parseSlackMergeRequest(msg.text);
+  if (!request) return;
+
+  if (!request.pr) {
+    await replyToSlackMessage(client, msg, 'I can check merge-on-green status, but I need a GitHub pull request URL.');
+    return;
+  }
+
+  const decision = await decide(ctx, request.pr);
+  if (decision.outcome === 'ready' && decision.pr) {
+    await merge(ctx, decision.pr);
+    await replyToSlackMessage(
+      client,
+      msg,
+      `Merged ${decision.pr.owner}/${decision.pr.repo}#${decision.pr.number} because checks are green and bot reviews are satisfied.`
+    );
+    return;
+  }
+
+  const reasons = decision.reasons.length > 0 ? decision.reasons : ['merge-on-green gates are not satisfied yet'];
+  await replyToSlackMessage(
+    client,
+    msg,
+    `I cannot merge ${request.pr.owner}/${request.pr.repo}#${request.pr.number} yet: ${reasons.join('; ')}.`
+  );
+}
+
+function readSlackMessage(payload: unknown): SlackMessage | undefined {
+  const p = payload as {
+    channel?: string;
+    ts?: string;
+    thread_ts?: string;
+    threadTs?: string;
+    text?: string;
+    is_bot?: boolean;
+    isBot?: boolean;
+    bot_id?: string;
+    subtype?: string;
+    message?: {
+      channel?: string;
+      ts?: string;
+      thread_ts?: string;
+      text?: string;
+      is_bot?: boolean;
+      bot_id?: string;
+      subtype?: string;
+    };
+  } | null;
+  const source = p?.message ?? p ?? {};
+  const channel = typeof source?.channel === 'string' ? source.channel : '';
+  const ts = typeof source?.ts === 'string' ? source.ts : '';
+  const text = typeof source?.text === 'string' ? source.text : '';
+  if (!channel || !ts || !text) return undefined;
+  return {
+    channel,
+    ts,
+    threadTs: typeof source.thread_ts === 'string'
+      ? source.thread_ts
+      : typeof p?.threadTs === 'string'
+        ? p.threadTs
+        : undefined,
+    text,
+    isBot: source.is_bot === true || p?.isBot === true || typeof source.bot_id === 'string',
+    subtype: typeof source.subtype === 'string' ? source.subtype : undefined,
+  };
+}
+
+export function parseSlackMergeRequest(text: string): { pr?: Pr } | null {
+  const normalized = text.toLowerCase();
+  if (!mentionsPrReviewer(normalized)) return null;
+  if (!/(merge|ship|land)/.test(normalized)) return null;
+  const pr = parseGithubPullRequestUrl(text);
+  return { ...(pr ? { pr } : {}) };
+}
+
+function mentionsPrReviewer(normalizedText: string): boolean {
+  return /<@[A-Z0-9]+>/i.test(normalizedText) ||
+    normalizedText.includes('pr-reviewer') ||
+    normalizedText.includes('review agent');
+}
+
+function parseGithubPullRequestUrl(text: string): Pr | undefined {
+  const match = text.match(/https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/([1-9]\d*)/i);
+  if (!match) return undefined;
+  return {
+    owner: match[1],
+    repo: match[2],
+    number: Number.parseInt(match[3], 10),
+    url: `https://github.com/${match[1]}/${match[2]}/pull/${match[3]}`,
+    author: 'unknown',
+  };
+}
+
+async function replyToSlackMessage(
+  client: SlackThreadClient,
+  msg: SlackMessage,
+  text: string
+): Promise<void> {
+  await client.reply(msg.channel, msg.threadTs ?? msg.ts, text);
 }
 
 export async function postSlackPrUpdate(
@@ -686,6 +1080,12 @@ function slackThreadTags(pr: Pr, channel: string): string[] {
 export function readPr(payload: unknown): Pr | undefined {
   const p = payload as {
     number?: number;
+    issue?: {
+      number?: number;
+      html_url?: string;
+      pull_request?: unknown;
+      labels?: unknown;
+    };
     pull_request?: {
       number?: number;
       html_url?: string;
@@ -700,7 +1100,8 @@ export function readPr(payload: unknown): Pr | undefined {
     repository?: { name?: string; owner?: { login?: string } };
     sender?: { login?: string };
   } | null;
-  const prRef = p?.pull_request ?? p?.check_run?.pull_requests?.[0];
+  const issuePr = p?.issue?.pull_request ? p.issue : undefined;
+  const prRef = p?.pull_request ?? p?.check_run?.pull_requests?.[0] ?? issuePr;
   const number = prRef?.number ?? p?.number;
   const owner = p?.repository?.owner?.login;
   const repo = p?.repository?.name;
@@ -717,7 +1118,8 @@ export function readPr(payload: unknown): Pr | undefined {
     ...(p?.pull_request?.state ? { state: p.pull_request.state } : {}),
     ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),
     ...(typeof p?.pull_request?.draft === 'boolean' ? { draft: p.pull_request.draft } : {}),
-    ...(p?.pull_request?.labels !== undefined ? { labels: p.pull_request.labels } : {})
+    ...(p?.pull_request?.labels !== undefined ? { labels: p.pull_request.labels } : {}),
+    ...(p?.issue?.labels !== undefined ? { labels: p.issue.labels } : {})
   };
 }
 function isApproval(payload: unknown): boolean {

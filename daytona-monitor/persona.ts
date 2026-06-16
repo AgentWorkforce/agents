@@ -17,7 +17,7 @@ export default definePersona({
   cloud: true,
 
   harness: 'opencode',
-  model: 'deepseek-chat',
+  model: 'deepseek-v4-flash-free',
   systemPrompt: 'You are a Daytona infrastructure monitor. Answer questions about the current Daytona organization state concisely using Slack markdown. When no question is asked, summarize any active alerts.',
 
   integrations: {

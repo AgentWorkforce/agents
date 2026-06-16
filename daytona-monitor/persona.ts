@@ -13,8 +13,12 @@ export default definePersona({
   intent: 'relay-orchestrator',
   tags: ['discovery'],
   description:
-    "Watches your Daytona org's usage quotas + sandbox allocations and posts a Slack alert when a quota nears its limit, a sandbox errors, or a sandbox runs stale.",
+    "Watches your Daytona org's usage quotas + sandbox allocations and posts a Slack alert when a quota nears its limit, a sandbox errors, or a sandbox runs stale. Can also answer questions about current Daytona state via relay inbox.",
   cloud: true,
+
+  harness: 'opencode',
+  model: 'deepseek-v4-flash-free',
+  systemPrompt: 'You are a Daytona infrastructure monitor. Answer questions about the current Daytona organization state concisely using Slack markdown. When no question is asked, summarize any active alerts.',
 
   integrations: {
     // Two daytona subtrees:

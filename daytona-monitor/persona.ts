@@ -52,6 +52,7 @@ export default definePersona({
 
   // Pure threshold-diff + post — no model needed.
   harnessSettings: { reasoning: 'low', timeoutSeconds: 120 },
+  relay: { inbox: '@self' },
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 90 },
 
   onEvent: './agent.ts'

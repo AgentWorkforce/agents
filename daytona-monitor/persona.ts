@@ -32,7 +32,11 @@ export default definePersona({
   },
 
   inputs: {
-    SLACK_CHANNEL: { description: 'Team Slack channel id to post alerts to.', env: 'SLACK_CHANNEL' },
+    SLACK_CHANNEL: {
+      description: 'Team Slack channel id to post alerts to.',
+      env: 'SLACK_CHANNEL',
+      picker: { provider: 'slack', resource: 'channels' }
+    },
     DAYTONA_ORG_ID: {
       description: 'Daytona organization id to monitor.',
       env: 'DAYTONA_ORG_ID',

@@ -10,8 +10,18 @@
  *     → post ONE concise Slack alert if any signal fires; stay silent otherwise
  *       and never re-alert an unchanged condition.
  */
-import { defineAgent, isCronTickEvent, type AgentEvent, type WorkforceCtx } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  isCronTickEvent,
+  readJsonFile,
+  resolveMountRoot,
+  type AgentEvent,
+  type IntegrationClientOptions,
+  type WorkforceCtx
+} from '@agentworkforce/runtime';
 import { slackClient } from '@relayfile/relay-helpers';
+// Adapter-published path for the org usage record (/daytona/usage/<orgId>.json).
+import { daytonaUsagePath } from '@relayfile/adapter-daytona';
 // Fresh, auto-refreshed Daytona Auth0 access token (auth once → refreshed
 // forever). Owned by ./lib/daytona-auth.ts; persists rotated refresh tokens.
 import { getDaytonaAccessToken } from './lib/daytona-auth.js';
@@ -191,7 +201,7 @@ async function handleUsageScan(ctx: WorkforceCtx): Promise<void> {
   const token = await getDaytonaAccessToken(orgId);
   const auth = { Authorization: `Bearer ${token}`, [ORG_HEADER]: orgId, Accept: 'application/json' };
 
-  const usage = await getJson<UsageResponse>(`${DAYTONA_API}/organizations/${orgId}/usage`, auth);
+  const usage = await readUsage(ctx, orgId, auth);
   const sandboxes = await getAllSandboxes(auth);
 
   const last = await loadSnapshot(ctx);
@@ -310,6 +320,38 @@ async function getAllSandboxes(headers: Record<string, string>): Promise<Sandbox
     cursor = body.nextCursor;
   }
   return out;
+}
+
+/**
+ * Org usage/quota. Prefer the @relayfile/adapter-daytona VFS mount
+ * (/daytona/usage/<orgId>.json, polled hourly by the adapter — no token, no
+ * direct REST call), and fall back to the Daytona REST API while the adapter's
+ * usage sync is still rolling out (relayfile-adapters#155). `evaluateSignals`
+ * sees the same `UsageResponse` shape either way.
+ */
+async function readUsage(
+  ctx: WorkforceCtx,
+  orgId: string,
+  auth: Record<string, string>
+): Promise<UsageResponse> {
+  try {
+    return await readJsonFile<UsageResponse>(vfsClient(), 'daytona', 'getUsage', daytonaUsagePath(orgId));
+  } catch (err) {
+    // No mounted usage record yet (adapter sync not live, or empty tree) — use
+    // the authoritative REST endpoint so quota signals still fire. Log the cause
+    // so a real fault (perms, malformed JSON, path drift) is distinguishable
+    // from the expected pre-rollout miss during triage.
+    ctx.log?.('info', 'daytona usage VFS read failed; falling back to REST /usage', {
+      orgId,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return getJson<UsageResponse>(`${DAYTONA_API}/organizations/${orgId}/usage`, auth);
+  }
+}
+
+/** Anchor relayfile reads to the mount root (never the runner CWD). */
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
 }
 
 // ── tiny helpers ─────────────────────────────────────────────────────────────

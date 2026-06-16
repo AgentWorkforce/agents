@@ -17,11 +17,15 @@ export default definePersona({
   cloud: true,
 
   integrations: {
-    // Real-time sandbox-lifecycle webhooks. The `daytona` triggers in agent.ts
-    // wake the agent on sandbox.created / sandbox.state.updated; this connection
-    // + scope mounts the read mirror at /daytona/sandboxes/** that backs the
-    // webhook payload and any sandbox refetch.
-    daytona: { scope: { sandboxes: '/daytona/sandboxes/**' } },
+    // Two daytona subtrees:
+    //   • usage     — org quota/usage the adapter polls hourly into
+    //                 /daytona/usage/<orgId>.json; the agent reads it from the
+    //                 mount (no token), falling back to the REST API while the
+    //                 adapter's usage sync is still rolling out.
+    //   • sandboxes — read mirror at /daytona/sandboxes/** backing the
+    //                 sandbox-lifecycle webhooks (sandbox.created /
+    //                 sandbox.state.updated) the triggers in agent.ts wake on.
+    daytona: { scope: { usage: '/daytona/usage/**', sandboxes: '/daytona/sandboxes/**' } },
     // No slack trigger here, so `scope` is the only thing that mounts /slack —
     // without it every post is a silent no-op.
     slack: { scope: { paths: '/slack/channels/**' } }

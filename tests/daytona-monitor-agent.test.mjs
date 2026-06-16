@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
+import { parseIntegrations } from '@agentworkforce/persona-kit';
 
 import agent, { evaluateSignals } from '../.test-build/daytona-monitor/agent.js';
+import persona from '../.test-build/daytona-monitor/persona.js';
 
 const ORG_ID = 'd9efb08e-7f53-4fe0-b37e-d1a281622bc0';
 const FIXED_NOW = Date.parse('2026-06-12T12:00:00.000Z');
@@ -262,6 +264,71 @@ test('dry-run computes Daytona signals and writes one sensible Slack alert paylo
       scope: 'workspace',
     });
     assert.equal(JSON.parse(memorySaves[0].content).running, 6);
+  } finally {
+    if (oldConfigDir === undefined) delete process.env.DAYTONA_CONFIG_DIR;
+    else process.env.DAYTONA_CONFIG_DIR = oldConfigDir;
+    if (oldMountPath === undefined) delete process.env.RELAYFILE_MOUNT_PATH;
+    else process.env.RELAYFILE_MOUNT_PATH = oldMountPath;
+    if (oldMountRoot === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+    else process.env.RELAYFILE_MOUNT_ROOT = oldMountRoot;
+    if (oldSlackChannel === undefined) delete process.env.SLACK_CHANNEL;
+    else process.env.SLACK_CHANNEL = oldSlackChannel;
+    if (oldWorkspaceRoot === undefined) delete process.env.WORKSPACE_ROOT;
+    else process.env.WORKSPACE_ROOT = oldWorkspaceRoot;
+  }
+});
+
+test('usage comes from the adapter VFS mount when present — no REST /usage call', async (t) => {
+  const oldConfigDir = process.env.DAYTONA_CONFIG_DIR;
+  const oldMountPath = process.env.RELAYFILE_MOUNT_PATH;
+  const oldMountRoot = process.env.RELAYFILE_MOUNT_ROOT;
+  const oldSlackChannel = process.env.SLACK_CHANNEL;
+  const oldWorkspaceRoot = process.env.WORKSPACE_ROOT;
+  const configDir = await writeDaytonaConfig();
+  const mountRoot = await mkdtemp(path.join(os.tmpdir(), 'daytona-monitor-vfs-usage-'));
+  const memorySaves = [];
+
+  try {
+    process.env.DAYTONA_CONFIG_DIR = configDir;
+    process.env.RELAYFILE_MOUNT_PATH = mountRoot;
+    process.env.RELAYFILE_MOUNT_ROOT = mountRoot;
+    process.env.SLACK_CHANNEL = 'C-daytona-alerts';
+    delete process.env.WORKSPACE_ROOT;
+    t.mock.method(Date, 'now', () => FIXED_NOW);
+
+    // Adapter-polled usage record sitting on the mount: the agent must read this
+    // and skip the REST /usage call entirely.
+    await mkdir(path.join(mountRoot, 'daytona/usage'), { recursive: true });
+    await writeFile(
+      path.join(mountRoot, 'daytona/usage', `${ORG_ID}.json`),
+      JSON.stringify({
+        organizationId: ORG_ID,
+        regionUsage: [{ regionId: 'eu', totalDiskQuota: 1000, currentDiskUsage: 910 }],
+      }),
+      'utf8',
+    );
+
+    // Fetch answers ONLY the sandbox list — a /usage call would assert-fail.
+    const calls = [];
+    t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+      const href = String(url);
+      calls.push(href);
+      assert.equal(init.headers.Authorization, 'Bearer cached-daytona-access');
+      assert.equal(init.headers['X-Daytona-Organization-ID'], ORG_ID);
+      if (href === 'https://app.daytona.io/api/sandbox') {
+        return Response.json({ items: [{ id: 'ok-1', name: 'ok-1', state: 'stopped' }] });
+      }
+      assert.fail(`unexpected fetch: ${href}`);
+    });
+
+    const slackPayloadPromise = answerSlackWriteback(mountRoot);
+    await agent.handler(ctx(memorySaves), cronEvent());
+    const slackPayload = await slackPayloadPromise;
+
+    // No REST /usage — only the sandbox list was fetched.
+    assert.deepEqual(calls, ['https://app.daytona.io/api/sandbox']);
+    // The disk-quota signal came from the mounted record (91% >= 80%).
+    assert.match(slackPayload.text, /disk quota.*eu.*91%.*910\/1000/);
   } finally {
     if (oldConfigDir === undefined) delete process.env.DAYTONA_CONFIG_DIR;
     else process.env.DAYTONA_CONFIG_DIR = oldConfigDir;
@@ -539,4 +606,18 @@ test('a healthy sandbox.state.updated webhook stays silent (no Slack post)', asy
       'expected a logged skip for the healthy event',
     );
   });
+});
+
+// Config-invariant pin (creating-cloud-persona §1/§6): readUsage reads the
+// adapter usage record from /daytona/usage/**, so that subtree MUST be mounted.
+// Cloud derives mounts only from triggers + each integration's scope; a missing
+// `usage` key (the pre-PR shape) leaves the read tree empty and the agent
+// silently stuck on the REST fallback forever. Parse through persona-kit so we
+// assert the scope as it survives client-side compilation, not the raw literal.
+test('daytona integration scope mounts the usage subtree readUsage depends on', () => {
+  const parsed = parseIntegrations(persona.default?.integrations ?? persona.integrations ?? {}, 'daytona-monitor.integrations') ?? {};
+  const scope = parsed.daytona?.scope ?? {};
+  assert.equal(scope.usage, '/daytona/usage/**', 'usage subtree must be scoped so the VFS read is mounted');
+  // Don't regress the existing sandbox-lifecycle mirror while adding usage.
+  assert.equal(scope.sandboxes, '/daytona/sandboxes/**', 'sandboxes mirror must remain mounted');
 });

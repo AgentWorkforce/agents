@@ -632,7 +632,7 @@ export function evaluateMergeOnGreenState(state: PullRequestReadyState): MergeOn
 
   if (reasons.length === 0) return { outcome: 'ready', reasons: [] };
   const blocked = reasons.some((reason) =>
-    /failed|error|changes requested|requested changes|conflict|closed|merged|draft/i.test(reason)
+    /fail|error|not passing|changes requested|requested changes|conflict|closed|merged|draft/i.test(reason)
   );
   return { outcome: blocked ? 'blocked' : 'pending', reasons };
 }
@@ -880,23 +880,31 @@ export async function handleSlackMergeRequest(
     return;
   }
 
-  const decision = await decide(ctx, request.pr);
-  if (decision.outcome === 'ready' && decision.pr) {
-    await merge(ctx, decision.pr);
+  try {
+    const decision = await decide(ctx, request.pr);
+    if (decision.outcome === 'ready' && decision.pr) {
+      await merge(ctx, decision.pr);
+      await replyToSlackMessage(
+        client,
+        msg,
+        `Merged ${decision.pr.owner}/${decision.pr.repo}#${decision.pr.number} because checks are green and bot reviews are satisfied.`
+      );
+      return;
+    }
+
+    const reasons = decision.reasons.length > 0 ? decision.reasons : ['merge-on-green gates are not satisfied yet'];
     await replyToSlackMessage(
       client,
       msg,
-      `Merged ${decision.pr.owner}/${decision.pr.repo}#${decision.pr.number} because checks are green and bot reviews are satisfied.`
+      `I cannot merge ${request.pr.owner}/${request.pr.repo}#${request.pr.number} yet: ${reasons.join('; ')}.`
     );
-    return;
+  } catch (error) {
+    await replyToSlackMessage(
+      client,
+      msg,
+      `An error occurred while processing the merge request for ${request.pr.owner}/${request.pr.repo}#${request.pr.number}: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
-
-  const reasons = decision.reasons.length > 0 ? decision.reasons : ['merge-on-green gates are not satisfied yet'];
-  await replyToSlackMessage(
-    client,
-    msg,
-    `I cannot merge ${request.pr.owner}/${request.pr.repo}#${request.pr.number} yet: ${reasons.join('; ')}.`
-  );
 }
 
 function readSlackMessage(payload: unknown): SlackMessage | undefined {

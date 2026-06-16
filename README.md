@@ -14,6 +14,9 @@ it does). The persona compiles to `persona.json`; deploy with
 | Agent | Fires on | What it does |
 | --- | --- | --- |
 | [**cloud-team-implementer**](cloud-team-implementer/) | launched by a teamSolve lead roster | Implements the assigned issue in its own sandbox and opens one focused pull request. |
+| [**transcript-to-linear-github**](https://github.com/AgentWorkforce/relayscribe/tree/main/agents/transcript-to-linear-github/) | Relayscribe recording → `/recall/recordings/**` | Extracts action items from a meeting transcript, files Linear issues, and autonomously opens a GitHub PR per coding task. |
+| [**transcript-slack-digest**](https://github.com/AgentWorkforce/relayscribe/tree/main/agents/transcript-slack-digest/) | Relayscribe recording → `/recall/recordings/**` | Extracts action items, decisions, and open questions from a transcript and posts a structured Slack digest. |
+| [**transcript-to-notion-slack**](https://github.com/AgentWorkforce/relayscribe/tree/main/agents/transcript-to-notion-slack/) | Relayscribe recording → `/recall/recordings/**` | Writes structured meeting notes and action items to a Notion database, then posts the page link to Slack. |
 | [**cloud-team-reviewer**](cloud-team-reviewer/) | launched by a teamSolve lead roster | Reviews a teammate's branch against the issue spec and returns verifiable, actionable findings. |
 | [**granola**](granola/) | a new Granola note (Nango sync → `file.created`) | Detects prospect calls, files a Linear issue with the ask, and opens a GitHub PR implementing it. |
 | [**hn-monitor**](hn-monitor/) | schedule (2×/day) | Scans Hacker News for your topics and posts a digest to Slack. |

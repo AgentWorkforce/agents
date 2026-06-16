@@ -103,7 +103,9 @@ async function handleInboxMessage(ctx: WorkforceCtx, event: AgentEvent): Promise
 
   const payload = await event.expand('full').catch(() => undefined);
   const data = (payload as { data?: Record<string, unknown> } | undefined)?.data;
-  const question = typeof data?.text === 'string' ? data.text : '';
+  const nested = (data?.message && typeof data.message === 'object' ? data.message : {}) as Record<string, unknown>;
+  const question = typeof data?.text === 'string' ? data.text
+    : typeof nested.text === 'string' ? nested.text : '';
   if (!question.trim()) {
     ctx.log?.('info', 'relaycast message with no text; skipping');
     return;

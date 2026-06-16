@@ -1,15 +1,15 @@
 import { definePersona } from '@agentworkforce/persona-kit';
 
 /**
- * Review Agent — reviews every new PR, fixes the issues it (and other bots)
- * find, resolves failing CI and merge conflicts, pings you on Slack when the PR
- * is ready, and merges it once you approve.
+ * Review Agent — reviews every new PR, applies only mechanical safe fixes,
+ * comments on logic/safety findings, pings you on Slack when the PR is ready,
+ * and merges it once you approve.
  */
 export default definePersona({
   id: 'pr-reviewer',
   intent: 'review',
   tags: ['review'],
-  description: 'Reviews new PRs, fixes the issues found (its own + other bots\'), resolves failing CI and merge conflicts, pings you on Slack when ready, and merges once you approve.',
+  description: 'Reviews new PRs, applies only lint/format/typo fixes, comments on logic or safety findings, pings you on Slack when ready, and merges once you approve.',
   cloud: true,
 
   integrations: {
@@ -36,7 +36,7 @@ export default definePersona({
       picker: { provider: 'github', resource: 'users' }
     },
     REVIEW_AUTHORS: {
-      description: 'Only review and auto-fix PRs opened by these GitHub logins (comma-separated). If unset, every author is reviewed.',
+      description: 'Only review and mechanically auto-fix PRs opened by these GitHub logins (comma-separated). If unset, every author is reviewed.',
       env: 'REVIEW_AUTHORS',
       optional: true,
       picker: { provider: 'github', resource: 'users' }
@@ -50,7 +50,7 @@ export default definePersona({
 
   harness: 'codex',
   model: 'gpt-5.5',
-  systemPrompt: 'You are a rigorous senior reviewer. Review PRs, fix what you find, keep CI green, and only hand back when the PR is genuinely ready.',
+  systemPrompt: 'You are a rigorous senior reviewer. Review PRs, auto-apply only lint/format/typo fixes, leave logic and safety changes as comments, keep CI honest, and only hand back when the PR is genuinely ready.',
   harnessSettings: {
     reasoning: 'high',
     timeoutSeconds: 2400,

@@ -1,0 +1,2 @@
+[ { "id": "ws-done", "name": "Done", "type": "completed", "teamId": "team-eng" },
+  { "id": "ws-prog", "name": "In Progress", "type": "started", "teamId": "team-eng" } ]

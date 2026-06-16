@@ -1,5 +1,6 @@
 /**
- * pr-reviewer handler — review, auto-fix, and shepherd a PR to the finish line.
+ * pr-reviewer handler — review, apply mechanical safe fixes, and shepherd a PR
+ * to the finish line.
  *
  *   an authorized approval (pull_request_review.submitted) → merge the PR.
  *   merge-on-green label + green checks + bot approvals     → merge the PR.
@@ -8,8 +9,8 @@
  *   review comment, failed CI, changes requested            → (re)review and fix.
  *
  * The PR's repo is materialized into ctx.sandbox.cwd by cloud before the
- * harness runs. The agent fixes by editing files there; cloud commits and
- * pushes those edits after the harness exits — no git/gh in the harness.
+ * harness runs. The agent may leave only mechanical fixes there; cloud commits
+ * and pushes those edits after the harness exits — no git/gh in the harness.
  *
  * Slack policy: the channel only hears about a PR when it's a human's turn —
  * checks green, every bot/reviewer comment resolved, nothing left for the agent
@@ -123,7 +124,8 @@ export default defineAgent({
   // A check run that finished without failing needs no action.
   if (event.type === 'github.check_run.completed' && !ciFailed(data)) return;
 
-  // Everything else is a reason to (re)review and push fixes.
+  // Everything else is a reason to (re)review and apply safe mechanical fixes.
+  // `pr` was read above for the merge-on-green path and is reused here.
   if (pr) {
     const skip = await shouldSkipReview(ctx, pr);
     if (skip) {
@@ -460,14 +462,24 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `Focus on the actual PR changes: read .workforce/pr.diff first, then .workforce/changed-files.txt and .workforce/context.json.`,
     `Use the checked-out repo to trace the impact of this diff across callers, types, tests, config, and related files.`,
     `Flag and fix breakage even when the affected file is outside the changed-file set, but do not do an unrelated full-repo audit.`,
-    `Then proactively FIX everything that needs changing — your own findings and any other bot reviews on the PR —`,
-    `and resolve failing CI checks and merge conflicts by editing the code. Don't use git or the gh CLI; cloud commits`,
+    `Auto-edit only lint, formatting, spelling, typo, import-order, or other mechanical non-semantic changes.`,
+    `Do not auto-edit semantic or safety-critical logic. For behavior changes, architecture changes, and any reviewer`,
+    `request that needs human judgment, leave a clear suggestion or review comment instead of changing files.`,
+    `If the PR already has a human review or approval, switch to suggestion/comment-only for everything except`,
+    `obvious mechanical cleanup that cannot change runtime behavior.`,
+    `Resolve failing CI checks by editing the code only when the fix is mechanical and non-semantic. Don't use git or the gh CLI; cloud commits`,
     `and pushes your file edits to the PR after this run. In your output, do not claim that fixes were pushed,`,
     `a GitHub review was submitted, or CI was verified; those are post-harness actions that cloud reports separately.`,
     `Validate every finding — yours or another bot's — against the CURRENT checkout before editing: review comments`,
     `are often stale (already fixed by a later push). Reproduce the problem in the code as it is now, or skip it.`,
     `Make the smallest fix that addresses a demonstrated problem. Do not rewrite, restructure, or "harden" working`,
     `code beyond what the finding requires.`,
+    `Never change semantic or safety defaults: do not turn fail-closed states into fail-open states such as`,
+    `"timeout", "pending", throw, or undefined becoming "acked", true, {}, or another success/default path; do not`,
+    `swap truthiness checks for presence checks; do not edit guard default values. If a reviewer asks for one of`,
+    `these changes, explain the risk in your review and leave the code unchanged.`,
+    `Never touch lifecycle, termination, reaper, in-flight, dispatch, broker ownership, or process-cleanup code. Those`,
+    `areas are safety-critical; raise findings as comments for a human-authored patch instead.`,
     `Stay within this PR's purpose (.workforce/pr.diff is the change; use .workforce/context.json for available PR`,
     `metadata). A reviewer suggestion that changes files or behavior unrelated to`,
     `that purpose — refactoring a module`,
@@ -490,6 +502,8 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `ships — the working tree must pass the full command with your edits in place. When you change code that`,
     `GENERATES commands, scripts, or queries, also execute a sample of the generated output against a throwaway`,
     `fixture — tests that only assert on the generated string prove nothing about its behavior.`,
+    `Never add or modify tests to make your own change pass. If a change needs a new or updated test, that is a`,
+    `human decision; describe the needed test in your review and leave the working tree unchanged.`,
     `Never make a check pass by weakening the test: do not delete it, skip it, loosen an assertion, narrow its`,
     `inputs, or replace a real assertion with a trivially-true one. A test that no longer fails when the behavior it`,
     `guards regresses is worse than no test, and it passes CI while hiding the bug. When an edit makes a test fail,`,

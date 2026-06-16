@@ -1,0 +1,5 @@
+[
+  { "id": "AR-1", "identifier": "AR-1", "title": "Export job times out on large accounts", "projectId": "acme", "state": "In Progress", "dueDate": "2026-05-01", "updatedAt": "2026-05-20T00:00:00Z", "objectId": "AR-1" },
+  { "id": "AR-2", "identifier": "AR-2", "title": "Add SSO for Acme", "projectId": "acme", "state": "Backlog", "dueDate": "2026-07-01", "updatedAt": "2026-06-05T00:00:00Z", "objectId": "AR-2" },
+  { "id": "AR-9", "identifier": "AR-9", "title": "Globex onboarding checklist", "projectId": "globex", "state": "In Progress", "dueDate": "2026-06-15", "updatedAt": "2026-06-09T00:00:00Z", "objectId": "AR-9" }
+]

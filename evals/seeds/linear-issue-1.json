@@ -1,0 +1,11 @@
+{
+  "id": "issue-1",
+  "identifier": "AR-1",
+  "title": "CSV export still failing for Acme",
+  "description": "Acme reports the account-activity CSV export times out on large accounts. Needs pagination.",
+  "url": "https://linear.app/agentrelay/issue/AR-1",
+  "state": { "name": "In Progress", "type": "started" },
+  "priority": 2,
+  "assignee": { "name": "Benjamin" },
+  "team": { "id": "team-1", "key": "AR" }
+}

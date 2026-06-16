@@ -1,0 +1,5 @@
+{
+  "title": "Intro call — Acme Corp",
+  "transcript": "Sarah (Acme, VP Eng): we're a 200-person fintech, evaluating workflow automation. We looked at Zapier and n8n but need something that can run agents against our Linear and GitHub. Budget is approved for this quarter. Can you send pricing and SSO details? We'd want to start a pilot in two weeks.",
+  "summary": "Acme Corp evaluating us vs Zapier/n8n; approved budget; asked for pricing + SSO; wants a 2-week pilot."
+}

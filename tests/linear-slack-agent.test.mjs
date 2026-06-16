@@ -10,7 +10,7 @@ function ctx(overrides = {}) {
   return {
     logs,
     memorySaves,
-    persona: { id: 'linear-slack', inputs: {}, inputSpecs: {} },
+    persona: { id: 'linear-slack', inputs: {}, inputSpecs: { SLACK_CHANNEL: { env: 'TEST_SLACK_CHANNEL' } } },
     sandbox: { cwd: '/home/daytona/workspace' },
     memory: {
       recall: async () => [],

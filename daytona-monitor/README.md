@@ -1,3 +1,5 @@
+<img src="./banner.png" alt="Daytona Monitor">
+
 Daytona Monitor
 ==================
 

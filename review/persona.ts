@@ -48,15 +48,12 @@ export default definePersona({
     }
   },
 
-  harness: 'codex',
-  model: 'gpt-5.5',
+  harness: 'claude',
+  model: 'claude-opus-4-8',
   systemPrompt: 'You are a rigorous senior reviewer. Review PRs, auto-apply only lint/format/typo fixes, leave logic and safety changes as comments, keep CI honest, and only hand back when the PR is genuinely ready.',
   harnessSettings: {
     reasoning: 'high',
     timeoutSeconds: 2400,
-    // Daytona is the trust boundary for cloud fires. Codex's nested
-    // bubblewrap sandbox requires user namespaces that Daytona does not allow.
-    dangerouslyBypassApprovalsAndSandbox: true
   },
 
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 180 },

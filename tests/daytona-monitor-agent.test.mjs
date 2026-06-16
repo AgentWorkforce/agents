@@ -5,8 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
+import { parseIntegrations } from '@agentworkforce/persona-kit';
 
 import agent, { evaluateSignals } from '../.test-build/daytona-monitor/agent.js';
+import persona from '../.test-build/daytona-monitor/persona.js';
 
 const ORG_ID = 'd9efb08e-7f53-4fe0-b37e-d1a281622bc0';
 const FIXED_NOW = Date.parse('2026-06-12T12:00:00.000Z');
@@ -604,4 +606,18 @@ test('a healthy sandbox.state.updated webhook stays silent (no Slack post)', asy
       'expected a logged skip for the healthy event',
     );
   });
+});
+
+// Config-invariant pin (creating-cloud-persona §1/§6): readUsage reads the
+// adapter usage record from /daytona/usage/**, so that subtree MUST be mounted.
+// Cloud derives mounts only from triggers + each integration's scope; a missing
+// `usage` key (the pre-PR shape) leaves the read tree empty and the agent
+// silently stuck on the REST fallback forever. Parse through persona-kit so we
+// assert the scope as it survives client-side compilation, not the raw literal.
+test('daytona integration scope mounts the usage subtree readUsage depends on', () => {
+  const parsed = parseIntegrations(persona.default?.integrations ?? persona.integrations ?? {}, 'daytona-monitor.integrations') ?? {};
+  const scope = parsed.daytona?.scope ?? {};
+  assert.equal(scope.usage, '/daytona/usage/**', 'usage subtree must be scoped so the VFS read is mounted');
+  // Don't regress the existing sandbox-lifecycle mirror while adding usage.
+  assert.equal(scope.sandboxes, '/daytona/sandboxes/**', 'sandboxes mirror must remain mounted');
 });

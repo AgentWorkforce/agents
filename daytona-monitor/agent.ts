@@ -13,6 +13,7 @@
 import {
   defineAgent,
   isCronTickEvent,
+  isRelaycastMessageEvent,
   readJsonFile,
   resolveMountRoot,
   type AgentEvent,
@@ -72,6 +73,11 @@ export default defineAgent({
     daytona: [{ on: 'sandbox.created' }, { on: 'sandbox.state.updated' }]
   },
   handler: async (ctx, event) => {
+    // Chat path: a relay message arrived — answer questions about Daytona data.
+    if (isRelaycastMessageEvent(event)) {
+      await handleInboxMessage(ctx, event);
+      return;
+    }
     // Real-time path: a Daytona webhook arrived — alert the MOMENT a sandbox
     // turns ERROR/BUILD_FAILED, instead of waiting for the next hourly tick.
     if (isDaytonaSandboxEvent(event)) {
@@ -85,6 +91,68 @@ export default defineAgent({
     }
   }
 });
+
+/**
+ * Chat handler: when someone messages the agent via relay inbox, fetch current
+ * Daytona data and use the LLM to answer their question conversationally.
+ */
+async function handleInboxMessage(ctx: WorkforceCtx, event: AgentEvent): Promise<void> {
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (!channel) throw new Error('SLACK_CHANNEL is required');
+  const orgId = input(ctx, 'DAYTONA_ORG_ID') ?? DEFAULT_ORG_ID;
+
+  const payload = await event.expand('full').catch(() => undefined);
+  const data = (payload as { data?: Record<string, unknown> } | undefined)?.data;
+  const nested = (data?.message && typeof data.message === 'object' ? data.message : {}) as Record<string, unknown>;
+  const question = typeof data?.text === 'string' ? data.text
+    : typeof nested.text === 'string' ? nested.text : '';
+  if (!question.trim()) {
+    ctx.log?.('info', 'relaycast message with no text; skipping');
+    return;
+  }
+
+  let usageText = 'Usage data unavailable.';
+  let sandboxText = 'Sandbox data unavailable.';
+  try {
+    const token = await getDaytonaAccessToken(orgId);
+    const auth = { Authorization: `Bearer ${token}`, [ORG_HEADER]: orgId, Accept: 'application/json' };
+
+    const usage = await readUsage(ctx, orgId, auth);
+    usageText = JSON.stringify(usage, null, 2);
+
+    const sandboxes = await getAllSandboxes(auth);
+    sandboxText = JSON.stringify(
+      sandboxes.map(s => ({
+        id: s.id, name: s.name, state: s.state,
+        errorReason: s.errorReason, createdAt: s.createdAt, updatedAt: s.updatedAt
+      })),
+      null, 2
+    );
+  } catch (err) {
+    ctx.log?.('warn', 'failed to fetch Daytona data for chat response', {
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
+
+  const prompt = [
+    'You are a Daytona infrastructure monitor. Answer the user\'s question about the current Daytona organization state using the data below.',
+    'Be concise and specific. Use Slack markdown formatting.',
+    '',
+    `## Current Usage/Quota Data (org ${orgId})`,
+    usageText,
+    '',
+    '## Current Sandboxes',
+    sandboxText,
+    '',
+    `## User Question`,
+    question
+  ].join('\n');
+
+  const answer = await ctx.llm.complete(prompt, { maxTokens: 1024 });
+
+  const res = await slackClient().post(channel, answer);
+  if (!res.ts) throw new Error(`Slack post to ${channel} got no writeback receipt (silent drop)`);
+}
 
 /** True for a Daytona sandbox-lifecycle webhook event (`daytona.sandbox.*`). */
 function isDaytonaSandboxEvent(event: AgentEvent): boolean {

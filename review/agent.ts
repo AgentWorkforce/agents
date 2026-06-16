@@ -81,7 +81,6 @@ export default defineAgent({
       { on: 'check_run.completed' },
       { on: 'pull_request.synchronize' },
       { on: 'issues.labeled' },
-      { on: 'status' }
     ],
     slack: [
       {
@@ -105,14 +104,7 @@ export default defineAgent({
   if (pr && mergeOnGreenEventType(event.type)) {
     const outcome = await maybeMergeOnGreen(ctx, pr);
     if (outcome === 'merged') return;
-    if (event.type === 'github.issues.labeled' || event.type === 'github.status') return;
-  } else if (event.type === 'github.status') {
-    const statusPrs = await readPrsForCommitStatus(ctx, data);
-    for (const statusPr of statusPrs) {
-      const outcome = await maybeMergeOnGreen(ctx, statusPr);
-      if (outcome === 'merged') return;
-    }
-    return;
+    if (event.type === 'github.issues.labeled') return;
   }
 
   // An approval from an authorized reviewer ends the loop: merge and stop.
@@ -144,7 +136,6 @@ export default defineAgent({
 
 function mergeOnGreenEventType(eventType: string): boolean {
   return eventType === 'github.issues.labeled' ||
-    eventType === 'github.status' ||
     eventType === 'github.check_run.completed' ||
     eventType === 'github.pull_request_review.submitted' ||
     eventType === 'github.pull_request.synchronize' ||
@@ -592,34 +583,6 @@ async function readMergeOnGreenState(ctx: WorkforceCtx, pr: Pr): Promise<PullReq
     'state,isDraft,labels,mergeable,mergeStateStatus,reviewRequests,latestReviews,statusCheckRollup,headRefOid,url',
   ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
   return parsePrReadyState(stdout);
-}
-
-async function readPrsForCommitStatus(ctx: WorkforceCtx, payload: unknown): Promise<Pr[]> {
-  const p = payload as {
-    sha?: string;
-    repository?: { name?: string; owner?: { login?: string } };
-  } | null;
-  const owner = p?.repository?.owner?.login;
-  const repo = p?.repository?.name;
-  const sha = p?.sha;
-  if (!owner || !repo || !sha) return [];
-  const { stdout } = await execFileAsync('gh', [
-    'api',
-    `/repos/${owner}/${repo}/commits/${sha}/pulls`,
-    '--jq',
-    '.[] | {number,html_url,head:{sha:.head.sha},user:{login:.user.login},state,merged,draft}',
-  ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
-  return stdout
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .flatMap((line) => {
-      try {
-        return readPr({ repository: { name: repo, owner: { login: owner } }, pull_request: JSON.parse(line) }) ?? [];
-      } catch {
-        return [];
-      }
-    });
 }
 
 /** Whether the PR is still open. A missing `state` is treated as open so the

@@ -582,9 +582,16 @@ async function readPrReviewState(pr: Pr): Promise<PullRequestReadyState> {
   return {
     state: typeof meta?.state === 'string' ? meta.state : undefined,
     isDraft: meta?.draft === true,
-    // The VFS carries no mergeability field, so default to MERGEABLE rather than
-    // gate on a value we can't read. A real conflict never auto-merges: the
-    // merge API rejects it and mergePr throws.
+    // The VFS carries no mergeability field (the adapter doesn't project it), so
+    // default to MERGEABLE rather than gate on a value we can't read — otherwise
+    // the ready/merge gates could never pass at all. Safety rests on the merge
+    // API, not this field: a conflicted PR can NEVER be auto-merged, because
+    // mergePr throws when GitHub rejects the merge (merged:false). The residual
+    // is cosmetic — a conflicted PR may still be pinged as "ready for human
+    // review" (the ready path doesn't hit the merge API); a human resolving the
+    // conflict at review time absorbs that. True conflict-awareness needs the
+    // github adapter to project mergeable/mergeStateStatus (tracked alongside the
+    // cloud credential/projection work).
     mergeable: 'MERGEABLE',
     // Drafts surface via isDraft; mirror onto mergeStateStatus too so the ready
     // gate (which keys on DRAFT) still holds a draft back.
@@ -627,7 +634,14 @@ async function loadReviews(pr: Pr): Promise<Array<Record<string, unknown>>> {
       'listReviews',
       `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/pulls/${pr.number}/reviews`
     );
-    return files.map((file) => file.value);
+    // Guard each entry: a malformed file must not throw out of the map and blank
+    // the whole review set (the catch below would return []), which would drop an
+    // active CHANGES_REQUESTED review and could let a blocked PR merge.
+    return Array.isArray(files)
+      ? files
+          .map((file) => file?.value)
+          .filter((v): v is Record<string, unknown> => v !== null && typeof v === 'object')
+      : [];
   } catch {
     return [];
   }
@@ -654,11 +668,14 @@ function readMetaHeadSha(meta: PrMeta | undefined): string | undefined {
  *   • all complete+passing → a single SUCCESS entry → green.
  */
 export function rollupFromCheckSummary(summary: CheckSummary | undefined): Array<Record<string, unknown>> {
-  const total = typeof summary?.total === 'number' ? summary.total : 0;
+  const failed = typeof summary?.failed === 'number' ? summary.failed : 0;
+  const pending = typeof summary?.pending === 'number' ? summary.pending : 0;
+  const passed = typeof summary?.passed === 'number' ? summary.passed : 0;
+  // Fall back to the component counts when `total` is missing/malformed, so a
+  // summary that carries failed/pending/passed but no `total` still reports the
+  // real check states instead of being treated as "no checks" and held generically.
+  const total = typeof summary?.total === 'number' ? summary.total : failed + pending + passed;
   if (!summary || total === 0) return [];
-  const failed = typeof summary.failed === 'number' ? summary.failed : 0;
-  const pending = typeof summary.pending === 'number' ? summary.pending : 0;
-  const passed = typeof summary.passed === 'number' ? summary.passed : 0;
   const rollup: Array<Record<string, unknown>> = [];
   if (failed > 0) {
     rollup.push({ name: `${failed} failing check${failed === 1 ? '' : 's'}`, status: 'COMPLETED', conclusion: 'FAILURE' });

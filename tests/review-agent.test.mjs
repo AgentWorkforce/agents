@@ -233,6 +233,13 @@ test('rollupFromCheckSummary maps the adapter check summary to gate-ready rollup
   assert.equal(prReadyStateAllowsHumanReview({
     state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: green,
   }), true);
+
+  // `total` missing but component counts present → derive total from the counts
+  // so a failing check still blocks (not treated as "no checks reported").
+  assert.equal(evaluateMergeOnGreenState({
+    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', labels: [{ name: 'merge-on-green' }],
+    statusCheckRollup: rollupFromCheckSummary({ failed: 1, pending: 0, passed: 2 }),
+  }).outcome, 'blocked');
 });
 
 test('deriveReviewDecision flags CHANGES_REQUESTED from the latest review per author', () => {

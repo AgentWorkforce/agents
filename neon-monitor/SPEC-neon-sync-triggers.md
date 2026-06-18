@@ -489,3 +489,114 @@ The free-tier neon-monitor subscribes to a subset: `operation.failed`,
 - `packages/daytona/src/webhook-normalizer.ts` in relayfile-adapters — the canonical normalizer shape to follow
 - `agents/daytona-monitor/agent.ts` — the trigger handler pattern in the monitor this one mirrors
 - `nango-integrations/neon-relay/syncs/fetch-operations.ts` — confirms `NeonOperation` is the model name; `status` and `action` are the fields to filter on
+
+---
+
+## Implementation addendum (team validation, 2026-06-18)
+
+The body above is the original design. The points below were validated against the
+**actual** `relayfile-adapters` and `cloud` checkouts by the per-repo agents and
+**supersede the body where they conflict.** Read this section before implementing.
+
+### Frozen event contract — 5 delta events
+
+The normalizer is the single source of truth. Legal subscription set (a persona may
+subscribe to a subset; nothing outside it):
+
+| eventType | model | condition |
+|---|---|---|
+| `operation.failed` | `NeonOperation` | `action === 'ADDED'` + `status === 'failed'` |
+| `operation.cancelled` | `NeonOperation` | `action === 'ADDED'` + `status === 'cancelled'` |
+| `operation.succeeded` | `NeonOperation` | `action === 'UPDATED'` + transition evidence `status → 'finished'` |
+| `endpoint.state_changed` | `NeonEndpoint` | `action === 'UPDATED'` + `current_state` changed |
+| `advisor.issue_raised` | `NeonAdvisorIssue` | `action === 'ADDED'` |
+
+`spending-limit.missing` and `consumption.threshold` are **full-state signals**, NOT
+delta events — they have no per-record ADDED/UPDATED. They stay `fromNeonRecord`
+outputs on the **cron sweep only** and must **not** be declared as `triggers.neon`
+(see strict preflight below). Subscriptions: free-tier `neon-monitor` takes
+failed/cancelled? (its choice) — the spec's §4 lists failed/endpoint/advisor; paid-tier
+`nightcto/watch` takes failed/cancelled/endpoint/advisor (not succeeded).
+
+### Normalizer event shape + downstream dedup
+
+`normalizeNeonSyncDelta(modelName, records)` returns, per emitted event:
+
+```ts
+{ provider: 'neon', eventType, objectType: 'operation' | 'endpoint' | 'advisor-issue',
+  objectId, path, occurredAt, payload,
+  metadata: { action, firstSeenAt, lastModifiedAt, cursor? } }
+```
+
+- `objectId`: `operation.id` / `endpoint.id` / advisor `cache_key` (raw record id kept in `payload.id`).
+- `occurredAt`: provider/Nango timestamp — **never** `new Date()`. A Cloud receipt time, if any, is a separate `receivedAt` diagnostic only.
+
+Per-object-type dedup fingerprints (both tiers use these — stable identity, not handler time):
+
+```
+operation.* :  neon:${eventType}:${objectId}
+advisor     :  neon:advisor.issue_raised:${cache_key || objectId}
+endpoint    :  neon:endpoint.state_changed:${objectId}:${current_state}:${occurredAt}
+```
+
+Endpoint includes state+time so legitimate later transitions on the same endpoint
+(`idle→active→idle`) are not suppressed.
+
+### Normalizer hardening (relayfile-adapters tests)
+
+Record returns **no event** when: missing `_nango_metadata.action`; missing stable
+`objectId`; or (for `operation.succeeded`/`endpoint.state_changed`) no previous/current
+or trustworthy `changedFields` evidence. **Negative test required:** plain final
+snapshots (`status:'finished'`, `current_state:'active'`) with no transition metadata
+must produce `[]`. If Nango can't expose previous values but exposes `changedFields:
+['status']`/`['current_state']`, that is sufficient — Cloud adapts at the call boundary.
+
+### Corrections to the body
+
+1. **§1 method:** the catalog generator reads adapter `supportedEvents()` (or
+   `neon.mapping.yaml` `webhooks:` keys), **NOT** `supportedTriggerEvents()`. An extra
+   `supportedTriggerEvents()` export won't update `KNOWN_TRIGGER_CATALOG`.
+2. **§1 regen command:** `npx turbo build` then `npx adapter-core triggers generate`
+   (+ `npx adapter-core triggers check`) — **NOT** `npm run triggers:generate`.
+3. **§1/§2 versioning:** do **NOT** bump package versions in the feature PR; the
+   publish workflow owns bumps (repo AGENTS.md). Open the source/catalog PR first;
+   canary/publish is a separate downstream step.
+4. **§2 architecture (rewritten):** do **NOT** add `agent-gateway/src/neon-sync-delta.ts`
+   nor a `sync.completed` webhook branch nor a new KV/DO cursor. Cloud's inbound webhook
+   is `type:"sync"` → `handleSyncEvent()` → `packages/core/src/sync/nango-sync-workflow.ts`.
+   Add a narrow post-page/post-write hook for watched Neon models in
+   `nango-sync-runtime.ts`/`nango-sync-workflow.ts`, call `normalizeNeonSyncDelta()`, and
+   dispatch to the **existing proactive VFS-watch ingress**. Reuse the workflow's existing
+   `cursor`/`checkpoints`; first-run suppression keys off `syncType === 'INITIAL'` /
+   `checkpoints.from === null` (no separate cursor store).
+5. **§3 routing:** wire the frozen 5 into `packages/core/src/relayfile/provider-contracts.ts`
+   `triggerEvents` (from the adapter-core catalog). `npm run nango-provider-parity:generate`
+   is for sync-model parity, **not** trigger routing — wrong command for this step.
+
+### Strict preflight (important)
+
+Deploy preflight is **strict**: `translatePersonaTriggersToWatchGlobs()` →
+`relayfilePathsForTrigger()` throws `unsupported_trigger` for any provider+event it can't
+map. Cloud's Neon `provider-contracts.ts` currently has resources but no `triggerEvents`,
+so the 5 must be wired in (correction #5) **before** any agents/nightcto `--dry-run` is
+expected to pass. Unknown trigger names are hard failures, not silent no-ops.
+
+### Mandatory spike (gates Step 2)
+
+Before coding Step 2: prove whether the existing Nango `listRecords` path returns
+`_nango_metadata.action` **and** enough prior/changed-field metadata for the two
+transition events. If not, extend the records request / add a delta fetch at the
+workflow boundary — do **not** weaken the 5-event contract or alert off snapshots.
+
+### Blocker #0 — `packages/neon` does not exist
+
+Confirmed from both checkouts: relayfile-adapters has no `packages/neon`, and cloud
+imports `@relayfile/adapter-neon` but it's absent from package-lock/node_modules.
+**Nothing starts until this is resolved** — either an existing Neon adapter branch is
+shared, or `packages/neon` is scaffolded net-new (which changes the ~3-day estimate).
+Owner decision required.
+
+### Revised critical path
+
+`#0 packages/neon decision → delta-metadata spike → Step 1 normalizer+catalog →
+Step 2 cloud sync-hook+provider-contracts → Steps 3a/3b deploy (parallel)`.

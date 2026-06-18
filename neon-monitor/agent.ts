@@ -114,10 +114,26 @@ interface MonitorMemory {
 // ── Exports ──────────────────────────────────────────────────────────────────
 
 export default defineAgent({
-  // Every 15 minutes — frequent enough to surface a connection thrash before
-  // it cascades (operations sync is every 10 minutes; 15 min gives one full
-  // sync window of buffer before the next alert check).
-  schedules: [{ name: 'neon-scan', cron: '*/15 * * * *', tz: 'UTC' }],
+  // Full-state sweep every 2 hours. Triggers (below) now cover the hot path —
+  // failed ops / endpoint transitions / advisor issues fire in real time — so
+  // the cron only needs to catch the FULL-STATE signals that have no per-record
+  // delta event: CU-consumption spikes and absent/exceeded spending limits.
+  schedules: [{ name: 'neon-scan', cron: '0 */2 * * *', tz: 'UTC' }],
+
+  // Real-time: subscribe to the frozen sync-delta events the neon-relay
+  // normalizer emits (relayfile-adapters `normalizeNeonSyncDelta()` →
+  // cloud sync-hook → gateway). The runtime surfaces them as
+  // `event.type === 'neon.<object>.<action>'`. Free-tier set = the three
+  // immediately-actionable deltas; `operation.cancelled` and the full-state
+  // `spending-limit.missing` / `consumption.threshold` signals stay on the
+  // cron sweep (the paid `nightcto/watch` tier subscribes to the wider set).
+  triggers: {
+    neon: [
+      { on: 'operation.failed' },
+      { on: 'endpoint.state_changed' },
+      { on: 'advisor.issue_raised' }
+    ]
+  },
 
   handler: async (ctx, event) => {
     // Chat path: a relay message arrived — answer questions about Neon state.
@@ -125,7 +141,13 @@ export default defineAgent({
       await handleInboxMessage(ctx, event);
       return;
     }
-    // Clock path: the full 15-minute state scan.
+    // Real-time path: a Neon sync-delta event arrived — alert the moment the
+    // operations sync detects a new failure instead of waiting for the sweep.
+    if (isNeonDeltaEvent(event)) {
+      await handleNeonEvent(ctx, event);
+      return;
+    }
+    // Clock path: the full state sweep (every 2h).
     if (isCronTickEvent(event)) {
       await handleScan(ctx);
       return;
@@ -183,6 +205,169 @@ async function handleScan(ctx: WorkforceCtx): Promise<void> {
 
   await saveMemory(ctx, { lastAlertFingerprint: fingerprint, lastScanAt: new Date().toISOString() });
   ctx.log?.('info', 'neon-monitor.alerted', { ts: result.ts, fingerprint });
+}
+
+// ── Real-time sync-delta event handler ────────────────────────────────────────
+
+// v4 runtime delivers provider triggers as a standard AgentEvent whose `type`
+// is `provider.object.action`. Neon deltas are `neon.operation.failed`,
+// `neon.endpoint.state_changed`, `neon.advisor.issue_raised`.
+function isNeonDeltaEvent(event: AgentEvent): boolean {
+  return typeof event.type === 'string' && event.type.startsWith('neon.');
+}
+
+/** Normalized view of a Neon sync-delta event, read from the v4 envelope. */
+export interface ParsedNeonEvent {
+  /** Unprefixed contract event type, e.g. `operation.failed`. */
+  eventType: string;
+  /** `operation` | `endpoint` | `advisor-issue`. */
+  objectType: string;
+  /** Stable object identity (advisor uses `cache_key`). */
+  objectId: string;
+  /** Provider/Nango time — never handler receipt time. */
+  occurredAt: string;
+  /** Endpoint current_state (only set for endpoint events). */
+  currentState?: string;
+  /** The normalized provider record (status, project_id, title, etc.). */
+  record: Record<string, unknown>;
+}
+
+/**
+ * Read a Neon sync-delta event into the dedup/format-ready shape.
+ *
+ * Envelope reality (verified against `@agentworkforce/runtime`'s
+ * `envelopeToAgentEvent`): the normalized object Cloud dispatches in
+ * `env.resource` is exposed to handlers ONLY through `await event.expand('full')`
+ * (its `.data`). The inline `event.resource` is rebuilt as a thin handle
+ * `{ path, kind, id, provider }` whose `id` is the DELIVERY id — NOT the
+ * objectId — so we must never read identity off `event.resource`. `event.type`
+ * (`neon.<object>.<action>`) and `event.occurredAt` are the reliable top-level
+ * fields. Returns `undefined` when there is no stable `objectId` — matching the
+ * normalizer's "no stable id → no event" rule.
+ */
+export async function parseNeonEvent(event: AgentEvent): Promise<ParsedNeonEvent | undefined> {
+  const type = typeof event.type === 'string' ? event.type : '';
+  if (!type.startsWith('neon.')) return undefined;
+
+  // The full normalized object lives in expand('full').data.
+  let data: Record<string, unknown> = {};
+  try {
+    const full = (await event.expand('full')) as { data?: unknown } | undefined;
+    if (full?.data && typeof full.data === 'object') data = full.data as Record<string, unknown>;
+  } catch {
+    // expansion is best-effort; an unexpandable event yields no stable id below.
+  }
+
+  const str = (...vals: unknown[]): string | undefined =>
+    vals.find((v): v is string => typeof v === 'string' && v.length > 0);
+
+  const record = (data.payload && typeof data.payload === 'object'
+    ? data.payload
+    : {}) as Record<string, unknown>;
+
+  // objectId precedence: explicit objectId → record id → advisor cache_key →
+  // raw record id. (NOT event.resource.id — that is the delivery id.)
+  const objectId = str(data.objectId, data.id, record.cache_key, record.id);
+  if (!objectId) return undefined;
+
+  // eventType: prefer the normalized unprefixed field; else strip `neon.`.
+  const eventType = str(data.eventType) ?? type.slice('neon.'.length);
+  const objectType = str(data.objectType) ?? inferObjectType(eventType);
+  const occurredAt = str(event.occurredAt, data.occurredAt as string, record.created_at as string) ?? '';
+  const currentState = str(data.current_state, record.current_state);
+
+  return { eventType, objectType, objectId, occurredAt, currentState, record };
+}
+
+function inferObjectType(eventType: string): string {
+  if (eventType.startsWith('endpoint.')) return 'endpoint';
+  if (eventType.startsWith('advisor.')) return 'advisor-issue';
+  return 'operation';
+}
+
+/**
+ * Per-object-type dedup fingerprint (frozen contract, addendum). Stable
+ * identity — NOT handler time — so a replayed/retried delivery maps to the same
+ * key. The endpoint key folds in state + time so a legitimate later transition
+ * on the same endpoint (`idle→active→idle`) is not suppressed.
+ */
+export function neonEventFingerprint(p: ParsedNeonEvent): string {
+  if (p.objectType === 'endpoint' || p.eventType.startsWith('endpoint.')) {
+    return `neon:endpoint.state_changed:${p.objectId}:${p.currentState ?? 'unknown'}:${p.occurredAt}`;
+  }
+  if (p.objectType === 'advisor-issue' || p.eventType.startsWith('advisor.')) {
+    return `neon:advisor.issue_raised:${p.objectId}`;
+  }
+  return `neon:${p.eventType}:${p.objectId}`;
+}
+
+async function handleNeonEvent(ctx: WorkforceCtx, event: AgentEvent): Promise<void> {
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (!channel) {
+    ctx.log?.('warn', 'neon-monitor.no-channel', { reason: 'SLACK_CHANNEL not set; skipping event alert' });
+    return;
+  }
+
+  const parsed = await parseNeonEvent(event);
+  if (!parsed) {
+    ctx.log?.('info', 'neon-monitor.event-unparsed', {
+      type: event.type,
+      reason: 'no stable objectId or not a neon delta'
+    });
+    return;
+  }
+
+  // Replay/retry dedup: skip an event whose fingerprint we have already alerted.
+  const fingerprint = neonEventFingerprint(parsed);
+  const seen = await loadEventDedup(ctx);
+  if (seen.includes(fingerprint)) {
+    ctx.log?.('info', 'neon-monitor.event-duplicate', { fingerprint, eventType: parsed.eventType });
+    return;
+  }
+
+  const message = formatEventAlert(parsed);
+  const result = await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, message);
+  if (!result?.ts) {
+    ctx.log?.('error', 'neon-monitor.event-post-failed', {
+      fingerprint,
+      reason: 'Slack writeback returned empty ts — path may not be mounted'
+    });
+    throw new Error(`Slack post returned no receipt for neon event ${parsed.eventType}`);
+  }
+
+  // Bounded ring of recent fingerprints — dedup without unbounded growth.
+  await saveEventDedup(ctx, [...seen, fingerprint].slice(-200));
+  ctx.log?.('info', 'neon-monitor.event-alerted', {
+    eventType: parsed.eventType,
+    fingerprint,
+    ts: result.ts
+  });
+}
+
+export function formatEventAlert(p: ParsedNeonEvent): string {
+  const r = p.record;
+  if (p.eventType === 'operation.failed' || p.eventType === 'operation.cancelled') {
+    const verb = p.eventType === 'operation.cancelled' ? 'cancelled' : 'failed';
+    const action = String(r.action ?? 'unknown');
+    const project = String(r.project_id ?? 'unknown');
+    const error = r.error ? ` — ${String(r.error).slice(0, 200)}` : '';
+    const emoji = verb === 'failed' ? ':red_circle:' : ':warning:';
+    return `${emoji} *Neon operation ${verb}*\n  \`${action}\` on project \`${project}\`${error}`;
+  }
+  if (p.eventType === 'endpoint.state_changed') {
+    const host = String(r.host ?? p.objectId);
+    const state = String(p.currentState ?? r.current_state ?? 'unknown');
+    const project = r.project_id ? ` (project \`${String(r.project_id)}\`)` : '';
+    return `:warning: *Neon endpoint state change*\n  \`${host}\`${project} → \`${state}\``;
+  }
+  if (p.eventType === 'advisor.issue_raised') {
+    const title = String(r.title ?? r.name ?? 'unknown');
+    const level = String(r.level ?? 'WARN');
+    const emoji = level === 'ERROR' ? ':red_circle:' : ':warning:';
+    const remediation = r.remediation ? `\n  ${String(r.remediation).slice(0, 200)}` : '';
+    return `${emoji} *Neon advisor issue* (${level}): ${title}${remediation}`;
+  }
+  return `:warning: *Neon event*: \`${p.eventType}\` on \`${p.objectId}\``;
 }
 
 // ── Signal evaluation ─────────────────────────────────────────────────────────
@@ -415,7 +600,9 @@ async function handleInboxMessage(ctx: WorkforceCtx, event: AgentEvent): Promise
   // no coding environment. It uses the deployer's subscription credential
   // (useSubscription: true on persona). This is the right tool for Q&A
   // over structured data; ctx.harness.run() is for agentic coding tasks.
-  const reply = await ctx.llm.complete(userMessage, { system: CHAT_SYSTEM_PROMPT });
+  // The runtime's LlmContext.complete() takes only { maxTokens } — there is no
+  // `system` option — so the system guidance rides as a preamble on the prompt.
+  const reply = await ctx.llm.complete(`${CHAT_SYSTEM_PROMPT}\n\n${userMessage}`);
 
   const result = await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, reply);
   if (!result?.ts) {
@@ -477,4 +664,21 @@ async function loadMemory(ctx: WorkforceCtx): Promise<MonitorMemory> {
 
 async function saveMemory(ctx: WorkforceCtx, state: MonitorMemory): Promise<void> {
   await ctx.memory.save(JSON.stringify(state), { tags: ['neon-monitor:state'], scope: 'workspace' });
+}
+
+// Real-time event dedup is kept in its own memory record so the cron sweep's
+// state (lastAlertFingerprint) and the trigger path never clobber each other.
+async function loadEventDedup(ctx: WorkforceCtx): Promise<string[]> {
+  try {
+    const [item] = await ctx.memory.recall('neon event dedup', { tags: ['neon-monitor:event-dedup'], limit: 1 });
+    if (!item) return [];
+    const parsed = JSON.parse(item.content) as unknown;
+    return Array.isArray(parsed) ? (parsed as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveEventDedup(ctx: WorkforceCtx, fingerprints: string[]): Promise<void> {
+  await ctx.memory.save(JSON.stringify(fingerprints), { tags: ['neon-monitor:event-dedup'], scope: 'workspace' });
 }

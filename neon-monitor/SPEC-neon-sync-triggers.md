@@ -600,3 +600,128 @@ Owner decision required.
 
 `#0 packages/neon decision → delta-metadata spike → Step 1 normalizer+catalog →
 Step 2 cloud sync-hook+provider-contracts → Steps 3a/3b deploy (parallel)`.
+
+---
+
+## Live-build corrections (team build, 2026-06-18 — supersede everything above)
+
+`#0` is **cleared**: `relayfile-adapters` PR #212 merged (commit `4d4f33c`),
+`@relayfile/adapter-neon` published `@0.1.1`. Spike done; Step 1 landed; Steps
+3a/3b staged. The items below were found while actually building each side and
+**supersede the body AND the first addendum where they conflict.**
+
+### C1 — Nango metadata field is `last_action`, not `action`
+
+The delta action is `record._nango_metadata.last_action` (Nango lowercase
+`added`/`updated`/`deleted`), **not** `_nango_metadata.action`. The normalizer
+case-normalizes it and emits it as `metadata.action` (`ADDED`/`UPDATED`) on the
+output event. `normalizeNeonSyncDelta()` keys on `last_action`; the negative
+tests assert a record with `last_action:'updated'` and no transition evidence
+emits `[]`.
+
+### C2 — transition evidence is carried in `_relayfile_transition`
+
+`listRecords` does **not** expose prior values or changed-field lists (spike
+result). Cloud enriches watched UPDATED records at the workflow boundary, before
+`writeBatch`, by reading the prior canonical Relayfile record and attaching:
+
+```ts
+_relayfile_transition: {
+  previous: { status?: string; current_state?: string };
+  current:  { status?: string; current_state?: string };
+  changedFields: Array<'status' | 'current_state'>;  // [] when no change
+}
+```
+
+`operation.succeeded` emits only when prior `status` differs and current is
+`finished`; `endpoint.state_changed` only when `current_state` actually changed.
+First run is suppressed via `syncType === 'INITIAL'` / `checkpoints.from === null`.
+The normalizer strips `_nango_metadata` and `_relayfile_transition` from the
+emitted `payload`, exposing only the normalized `metadata` object alongside it.
+
+### C3 — the v4 consumer envelope (this replaces §4's handler entirely)
+
+§4's handler is **pre-v4 and will not run** (`event.source`/`event.payload` were
+removed). The runtime decodes Cloud's gateway envelope via
+`@agentworkforce/runtime`'s `envelopeToAgentEvent`, which delivers a standard
+`@agent-relay/events` `AgentEvent`. **Verified behavior** (not assumed):
+
+- `event.type` = `neon.<object>.<action>` (e.g. `neon.operation.failed`). Trigger
+  decls stay `{ on: 'operation.failed' }`; the runtime adds the `neon.` prefix.
+- `event.occurredAt` = provider time (top-level, reliable).
+- **`event.resource` is a thin handle** `{ path, kind:'neon.<object>', id, provider }`
+  where **`id` is the DELIVERY id, not the objectId.** Do **not** read identity
+  from `event.resource`.
+- The full normalized object is reachable **only** via
+  **`(await event.expand('full')).data`** = `{ provider, eventType, objectType,
+  objectId, path, payload, metadata, current_state? }`.
+
+Producer note for Cloud: keep putting the whole normalized object in
+`env.resource` — the runtime's `loadFull` loader is what surfaces it as
+`expand('full').data`. Consumers read from `expand('full').data`, period.
+
+**Reference consumer (both `neon-monitor` and `nightcto/watch` mirror this):**
+
+```ts
+async function parseNeonEvent(event) {
+  const type = event.type ?? '';
+  if (!type.startsWith('neon.')) return undefined;
+  let data = {};
+  try { const full = await event.expand('full'); if (full?.data) data = full.data; } catch {}
+  const record = (data.payload && typeof data.payload === 'object') ? data.payload : {};
+  const objectId = data.objectId ?? data.id ?? record.cache_key ?? record.id;  // NOT event.resource.id
+  if (!objectId) return undefined;
+  return {
+    eventType: data.eventType ?? type.slice('neon.'.length),
+    objectType: data.objectType ?? inferObjectType(eventType),
+    objectId,
+    occurredAt: event.occurredAt ?? data.occurredAt ?? '',
+    currentState: data.current_state ?? record.current_state,
+    record,
+  };
+}
+```
+
+Dedup fingerprints are unchanged from the first addendum (operations/advisor
+`neon:${eventType}:${objectId}`; endpoint
+`neon:endpoint.state_changed:${objectId}:${current_state}:${occurredAt}`).
+
+### C4 — `ctx.llm.complete()` has no `system` option
+
+`@agentworkforce/runtime@4.1.4` types `LlmContext.complete(prompt, { maxTokens? })`
+— there is no `system` field. The chat path folds its system guidance into the
+prompt as a preamble (`complete(`${SYSTEM}\n\n${userMessage}`)`). The earlier
+`{ system }` call was a typecheck failure (part of PR #71's open CI feedback).
+
+### Status at this checkpoint
+
+- **Step 1 (adapters):** ✅ done — `normalizeNeonSyncDelta()` + `_relayfile_transition`
+  + negative tests + catalog regen; no version bumps.
+- **Step 2 (cloud):** in progress — VFS-watch dispatch reshaped to the standard
+  AgentEvent, sync-boundary transition enrichment, `provider-contracts.ts`
+  `triggerEvents` wiring (gates `--dry-run` via strict preflight).
+- **Step 3a (agents / this repo):** ✅ staged — `triggers.neon` = failed /
+  endpoint / advisor (3, matches the deploy `--dry-run` checkpoint), cron dropped
+  to `0 */2 * * *`, `handleNeonEvent` + `parseNeonEvent` + per-object-type
+  fingerprint dedup, 7 unit tests (full suite 109/109 green). Persona unchanged.
+  Deploy `--dry-run` gated on Step 2's provider-contracts wiring.
+- **Step 3b (nightcto):** ✅ staged — `handleNeonTriggerV4`/`buildNeonTriggerSignal`
+  re-pointed to `expand('full').data` per C3 (no `event.resource.id` shortcut).
+  Gated on Step 2 for `--dry-run`.
+
+### C5 — adapter publish gate (the real critical-path blocker now)
+
+Step 1's normalizer + regenerated catalog are **merged-locally only**; npm still
+serves the pre-Step-1 `@relayfile/adapter-core@0.3.58` / `@relayfile/adapter-neon@0.1.1`
+(both published from PR #212, the *initial* adapter). So Cloud's installed packages
+expose neither `KNOWN_TRIGGER_CATALOG.neon` nor `normalizeNeonSyncDelta`.
+
+- **Cloud Step 2 dev (now):** consume local built tarballs — `@relayfile/adapter-core@0.3.58`
+  and `@relayfile/adapter-neon@0.1.1` (.tgz from the adapters checkout) — and import
+  `KNOWN_TRIGGER_CATALOG` from **`@relayfile/adapter-core/triggers`** and
+  `normalizeNeonSyncDelta` from **`@relayfile/adapter-neon/webhook`** (declared subpaths).
+  Do **not** hand-copy the 5 events into `provider-contracts.ts`.
+- **Release gate (owner decision — human):** land the adapters Step 1 PR → run the
+  repo publish workflow (it owns the version bump; no feature-PR bumps) → Cloud
+  re-pins to the published version and drops the tarball dep. The deploy `--dry-run`
+  / CI for 3a + 3b must run against the **published** version, not the file: dep.

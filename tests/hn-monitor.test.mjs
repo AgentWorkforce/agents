@@ -65,20 +65,31 @@ test('postFreshStories claims fresh ids before summarizing, then keeps them on a
   assert.deepEqual(record.stories, [{ title: STORY.title, url: STORY.url, points: STORY.points }]);
 });
 
-test('postFreshStories releases the claim when summarizing fails, so the next tick retries', async () => {
+test('postFreshStories posts a plain fallback digest when the LLM throws, and still saves the post record', async () => {
   const { ctx, events, saved } = makeCtx({
-    llm: { async complete() { events.push('llm'); throw new Error('summary failed'); } },
+    llm: { async complete() { events.push('llm'); throw new Error('llm exploded'); } },
   });
-  const client = { async post() { throw new Error('should not post when summary fails'); } };
+  const posts = [];
+  const client = { async post(channel, text) { posts.push({ channel, text }); return { ts: '1710000000.2' }; } };
 
-  await assert.rejects(() => postFreshStories(ctx, 'C123', [10], [STORY], client), /summary failed/);
+  // summarize() no longer throws on an LLM failure — it falls back to a plain
+  // digest built from the story lines, so the post still lands and is retained.
+  await postFreshStories(ctx, 'C123', [10], [STORY], client);
 
-  // claim ([10,20]) → llm throws → rollback to the prior seen set ([10]).
   assert.deepEqual(events, ['save', 'llm', 'save']);
-  assert.deepEqual(saved.map((s) => s.content), [
-    JSON.stringify([10, 20]),
-    JSON.stringify([10]),
-  ]);
+  // The claim is kept (post succeeded), not rolled back.
+  assert.equal(saved[0].content, JSON.stringify([10, 20]));
+  // The fallback digest carries the header and the actual story title/url.
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].channel, 'C123');
+  assert.match(posts[0].text, /Hacker News/);
+  assert.match(posts[0].text, /Agent Workforce cron leases/);
+  assert.match(posts[0].text, /example\.com\/20/);
+  // The post record is still persisted for the Q&A path.
+  assert.deepEqual(saved[1].opts, { tags: ['hn-monitor:post'], scope: 'workspace' });
+  const record = JSON.parse(saved[1].content);
+  assert.match(record.digest, /Agent Workforce cron leases/);
+  assert.deepEqual(record.stories, [{ title: STORY.title, url: STORY.url, points: STORY.points }]);
 });
 
 test('postFreshStories treats a no-receipt Slack post as a failure and releases the claim', async () => {

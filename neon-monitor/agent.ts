@@ -330,6 +330,23 @@ function buildFingerprint(signals: AlertSignals): string {
 
 // ── Chat handler ──────────────────────────────────────────────────────────────
 
+const CHAT_SYSTEM_PROMPT = `You are a knowledgeable Neon database assistant with access to live infrastructure data for this organization. You can answer questions about:
+
+- **Projects** — names, regions, creation dates, org membership
+- **Branches** — which branches exist per project, their state, parent/child relationships
+- **Endpoints** — compute endpoint state (active, suspended, waking), host addresses, type (read_write / read_only)
+- **Operations** — recent database operations, their status (running, finished, failed), duration, error details
+- **Advisor issues** — performance/security recommendations at ERROR, WARN, or INFO level, with remediation steps
+- **Consumption** — compute-unit-seconds consumed per project, storage, network transfer
+- **Spending limits** — whether a spending cap is set on the organization
+
+When answering:
+- Use Slack mrkdwn formatting (*bold*, \`code\`, bullet lists).
+- Be specific — quote project IDs, operation IDs, or host names when they are relevant.
+- If the data doesn't contain enough detail to answer, say so and suggest what the user should check in the Neon console.
+- If there are active alerts (failed ops, waking endpoints, advisor errors), proactively surface them even if the user didn't ask.
+- Keep responses concise — prefer a tight bullet list over a long paragraph.`;
+
 async function handleInboxMessage(ctx: WorkforceCtx, event: AgentEvent): Promise<void> {
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (!channel) throw new Error('SLACK_CHANNEL is required');
@@ -345,37 +362,66 @@ async function handleInboxMessage(ctx: WorkforceCtx, event: AgentEvent): Promise
   }
 
   const root = resolveMountRoot({});
-  const [operations, endpoints, advisors, projects] = await Promise.all([
+
+  // Load all data in parallel — the LLM gets the full picture so it can
+  // answer cross-cutting questions (e.g. "which projects are consuming the
+  // most compute?" requires both projects + consumption).
+  const [operations, endpoints, advisors, projects, consumption, spendingLimits] = await Promise.all([
     readCollection<NeonOperation>(ctx, root, 'getOperations', OPERATIONS_INDEX),
     readCollection<NeonEndpoint>(ctx, root, 'getEndpoints', ENDPOINTS_INDEX),
     readCollection<NeonAdvisorIssue>(ctx, root, 'getAdvisors', ADVISORS_INDEX),
     readCollection<Record<string, unknown>>(ctx, root, 'getProjects', PROJECTS_INDEX),
+    readCollection<NeonProjectConsumption>(ctx, root, 'getConsumption', PROJECT_CONSUMPTION_INDEX),
+    readCollection<NeonSpendingLimit>(ctx, root, 'getSpendingLimits', SPENDING_LIMITS_INDEX),
   ]);
 
-  const prompt = [
-    'You are a Neon database infrastructure monitor. Answer the user\'s question about the current Neon state using the data below.',
-    'Be concise and specific. Use Slack markdown formatting.',
-    '',
+  // Surface the active alert state so the LLM can reference it even if the
+  // user's question isn't about alerts.
+  const failedOps = operations.filter((op) => op.status === 'failed' || (op.failures_count != null && op.failures_count > 0));
+  const wakingEndpoints = endpoints.filter((ep) => ep.current_state && THRASH_STATES.has(ep.current_state));
+  const activeAdvisorErrors = advisors.filter((a) => a.level === 'ERROR');
+
+  const activeAlertsSummary = [
+    failedOps.length > 0 ? `${failedOps.length} failed operation(s)` : null,
+    wakingEndpoints.length > 0 ? `${wakingEndpoints.length} endpoint(s) in waking/init state` : null,
+    activeAdvisorErrors.length > 0 ? `${activeAdvisorErrors.length} advisor error(s)` : null,
+  ].filter(Boolean);
+
+  const userMessage = [
+    activeAlertsSummary.length > 0
+      ? `[Active alerts: ${activeAlertsSummary.join(', ')}]\n`
+      : '[No active alerts at this time]\n',
     '## Projects',
-    JSON.stringify(projects.slice(0, 20), null, 2),
+    JSON.stringify(projects.slice(0, 30), null, 2),
     '',
-    `## Recent operations (last ${operations.length})`,
-    JSON.stringify(operations.slice(0, 30).map(compactOp), null, 2),
+    `## Operations (${operations.length} total — showing most recent 50)`,
+    JSON.stringify(operations.slice(0, 50).map(compactOp), null, 2),
     '',
     `## Endpoints (${endpoints.length})`,
-    JSON.stringify(endpoints.slice(0, 20).map(compactEndpoint), null, 2),
+    JSON.stringify(endpoints.map(compactEndpoint), null, 2),
     '',
     `## Advisor issues (${advisors.length})`,
-    JSON.stringify(advisors.slice(0, 20), null, 2),
+    JSON.stringify(advisors, null, 2),
     '',
-    '## User question',
-    question
+    `## Consumption (${consumption.length} projects)`,
+    JSON.stringify(consumption.slice(0, 20), null, 2),
+    '',
+    `## Spending limits`,
+    JSON.stringify(spendingLimits, null, 2),
+    '',
+    `## User question\n${question}`,
   ].join('\n');
 
-  const reply = await ctx.harness.run(prompt);
-  const result = await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, reply.output ?? 'No response from harness.');
+  // ctx.llm.complete() is a direct LLM completion — no harness subprocess,
+  // no coding environment. It uses the deployer's subscription credential
+  // (useSubscription: true on persona). This is the right tool for Q&A
+  // over structured data; ctx.harness.run() is for agentic coding tasks.
+  const reply = await ctx.llm.complete(userMessage, { system: CHAT_SYSTEM_PROMPT });
+
+  const result = await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, reply);
   if (!result?.ts) {
     ctx.log?.('error', 'neon-monitor.chat-post-failed', { reason: 'Slack post returned no receipt' });
+    throw new Error('Slack post returned no receipt ts after chat reply');
   }
 }
 

@@ -32,6 +32,11 @@ export default definePersona({
   systemPrompt:
     'You are a Neon database infrastructure monitor. Answer questions about the current Neon organization state (projects, branches, endpoints, operations, advisor issues, consumption) concisely using Slack markdown. When no question is asked, summarize any active alerts.',
 
+  // useSubscription lets ctx.llm.complete() resolve against the deployer's
+  // active subscription credential. Used only on the chat path — the cron
+  // scan is fully deterministic and never calls ctx.llm.
+  useSubscription: true,
+
   integrations: {
     // Neon state materialized into the VFS by @relayfile/adapter-neon:
     //   • operations  — recent DB operations   /neon/operations/**

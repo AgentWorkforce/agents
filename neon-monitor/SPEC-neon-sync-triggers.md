@@ -2,8 +2,35 @@
 
 **Status:** Ready for implementation  
 **Depends on:** AgentWorkforce/cloud#2266 (neon-relay), AgentWorkforce/agents#71 (neon-monitor)  
-**Repos touched:** `cloud`, `relayfile-adapters`, `agents`  
+**Repos touched:** `cloud`, `relayfile-adapters`, `agents`, `nightcto`  
 **Effort:** ~3 days across all repos
+
+---
+
+## Two-tier context
+
+This spec is **shared infrastructure** that unblocks two distinct personas at different product tiers. Implementers should understand both before starting — the trigger event shape is the contract between them.
+
+### Free tier — `agents/neon-monitor` (AgentWorkforce/agents#71)
+
+VFS snapshot reads on a 15-minute cron. Threshold-based alerting. Basic Slack post.
+No LLM judgment, no cross-signal correlation. The gcp-watcher equivalent for Neon.
+The cron drops to 2-hour once triggers are live (triggers cover the hot path).
+
+### Paid tier — `nightcto/personas/watch` (NightCTO product)
+
+Already declares `neon` triggers in `persona.ts` (`operation.failed`, `operation.cancelled`,
+`endpoint.suspended`, `spending-limit.missing`, `consumption.threshold`, `advisor.issue`).
+`fromNeonRecord()` in `personas/watch/lib/signals.ts` is fully implemented — maps every
+neon VFS record type to a structured `IncidentSignal` with calibrated severity levels
+(failed/cancelled ops → critical, endpoint suspended → high, no spending limit → medium).
+Feeds into `@nightcto/skill-observability-triage` (multi-signal OTel correlation),
+`@nightcto/skill-daily-recap`, `@nightcto/skill-hotfix` (can propose fixes),
+Sage handoff, and founder DMs for critical incidents.
+
+**Neither tier fires today** because Cloud does not route `sync.completed` webhooks for
+`neon-relay` to trigger events. This spec builds that shared routing layer once.
+After it ships, both personas activate automatically on their next deploy.
 
 ---
 
@@ -327,7 +354,7 @@ covers `operations/**`, `endpoints/**`, `advisors/**` — no change needed).
 
 ## Sequencing
 
-The repos must be done in this order. Each step is a merge gate for the next:
+The repos must be done in this order. Steps 3a and 3b can run in parallel.
 
 ```
 Step 1: relayfile-adapters
@@ -343,13 +370,47 @@ Step 2: cloud (depends on step 1)
   └─ Register neon triggers in routing table
   └─ Tests: mock a NeonOperation ADDED delta, assert neon.operation.failed emitted
 
-Step 3: agents (depends on step 2)
+Step 3a: agents — free tier (depends on step 2)
   └─ Add triggers to neon-monitor/agent.ts
-  └─ Add handleNeonEvent function
+  └─ Add handleNeonEvent function (see §agents below)
   └─ Reduce cron from */15 to 0 */2 (triggers cover hot path)
-  └─ Update persona.ts if trigger scope needs widening
   └─ Deploy: agentworkforce deploy neon-monitor/persona.ts --mode cloud --on-exists update
+
+Step 3b: nightcto — paid tier (depends on step 2, parallel with 3a)
+  └─ persona.ts already declares neon triggers — no change expected
+  └─ fromNeonRecord() in lib/signals.ts already implemented — no change expected
+  └─ Verify watchListenerSpec.triggers.neon event names match the catalog from step 1:
+     catalog emits:  operation.failed, endpoint.state_changed, advisor.issue_raised
+     persona.ts has: operation.failed, operation.cancelled, endpoint.suspended,
+                     spending-limit.missing, consumption.threshold, advisor.issue
+     → Align the names; the normalizer (step 1) is the source of truth
+  └─ Deploy: agentworkforce deploy nightcto/personas/watch/persona.ts --mode cloud --on-exists update
+  └─ Smoke test: trigger a failed op → confirm neon.operation.failed fires
+     handleSignal → triage → Slack alert in the nightcto channel
 ```
+
+### Event name alignment (critical)
+
+The nightcto persona.ts uses human-readable names (`endpoint.suspended`,
+`spending-limit.missing`) that differ from the names the normalizer will emit.
+One of these must be the canonical form — the normalizer in relayfile-adapters
+is the right place to define it since it's the source. Recommend keeping the
+normalizer's names and updating nightcto's `watchListenerSpec` to match, so the
+catalog is always the single source of truth.
+
+Suggested canonical names (normalizer outputs, both tiers subscribe):
+
+| Event | nightcto current | Recommended canonical |
+|---|---|---|
+| Operation fails | `operation.failed` | `operation.failed` ✓ same |
+| Operation cancelled | `operation.cancelled` | `operation.cancelled` ✓ same |
+| Endpoint waking/suspended | `endpoint.suspended` | `endpoint.state_changed` (broader) |
+| Spending limit absent | `spending-limit.missing` | `spending-limit.missing` ✓ same |
+| Consumption spike | `consumption.threshold` | `consumption.threshold` ✓ same |
+| Advisor issue | `advisor.issue` | `advisor.issue_raised` |
+
+The free-tier neon-monitor subscribes to a subset: `operation.failed`,
+`endpoint.state_changed`, `advisor.issue_raised`. The paid tier subscribes to all.
 
 ---
 
@@ -365,10 +426,15 @@ Step 3: agents (depends on step 2)
 - Test cursor cold-start: first call with no stored cursor fetches full records, stores cursor, emits nothing
 - Test cursor advance: second call with stored cursor fetches only delta, emits events for new failures
 
-### agents
+### agents (free tier)
 - Unit test `handleNeonEvent` with a mock `operation.failed` event payload → assert `slackClient().post()` called with message containing the action and project id
 - Unit test `handleNeonEvent` with `endpoint.state_changed` and `waking` state → assert Slack post fires
 - `agentworkforce deploy neon-monitor/persona.ts --mode cloud --dry-run` → asserts 2 integrations, 1 schedule, 3 triggers
+
+### nightcto (paid tier)
+- Existing `fromNeonRecord` unit tests in `personas/watch/lib/signals.test.ts` should all pass unchanged
+- Add a test: fire a synthetic `neon.operation.failed` event through `watchListenerSpec` → assert `handleSignal` is called with `source: 'neon'` and `level: 'critical'`
+- `agentworkforce deploy nightcto/personas/watch/persona.ts --mode cloud --dry-run` → asserts neon triggers present
 
 ---
 
@@ -390,11 +456,18 @@ Step 3: agents (depends on step 2)
 | `packages/core/package.json` | Bump @relayfile/adapter-neon, @relayfile/adapter-core |
 | Tests | New sync-delta integration test |
 
-### agents
+### agents (free tier)
 | File | Change |
 |---|---|
 | `neon-monitor/agent.ts` | Add `triggers`, `handleNeonEvent`, reduce cron to 2h |
 | `neon-monitor/persona.ts` | No change expected |
+
+### nightcto (paid tier)
+| File | Change |
+|---|---|
+| `personas/watch/persona.ts` | Align trigger event names to catalog (see event name table above) |
+| `personas/watch/agent.ts` → `watchListenerSpec` | Same alignment |
+| `personas/watch/lib/signals.ts` | No change expected (`fromNeonRecord` is already complete) |
 
 ---
 

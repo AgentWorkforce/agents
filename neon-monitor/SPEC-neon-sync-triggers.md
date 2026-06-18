@@ -725,3 +725,25 @@ expose neither `KNOWN_TRIGGER_CATALOG.neon` nor `normalizeNeonSyncDelta`.
   repo publish workflow (it owns the version bump; no feature-PR bumps) → Cloud
   re-pins to the published version and drops the tarball dep. The deploy `--dry-run`
   / CI for 3a + 3b must run against the **published** version, not the file: dep.
+
+### C6 — `operation.failed` / `cancelled` also emit on UPDATED transitions
+
+The frozen table (line ~506) gated `failed`/`cancelled` on `ADDED` only. That is
+**wrong** and amended here (PR #214 review, Codex P1): Neon operations are created
+in `running`/`scheduling` (an `ADDED` with non-terminal status) and reach
+`failed`/`cancelled` via a later `UPDATED`. ADDED-only would emit `[]` for a
+mid-run failure and silently drop the canonical case this monitor exists for
+(the 2026-06-16 pooling incident was repeated `start_compute` failures —
+`running→failed` UPDATED transitions). Corrected conditions:
+
+```
+operation.failed    : (ADDED ∧ status='failed')    ∨ (UPDATED ∧ status='failed'    ∧ transition→failed)
+operation.cancelled : (ADDED ∧ status='cancelled') ∨ (UPDATED ∧ status='cancelled' ∧ transition→cancelled)
+```
+
+Reuses the same `_relayfile_transition`/`changedFields` `status` evidence Cloud
+already supplies for `operation.succeeded` (so the enrichment must not be
+restricted to `status='finished'`). Plain final snapshots with no transition
+evidence still emit `[]`. **No consumer change:** `parseNeonEvent` and nightcto's
+handler key on `eventType`, so an UPDATED-sourced `operation.failed` formats and
+fingerprints identically to an ADDED-sourced one. Normalizer-only fix.

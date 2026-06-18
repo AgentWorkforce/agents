@@ -108,7 +108,22 @@ export async function handleInboxMessage(
     question
   ].join('\n');
 
-  const answer = await ctx.llm.complete(prompt, { maxTokens: 1024 });
+  // ctx.llm.complete() can hang (cloud/runtime bug) or error — bound it and, on
+  // failure, fall back to a brief reply listing the recent post titles so the
+  // DM still gets an answer instead of hanging silently.
+  let answer: string;
+  try {
+    answer = await withTimeout(ctx.llm.complete(prompt, { maxTokens: 1024 }), 45_000, 'ctx.llm.complete');
+  } catch (error) {
+    ctx.log('warn', 'hn-monitor.llm-fallback', { error: String(error) });
+    const titles = posts
+      .flatMap((p) => p.stories.map((s) => `- ${s.title} ${s.url}`))
+      .slice(0, 15)
+      .join('\n');
+    answer = titles
+      ? `I couldn't generate an answer right now; here are the recent post titles:\n${titles}`
+      : "I couldn't generate an answer right now, and I don't have any recent posts to show.";
+  }
 
   const res = await client.post(channel, answer);
   if (!res.ts) throw new Error(`Slack post to ${channel} got no writeback receipt (silent drop)`);
@@ -181,11 +196,42 @@ async function fetchFrontPage(): Promise<Story[]> {
 
 async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<string> {
   const lines = stories.map((s) => `- ${s.title} (${s.points} pts) ${s.url}`).join('\n');
-  const digest = await ctx.llm.complete(
-    `Write a tight Slack digest (mrkdwn, one bullet per story, lead with why it matters):\n\n${lines}`,
-    { maxTokens: 500 }
-  );
-  return `:newspaper: *Hacker News* — ${stories.length} new match(es)\n${digest.trim()}`;
+  const header = `:newspaper: *Hacker News* — ${stories.length} new match(es)`;
+  // ctx.llm.complete() can hang indefinitely (cloud/runtime bug — see PR) or
+  // error. summarize() must ALWAYS return a postable string so the digest still
+  // lands: race the call against a timeout, and on timeout/error fall back to a
+  // plain bulleted digest built from the story lines we already have.
+  try {
+    const digest = await withTimeout(
+      ctx.llm.complete(
+        `Write a tight Slack digest (mrkdwn, one bullet per story, lead with why it matters):\n\n${lines}`,
+        { maxTokens: 500 }
+      ),
+      45_000,
+      'ctx.llm.complete'
+    );
+    return `${header}\n${digest.trim()}`;
+  } catch (error) {
+    ctx.log('warn', 'hn-monitor.llm-fallback', { error: String(error) });
+    return `${header}\n${lines}`;
+  }
+}
+
+/**
+ * Race a promise against a timeout. Used to bound ctx.llm.complete() calls so a
+ * hung LLM can't stall the whole run; on timeout the timer rejects and the
+ * caller falls back. Always clears the timer so it never leaks.
+ */
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
 }
 
 // ── tiny helpers ────────────────────────────────────────────────────────────

@@ -471,6 +471,140 @@ test('numeric persona inputs are honored instead of falling back to string defau
   }
 });
 
+test('reads sandbox records from the VFS mount token-free and alerts off them (no REST)', async (t) => {
+  const oldConfigDir = process.env.DAYTONA_CONFIG_DIR;
+  const oldAccessToken = process.env.DAYTONA_ACCESS_TOKEN;
+  const oldMountPath = process.env.RELAYFILE_MOUNT_PATH;
+  const oldMountRoot = process.env.RELAYFILE_MOUNT_ROOT;
+  const oldSlackChannel = process.env.SLACK_CHANNEL;
+  const oldWorkspaceRoot = process.env.WORKSPACE_ROOT;
+  const mountRoot = await mkdtemp(path.join(os.tmpdir(), 'daytona-monitor-vfs-sb-'));
+  // No daytona config + no injected token: the run must lean entirely on VFS.
+  const emptyConfigDir = await mkdtemp(path.join(os.tmpdir(), 'daytona-monitor-vfs-sb-noconfig-'));
+  const memorySaves = [];
+
+  try {
+    process.env.DAYTONA_CONFIG_DIR = emptyConfigDir;
+    delete process.env.DAYTONA_ACCESS_TOKEN;
+    process.env.RELAYFILE_MOUNT_PATH = mountRoot;
+    process.env.RELAYFILE_MOUNT_ROOT = mountRoot;
+    process.env.SLACK_CHANNEL = 'C-daytona-alerts';
+    delete process.env.WORKSPACE_ROOT;
+    t.mock.method(Date, 'now', () => FIXED_NOW);
+
+    // Sandbox records as the adapter materializes them: normalized top-level
+    // fields plus the raw provider body under `payload`. Include a housekeeping
+    // _index.json that must be ignored.
+    const sbDir = path.join(mountRoot, 'daytona/sandboxes');
+    await mkdir(sbDir, { recursive: true });
+    await writeFile(
+      path.join(sbDir, '_index.json'),
+      JSON.stringify([{ id: 'err-1', canonicalPath: '/daytona/sandboxes/err-1.json' }]),
+      'utf8',
+    );
+    await writeFile(
+      path.join(sbDir, 'err-1.json'),
+      JSON.stringify({
+        provider: 'daytona',
+        objectId: 'err-1',
+        state: 'ERROR',
+        errorReason: 'image pull failed',
+        payload: { id: 'err-1', name: 'build-failed', state: 'ERROR' },
+      }),
+      'utf8',
+    );
+    await writeFile(
+      path.join(sbDir, 'ok-1.json'),
+      JSON.stringify({ objectId: 'ok-1', state: 'STOPPED', payload: { id: 'ok-1', name: 'ok-1', state: 'STOPPED' } }),
+      'utf8',
+    );
+
+    // No token → any REST call is a bug.
+    t.mock.method(globalThis, 'fetch', async (url) => {
+      assert.fail(`unexpected fetch on the VFS-only path: ${String(url)}`);
+    });
+
+    const slackPayloadPromise = answerSlackWriteback(mountRoot);
+    await agent.handler(ctx(memorySaves), cronEvent());
+    const slackPayload = await slackPayloadPromise;
+
+    // The ERROR sandbox signal came straight from the mounted record.
+    assert.match(slackPayload.text, /Sandbox ERROR.*build-failed.*image pull failed/);
+    // It did NOT post the can't-reach-Daytona message — it had real data.
+    assert.doesNotMatch(slackPayload.text, /can't reach Daytona/);
+    // Snapshot saved as on a normal scan.
+    assert.equal(memorySaves.length, 1);
+  } finally {
+    if (oldConfigDir === undefined) delete process.env.DAYTONA_CONFIG_DIR;
+    else process.env.DAYTONA_CONFIG_DIR = oldConfigDir;
+    if (oldAccessToken === undefined) delete process.env.DAYTONA_ACCESS_TOKEN;
+    else process.env.DAYTONA_ACCESS_TOKEN = oldAccessToken;
+    if (oldMountPath === undefined) delete process.env.RELAYFILE_MOUNT_PATH;
+    else process.env.RELAYFILE_MOUNT_PATH = oldMountPath;
+    if (oldMountRoot === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+    else process.env.RELAYFILE_MOUNT_ROOT = oldMountRoot;
+    if (oldSlackChannel === undefined) delete process.env.SLACK_CHANNEL;
+    else process.env.SLACK_CHANNEL = oldSlackChannel;
+    if (oldWorkspaceRoot === undefined) delete process.env.WORKSPACE_ROOT;
+    else process.env.WORKSPACE_ROOT = oldWorkspaceRoot;
+  }
+});
+
+test('posts a loud "can\'t reach Daytona" message when auth fails and no VFS data exists', async (t) => {
+  const oldConfigDir = process.env.DAYTONA_CONFIG_DIR;
+  const oldAccessToken = process.env.DAYTONA_ACCESS_TOKEN;
+  const oldMountPath = process.env.RELAYFILE_MOUNT_PATH;
+  const oldMountRoot = process.env.RELAYFILE_MOUNT_ROOT;
+  const oldSlackChannel = process.env.SLACK_CHANNEL;
+  const oldWorkspaceRoot = process.env.WORKSPACE_ROOT;
+  // Empty mount (no /daytona/usage or /daytona/sandboxes records) so the
+  // VFS-first reads come back empty.
+  const mountRoot = await mkdtemp(path.join(os.tmpdir(), 'daytona-monitor-noauth-'));
+  // Point the daytona config at a directory with no config.json so
+  // getDaytonaAccessToken() throws — simulating the sandbox where the cloud
+  // never injected DAYTONA_ACCESS_TOKEN (cloud#2287).
+  const emptyConfigDir = await mkdtemp(path.join(os.tmpdir(), 'daytona-monitor-noconfig-'));
+  const memorySaves = [];
+
+  try {
+    process.env.DAYTONA_CONFIG_DIR = emptyConfigDir;
+    delete process.env.DAYTONA_ACCESS_TOKEN;
+    process.env.RELAYFILE_MOUNT_PATH = mountRoot;
+    process.env.RELAYFILE_MOUNT_ROOT = mountRoot;
+    process.env.SLACK_CHANNEL = 'C-daytona-alerts';
+    delete process.env.WORKSPACE_ROOT;
+    t.mock.method(Date, 'now', () => FIXED_NOW);
+
+    // No token means no REST calls should ever be attempted; assert-fail if one is.
+    t.mock.method(globalThis, 'fetch', async (url) => {
+      assert.fail(`unexpected fetch with no token: ${String(url)}`);
+    });
+
+    const slackPayloadPromise = answerSlackWriteback(mountRoot);
+    await agent.handler(ctx(memorySaves), cronEvent());
+    const slackPayload = await slackPayloadPromise;
+
+    assert.match(slackPayload.text, /can't reach Daytona/);
+    assert.match(slackPayload.text, /DAYTONA_ACCESS_TOKEN/);
+    assert.match(slackPayload.text, /cloud#2287/);
+    // The loud-failure path returns before saving a snapshot.
+    assert.equal(memorySaves.length, 0);
+  } finally {
+    if (oldConfigDir === undefined) delete process.env.DAYTONA_CONFIG_DIR;
+    else process.env.DAYTONA_CONFIG_DIR = oldConfigDir;
+    if (oldAccessToken === undefined) delete process.env.DAYTONA_ACCESS_TOKEN;
+    else process.env.DAYTONA_ACCESS_TOKEN = oldAccessToken;
+    if (oldMountPath === undefined) delete process.env.RELAYFILE_MOUNT_PATH;
+    else process.env.RELAYFILE_MOUNT_PATH = oldMountPath;
+    if (oldMountRoot === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+    else process.env.RELAYFILE_MOUNT_ROOT = oldMountRoot;
+    if (oldSlackChannel === undefined) delete process.env.SLACK_CHANNEL;
+    else process.env.SLACK_CHANNEL = oldSlackChannel;
+    if (oldWorkspaceRoot === undefined) delete process.env.WORKSPACE_ROOT;
+    else process.env.WORKSPACE_ROOT = oldWorkspaceRoot;
+  }
+});
+
 // ── webhook (real-time) path ──────────────────────────────────────────────────
 
 /** Run `fn` with the Daytona token config + a fresh mount root in env. */

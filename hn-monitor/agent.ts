@@ -41,19 +41,41 @@ export default defineAgent({
   }
 });
 
-export async function postFreshStories(ctx: WorkforceCtx, channel: string, seen: number[], fresh: Story[]): Promise<void> {
-  // Claim the stories as seen BEFORE any long work. Cron delivery is
-  // at-least-once: a single tick can re-invoke this handler (cloud re-runs a
-  // delivery whose lease expires before it reports done — see
-  // AgentWorkforce/cloud#1990). Recording first means the re-invocation loads
-  // these ids as already-seen and stays silent, instead of posting the digest
-  // twice. The trade is that a failed summary/post drops that digest rather
-  // than risking a duplicate — the right call for a low-stakes twice-daily
-  // summary. (This is a stopgap; the durable fix is idempotent cron delivery in
-  // cloud#1990.)
+interface SlackPoster {
+  post(channel: string, text: string): Promise<{ ts: string }>;
+}
+
+export async function postFreshStories(
+  ctx: WorkforceCtx,
+  channel: string,
+  seen: number[],
+  fresh: Story[],
+  client: SlackPoster = slackClient({ writebackTimeoutMs: 15_000 })
+): Promise<void> {
+  // Claim the stories as seen BEFORE the post. Cron delivery is at-least-once: a
+  // single tick can re-invoke this handler (cloud re-runs a delivery whose lease
+  // expires before it reports done — see AgentWorkforce/cloud#1990). Claiming
+  // first means a concurrent re-invocation loads these ids as already-seen and
+  // stays silent instead of double-posting.
   await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
-  const digest = await summarize(ctx, fresh);
-  await slackClient({ writebackTimeoutMs: 15_000 }).post(channel, digest);
+  try {
+    const digest = await summarize(ctx, fresh);
+    // post() resolves with ts:'' (no throw) when the writeback gets no receipt,
+    // so an empty ts is a SILENT DROP, not success — make it a loud failure
+    // (matches daytona-monitor / pr-reviewer). Without this, a dropped digest
+    // looked like a success and was never retried.
+    const res = await client.post(channel, digest);
+    if (!res.ts) throw new Error(`Slack post to ${channel} got no writeback receipt (silent drop)`);
+  } catch (err) {
+    // The claim was provisional: summarize or post failed, so RELEASE it by
+    // restoring the prior seen set. The next tick then retries this digest
+    // instead of dropping it forever — the old behavior marked the stories seen
+    // permanently, so a single transient LLM/Slack failure made the agent go
+    // silent for good. Releasing keeps the double-post guard (ids stay claimed
+    // for the duration of the attempt) while making a failed run self-heal.
+    await saveSeen(ctx, seen).catch(() => {});
+    throw err;
+  }
 }
 
 /** Top ~30 front-page stories via the public HN Algolia API. Returns [] on

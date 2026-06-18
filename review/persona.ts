@@ -29,15 +29,9 @@ export default definePersona({
   integrations: {
     github: {},
     slack: {
-      // Cloud mounts an integration's relayfile subtree only from `scope`
-      // (or from triggers — and this persona has github triggers only). A
-      // scope-less `slack: {}` mounts nothing, so slackClient().post() wrote
-      // its draft to unmounted local disk and the writeback worker never saw
-      // it: every Slack ping was a silent no-op. The channel is picked at
-      // deploy time (SLACK_CHANNEL input), so the scope can't name one
-      // statically — mount the channels subtree, which covers the
-      // `/slack/channels/{channelId}/messages` writeback path for any picked
-      // channel (and excludes DMs/users).
+      // Slack writebacks use bare channel ids while trigger paths can include
+      // display labels; keep the whole channels subtree mounted so ready/merge
+      // pings and merge-request replies both reach the writeback worker.
       scope: { paths: '/slack/channels/**' }
     }
   },
@@ -68,15 +62,12 @@ export default definePersona({
     }
   },
 
-  harness: 'codex',
-  model: 'gpt-5.5',
+  harness: 'claude',
+  model: 'claude-opus-4-8',
   systemPrompt: 'You are a rigorous senior reviewer. Review PRs, auto-apply only lint/format/typo fixes, leave logic and safety changes as comments, keep CI honest, and only hand back when the PR is genuinely ready.',
   harnessSettings: {
     reasoning: 'high',
     timeoutSeconds: 2400,
-    // Daytona is the trust boundary for cloud fires. Codex's nested
-    // bubblewrap sandbox requires user namespaces that Daytona does not allow.
-    dangerouslyBypassApprovalsAndSandbox: true
   },
 
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 180 },

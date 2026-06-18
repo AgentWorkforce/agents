@@ -8,15 +8,20 @@ import {
   commentBody,
   commenterLogin,
   conflictResolveHarnessPrompt,
+  deriveReviewDecision,
+  evaluateMergeOnGreenState,
+  handleSlackMergeRequest,
   isAuthorizedConflictCommander,
   labelNames,
   matchesConflictDirective,
+  parseSlackMergeRequest,
   postSlackPrUpdate,
   prReadyStateAllowsHumanReview,
   readPr,
   resolveAuthorLogin,
   reviewHarnessPrompt,
   reviewAuthorAllowlistDecision,
+  rollupFromCheckSummary,
 } from '../.test-build/review/agent.js';
 
 function conflictCtx({ approvers, reviewAuthors } = {}) {
@@ -246,6 +251,184 @@ test('labelNames normalizes github label arrays defensively', () => {
   assert.deepEqual(labelNames(undefined), []);
 });
 
+test('readPr resolves issue labeled payloads for pull requests in any AgentWorkforce repo', () => {
+  assert.deepEqual(readPr({
+    action: 'labeled',
+    label: { name: 'merge-on-green' },
+    issue: {
+      number: 158,
+      html_url: 'https://github.com/AgentWorkforce/relayfile-adapters/issues/158',
+      pull_request: {},
+      labels: [{ name: 'merge-on-green' }],
+    },
+    repository: { name: 'relayfile-adapters', owner: { login: 'AgentWorkforce' } },
+  }), {
+    owner: 'AgentWorkforce',
+    repo: 'relayfile-adapters',
+    number: 158,
+    url: 'https://github.com/AgentWorkforce/relayfile-adapters/issues/158',
+    author: 'unknown',
+    labels: [{ name: 'merge-on-green' }],
+  });
+});
+
+test('evaluateMergeOnGreenState requires label, green checks, and requested bot approvals', () => {
+  const base = {
+    state: 'OPEN',
+    isDraft: false,
+    mergeable: 'MERGEABLE',
+    mergeStateStatus: 'CLEAN',
+    labels: [{ name: 'merge-on-green' }],
+    statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    ],
+    reviewRequests: [
+      { requestedReviewer: { login: 'coderabbitai[bot]', type: 'Bot' } },
+    ],
+    latestReviews: [
+      { author: { login: 'coderabbitai[bot]', type: 'Bot' }, state: 'APPROVED', submittedAt: '2026-06-10T00:00:00Z' },
+    ],
+  };
+
+  assert.deepEqual(evaluateMergeOnGreenState(base), { outcome: 'ready', reasons: [] });
+
+  assert.equal(evaluateMergeOnGreenState({
+    ...base,
+    statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'unit', status: 'IN_PROGRESS', conclusion: null },
+    ],
+  }).outcome, 'pending');
+
+  assert.deepEqual(evaluateMergeOnGreenState({
+    ...base,
+    latestReviews: [],
+  }), {
+    outcome: 'pending',
+    reasons: ['bot @coderabbitai[bot] has not approved yet'],
+  });
+
+  assert.equal(evaluateMergeOnGreenState({
+    ...base,
+    latestReviews: [
+      { author: { login: 'gemini-code-assist[bot]', type: 'Bot' }, state: 'CHANGES_REQUESTED', submittedAt: '2026-06-10T00:00:00Z' },
+    ],
+  }).outcome, 'blocked');
+});
+
+test('rollupFromCheckSummary maps the adapter check summary to gate-ready rollups', () => {
+  // No checks ingested yet (missing / total 0) → empty rollup. The gates then
+  // fall through to mergeStateStatus (which the VFS path never reports CLEAN),
+  // so the PR HOLDS instead of going green on absent CI.
+  assert.deepEqual(rollupFromCheckSummary(undefined), []);
+  assert.deepEqual(rollupFromCheckSummary({ total: 0, passed: 0, failed: 0, pending: 0 }), []);
+
+  // All complete and passing → one SUCCESS entry the evaluators read as green.
+  const green = rollupFromCheckSummary({ total: 3, passed: 3, failed: 0, pending: 0 });
+  assert.equal(evaluateMergeOnGreenState({
+    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE',
+    labels: [{ name: 'merge-on-green' }], statusCheckRollup: green,
+  }).outcome, 'ready');
+
+  // A pending check → IN_PROGRESS → the merge-on-green gate stays pending.
+  const pending = rollupFromCheckSummary({ total: 2, passed: 1, failed: 0, pending: 1 });
+  assert.equal(evaluateMergeOnGreenState({
+    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE',
+    labels: [{ name: 'merge-on-green' }], statusCheckRollup: pending,
+  }).outcome, 'pending');
+
+  // A failing check → FAILURE → blocked.
+  const failing = rollupFromCheckSummary({ total: 2, passed: 1, failed: 1, pending: 0 });
+  assert.equal(evaluateMergeOnGreenState({
+    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE',
+    labels: [{ name: 'merge-on-green' }], statusCheckRollup: failing,
+  }).outcome, 'blocked');
+
+  // Green checks also satisfy the human-review ready gate.
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: green,
+  }), true);
+
+  // `total` missing but component counts present → derive total from the counts
+  // so a failing check still blocks (not treated as "no checks reported").
+  assert.equal(evaluateMergeOnGreenState({
+    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', labels: [{ name: 'merge-on-green' }],
+    statusCheckRollup: rollupFromCheckSummary({ failed: 1, pending: 0, passed: 2 }),
+  }).outcome, 'blocked');
+});
+
+test('deriveReviewDecision flags CHANGES_REQUESTED from the latest review per author', () => {
+  // No reviews → undefined (not blocking).
+  assert.equal(deriveReviewDecision([]), undefined);
+
+  // A later APPROVED supersedes an earlier CHANGES_REQUESTED from the same author.
+  assert.equal(deriveReviewDecision([
+    { author: { login: 'coderabbitai[bot]' }, state: 'CHANGES_REQUESTED', submitted_at: '2026-06-10T00:00:00Z' },
+    { author: { login: 'coderabbitai[bot]' }, state: 'APPROVED', submitted_at: '2026-06-11T00:00:00Z' },
+  ]), undefined);
+
+  // An outstanding CHANGES_REQUESTED (the author's latest) blocks.
+  assert.equal(deriveReviewDecision([
+    { author: { login: 'willwashburn' }, state: 'APPROVED', submitted_at: '2026-06-10T00:00:00Z' },
+    { author: { login: 'coderabbitai[bot]' }, state: 'CHANGES_REQUESTED', submitted_at: '2026-06-11T00:00:00Z' },
+  ]), 'CHANGES_REQUESTED');
+});
+
+test('parseSlackMergeRequest extracts a GitHub PR URL from merge requests', () => {
+  assert.deepEqual(parseSlackMergeRequest('<@Ubot> please merge https://github.com/AgentWorkforce/relayfile-adapters/pull/158'), {
+    pr: {
+      owner: 'AgentWorkforce',
+      repo: 'relayfile-adapters',
+      number: 158,
+      url: 'https://github.com/AgentWorkforce/relayfile-adapters/pull/158',
+      author: 'unknown',
+    },
+  });
+  assert.equal(parseSlackMergeRequest('can you review https://github.com/AgentWorkforce/agents/pull/1'), null);
+  assert.equal(parseSlackMergeRequest('please merge https://github.com/AgentWorkforce/agents/pull/1'), null);
+});
+
+test('handleSlackMergeRequest replies with blockers when Slack asks to merge a red PR', async () => {
+  const replies = [];
+  const ctx = {
+    persona: {
+      inputSpecs: { SLACK_CHANNEL: { env: '__TEST_SLACK_CHANNEL__' } },
+      inputs: { SLACK_CHANNEL: 'C123' },
+    },
+    sandbox: { cwd: '/tmp' },
+    log() {},
+  };
+  const slack = {
+    async post() { throw new Error('should reply in thread'); },
+    async reply(channel, threadTs, text) {
+      replies.push({ channel, threadTs, text });
+      return { channel, ts: 'reply-ts' };
+    },
+  };
+
+  await handleSlackMergeRequest(
+    ctx,
+    {
+      channel: 'C123',
+      ts: '1000.0001',
+      text: '<@Ubot> please merge https://github.com/AgentWorkforce/cloud/pull/2060',
+      is_bot: false,
+    },
+    slack,
+    async (_ctx, pr) => ({
+      outcome: 'blocked',
+      pr,
+      reasons: ['check "unit" is not passing (COMPLETED/FAILURE)', 'bot @coderabbitai[bot] has not approved yet'],
+    }),
+  );
+
+  assert.equal(replies.length, 1);
+  assert.deepEqual(replies[0], {
+    channel: 'C123',
+    threadTs: '1000.0001',
+    text: 'I cannot merge AgentWorkforce/cloud#2060 yet: check "unit" is not passing (COMPLETED/FAILURE); bot @coderabbitai[bot] has not approved yet.',
+  });
+});
+
 test('reviewHarnessPrompt forbids git except the explicit restore-only carve-out', () => {
   const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 47 });
   assert.match(prompt, /Don't use git or the gh CLI/);
@@ -401,13 +584,9 @@ test('reviewHarnessPrompt requires accounting for each bot/reviewer comment with
   assert.match(prompt, /do not say a comment\s+was addressed without pointing to the fix/);
 });
 
-// Cloud only mounts an integration's relayfile subtree from its `scope` (or
-// from triggers — and this persona has github triggers only). A scope-less
-// `slack: {}` mounts nothing, so every slackClient() post was written to
-// unmounted local disk and silently dropped. persona-kit also discards empty
-// scope objects client-side, so the scope must survive parsing as a non-empty
-// string map covering the `/slack/channels/{channelId}/messages` writeback
-// path. This pins both halves.
+// Slack writebacks use bare channel ids while trigger paths can include
+// display-labelled channel records. Keep an explicit scope covering the
+// `/slack/channels/{channelId}/messages` writeback path. This pins both halves.
 test('persona declares a slack scope that survives persona-kit parsing and covers the messages writeback path', async () => {
   const { default: persona } = await import('../.test-build/review/persona.js');
   const parsed = parseIntegrations(persona.integrations, 'integrations');

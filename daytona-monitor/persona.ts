@@ -13,22 +13,34 @@ export default definePersona({
   intent: 'relay-orchestrator',
   tags: ['discovery'],
   description:
-    "Watches your Daytona org's usage quotas + sandbox allocations and posts a Slack alert when a quota nears its limit, a sandbox errors, or a sandbox runs stale.",
+    "Watches your Daytona org's usage quotas + sandbox allocations and posts a Slack alert when a quota nears its limit, a sandbox errors, or a sandbox runs stale. Can also answer questions about current Daytona state via relay inbox.",
   cloud: true,
 
+  harness: 'opencode',
+  model: 'deepseek-v4-flash-free',
+  systemPrompt: 'You are a Daytona infrastructure monitor. Answer questions about the current Daytona organization state concisely using Slack markdown. When no question is asked, summarize any active alerts.',
+
   integrations: {
-    // Real-time sandbox-lifecycle webhooks. The `daytona` triggers in agent.ts
-    // wake the agent on sandbox.created / sandbox.state.updated; this connection
-    // + scope mounts the read mirror at /daytona/sandboxes/** that backs the
-    // webhook payload and any sandbox refetch.
-    daytona: { scope: { sandboxes: '/daytona/sandboxes/**' } },
+    // Two daytona subtrees:
+    //   • usage     — org quota/usage the adapter polls hourly into
+    //                 /daytona/usage/<orgId>.json; the agent reads it from the
+    //                 mount (no token), falling back to the REST API while the
+    //                 adapter's usage sync is still rolling out.
+    //   • sandboxes — read mirror at /daytona/sandboxes/** backing the
+    //                 sandbox-lifecycle webhooks (sandbox.created /
+    //                 sandbox.state.updated) the triggers in agent.ts wake on.
+    daytona: { scope: { usage: '/daytona/usage/**', sandboxes: '/daytona/sandboxes/**' } },
     // No slack trigger here, so `scope` is the only thing that mounts /slack —
     // without it every post is a silent no-op.
     slack: { scope: { paths: '/slack/channels/**' } }
   },
 
   inputs: {
-    SLACK_CHANNEL: { description: 'Team Slack channel id to post alerts to.', env: 'SLACK_CHANNEL' },
+    SLACK_CHANNEL: {
+      description: 'Team Slack channel id to post alerts to.',
+      env: 'SLACK_CHANNEL',
+      picker: { provider: 'slack', resource: 'channels' }
+    },
     DAYTONA_ORG_ID: {
       description: 'Daytona organization id to monitor.',
       env: 'DAYTONA_ORG_ID',
@@ -46,8 +58,8 @@ export default definePersona({
     }
   },
 
-  // Pure threshold-diff + post — no model needed.
-  harnessSettings: { reasoning: 'low', timeoutSeconds: 120 },
+  harnessSettings: { reasoning: 'medium', timeoutSeconds: 120 },
+  relay: { inbox: ['@self'] },
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 90 },
 
   onEvent: './agent.ts'

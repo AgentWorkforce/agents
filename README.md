@@ -14,10 +14,14 @@ it does). The persona compiles to `persona.json`; deploy with
 | Agent | Fires on | What it does |
 | --- | --- | --- |
 | [**cloud-team-implementer**](cloud-team-implementer/) | launched by a teamSolve lead roster | Implements the assigned issue in its own sandbox and opens one focused pull request. |
+| [**transcript-to-linear-github**](https://github.com/AgentWorkforce/relayscribe/tree/main/agents/transcript-to-linear-github/) | Relayscribe recording → `/recall/recordings/**` | Extracts action items from a meeting transcript, files Linear issues, and autonomously opens a GitHub PR per coding task. |
+| [**transcript-slack-digest**](https://github.com/AgentWorkforce/relayscribe/tree/main/agents/transcript-slack-digest/) | Relayscribe recording → `/recall/recordings/**` | Extracts action items, decisions, and open questions from a transcript and posts a structured Slack digest. |
+| [**transcript-to-notion-slack**](https://github.com/AgentWorkforce/relayscribe/tree/main/agents/transcript-to-notion-slack/) | Relayscribe recording → `/recall/recordings/**` | Writes structured meeting notes and action items to a Notion database, then posts the page link to Slack. |
 | [**cloud-team-reviewer**](cloud-team-reviewer/) | launched by a teamSolve lead roster | Reviews a teammate's branch against the issue spec and returns verifiable, actionable findings. |
 | [**granola**](granola/) | a new Granola note (Nango sync → `file.created`) | Detects prospect calls, files a Linear issue with the ask, and opens a GitHub PR implementing it. |
 | [**hn-monitor**](hn-monitor/) | schedule (2×/day) | Scans Hacker News for your topics and posts a digest to Slack. |
 | [**linear**](linear/) | Linear `issue.create` (labelled) / `comment.create` | Implements the issue and opens a GitHub PR; comments the PR link back. |
+| [**neon-monitor**](neon-monitor/) | Neon sync-delta triggers (`operation.failed` / `endpoint.state_changed` / `advisor.issue_raised`) + 2h sweep | Watches your Neon org for failed operations, endpoint thrash, advisor issues, and runaway compute/spend; posts Slack alerts and answers questions about live Neon state. |
 | [**repo-hygiene**](repo-hygiene/) | GitHub PR opened / updated | Diagnoses duplicated/dead code, divergent paths, stale skills/rules/docs, and code smells; comments findings and journals the run to Notion. |
 | [**review**](review/) | GitHub PR opened / updated / reviewed / CI finished | Reviews the PR, fixes the issues it (and other bots) find, resolves failing CI and merge conflicts, DMs you when it's ready, and merges once you approve. |
 | [**spotify-releases**](spotify-releases/) | schedule (daily) | Checks for new releases from artists you follow and DMs them to you. |

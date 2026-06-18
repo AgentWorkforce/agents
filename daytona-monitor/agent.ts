@@ -10,8 +10,19 @@
  *     → post ONE concise Slack alert if any signal fires; stay silent otherwise
  *       and never re-alert an unchanged condition.
  */
-import { defineAgent, isCronTickEvent, type AgentEvent, type WorkforceCtx } from '@agentworkforce/runtime';
+import {
+  defineAgent,
+  isCronTickEvent,
+  isRelaycastMessageEvent,
+  readJsonFile,
+  resolveMountRoot,
+  type AgentEvent,
+  type IntegrationClientOptions,
+  type WorkforceCtx
+} from '@agentworkforce/runtime';
 import { slackClient } from '@relayfile/relay-helpers';
+// Adapter-published path for the org usage record (/daytona/usage/<orgId>.json).
+import { daytonaUsagePath } from '@relayfile/adapter-daytona';
 // Fresh, auto-refreshed Daytona Auth0 access token (auth once → refreshed
 // forever). Owned by ./lib/daytona-auth.ts; persists rotated refresh tokens.
 import { getDaytonaAccessToken } from './lib/daytona-auth.js';
@@ -62,6 +73,11 @@ export default defineAgent({
     daytona: [{ on: 'sandbox.created' }, { on: 'sandbox.state.updated' }]
   },
   handler: async (ctx, event) => {
+    // Chat path: a relay message arrived — answer questions about Daytona data.
+    if (isRelaycastMessageEvent(event)) {
+      await handleInboxMessage(ctx, event);
+      return;
+    }
     // Real-time path: a Daytona webhook arrived — alert the MOMENT a sandbox
     // turns ERROR/BUILD_FAILED, instead of waiting for the next hourly tick.
     if (isDaytonaSandboxEvent(event)) {
@@ -75,6 +91,68 @@ export default defineAgent({
     }
   }
 });
+
+/**
+ * Chat handler: when someone messages the agent via relay inbox, fetch current
+ * Daytona data and use the LLM to answer their question conversationally.
+ */
+async function handleInboxMessage(ctx: WorkforceCtx, event: AgentEvent): Promise<void> {
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  if (!channel) throw new Error('SLACK_CHANNEL is required');
+  const orgId = input(ctx, 'DAYTONA_ORG_ID') ?? DEFAULT_ORG_ID;
+
+  const payload = await event.expand('full').catch(() => undefined);
+  const data = (payload as { data?: Record<string, unknown> } | undefined)?.data;
+  const nested = (data?.message && typeof data.message === 'object' ? data.message : {}) as Record<string, unknown>;
+  const question = typeof data?.text === 'string' ? data.text
+    : typeof nested.text === 'string' ? nested.text : '';
+  if (!question.trim()) {
+    ctx.log?.('info', 'relaycast message with no text; skipping');
+    return;
+  }
+
+  let usageText = 'Usage data unavailable.';
+  let sandboxText = 'Sandbox data unavailable.';
+  try {
+    const token = await getDaytonaAccessToken(orgId);
+    const auth = { Authorization: `Bearer ${token}`, [ORG_HEADER]: orgId, Accept: 'application/json' };
+
+    const usage = await readUsage(ctx, orgId, auth);
+    usageText = JSON.stringify(usage, null, 2);
+
+    const sandboxes = await getAllSandboxes(auth);
+    sandboxText = JSON.stringify(
+      sandboxes.map(s => ({
+        id: s.id, name: s.name, state: s.state,
+        errorReason: s.errorReason, createdAt: s.createdAt, updatedAt: s.updatedAt
+      })),
+      null, 2
+    );
+  } catch (err) {
+    ctx.log?.('warn', 'failed to fetch Daytona data for chat response', {
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
+
+  const prompt = [
+    'You are a Daytona infrastructure monitor. Answer the user\'s question about the current Daytona organization state using the data below.',
+    'Be concise and specific. Use Slack markdown formatting.',
+    '',
+    `## Current Usage/Quota Data (org ${orgId})`,
+    usageText,
+    '',
+    '## Current Sandboxes',
+    sandboxText,
+    '',
+    `## User Question`,
+    question
+  ].join('\n');
+
+  const answer = await ctx.llm.complete(prompt, { maxTokens: 1024 });
+
+  const res = await slackClient().post(channel, answer);
+  if (!res.ts) throw new Error(`Slack post to ${channel} got no writeback receipt (silent drop)`);
+}
 
 /** True for a Daytona sandbox-lifecycle webhook event (`daytona.sandbox.*`). */
 function isDaytonaSandboxEvent(event: AgentEvent): boolean {
@@ -191,7 +269,7 @@ async function handleUsageScan(ctx: WorkforceCtx): Promise<void> {
   const token = await getDaytonaAccessToken(orgId);
   const auth = { Authorization: `Bearer ${token}`, [ORG_HEADER]: orgId, Accept: 'application/json' };
 
-  const usage = await getJson<UsageResponse>(`${DAYTONA_API}/organizations/${orgId}/usage`, auth);
+  const usage = await readUsage(ctx, orgId, auth);
   const sandboxes = await getAllSandboxes(auth);
 
   const last = await loadSnapshot(ctx);
@@ -310,6 +388,38 @@ async function getAllSandboxes(headers: Record<string, string>): Promise<Sandbox
     cursor = body.nextCursor;
   }
   return out;
+}
+
+/**
+ * Org usage/quota. Prefer the @relayfile/adapter-daytona VFS mount
+ * (/daytona/usage/<orgId>.json, polled hourly by the adapter — no token, no
+ * direct REST call), and fall back to the Daytona REST API while the adapter's
+ * usage sync is still rolling out (relayfile-adapters#155). `evaluateSignals`
+ * sees the same `UsageResponse` shape either way.
+ */
+async function readUsage(
+  ctx: WorkforceCtx,
+  orgId: string,
+  auth: Record<string, string>
+): Promise<UsageResponse> {
+  try {
+    return await readJsonFile<UsageResponse>(vfsClient(), 'daytona', 'getUsage', daytonaUsagePath(orgId));
+  } catch (err) {
+    // No mounted usage record yet (adapter sync not live, or empty tree) — use
+    // the authoritative REST endpoint so quota signals still fire. Log the cause
+    // so a real fault (perms, malformed JSON, path drift) is distinguishable
+    // from the expected pre-rollout miss during triage.
+    ctx.log?.('info', 'daytona usage VFS read failed; falling back to REST /usage', {
+      orgId,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return getJson<UsageResponse>(`${DAYTONA_API}/organizations/${orgId}/usage`, auth);
+  }
+}
+
+/** Anchor relayfile reads to the mount root (never the runner CWD). */
+function vfsClient(): IntegrationClientOptions {
+  return { relayfileMountRoot: resolveMountRoot({}) };
 }
 
 // ── tiny helpers ─────────────────────────────────────────────────────────────

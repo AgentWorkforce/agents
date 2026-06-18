@@ -144,10 +144,9 @@ async function handleScan(ctx: WorkforceCtx): Promise<void> {
 
   const failedOpsThreshold = Number(input(ctx, 'FAILED_OPS_THRESHOLD') ?? '3');
   const wakingThreshold = Number(input(ctx, 'WAKING_ENDPOINTS_THRESHOLD') ?? '2');
-  const spendingAlertPct = Number(input(ctx, 'SPENDING_ALERT_PCT') ?? '80');
 
   const root = resolveMountRoot({});
-  const signals = await evaluateSignals(ctx, root, failedOpsThreshold, wakingThreshold, spendingAlertPct);
+  const signals = await evaluateSignals(ctx, root, failedOpsThreshold, wakingThreshold);
   const hasAlerts = signals.failedOps.length > 0
     || signals.wakingEndpoints.length > 0
     || signals.advisorErrors.length > 0
@@ -193,7 +192,6 @@ async function evaluateSignals(
   mountRoot: string,
   failedOpsThreshold: number,
   wakingThreshold: number,
-  spendingAlertPct: number,
 ): Promise<AlertSignals> {
   const [operations, endpoints, advisors, consumption, spendingLimits] = await Promise.all([
     readCollection<NeonOperation>(ctx, mountRoot, 'getOperations', OPERATIONS_INDEX),
@@ -222,30 +220,31 @@ async function evaluateSignals(
   const advisorErrors = advisors.filter((issue) => issue.level === 'ERROR');
   const advisorWarns = advisors.filter((issue) => issue.level === 'WARN');
 
-  // Spending limit issues.
+  // CU spike: projects above 1M CU-seconds (~278 compute hours) are flagged
+  // as potential runaways. Only alert when no spending limit is set AND
+  // consumption is high — avoids permanent noise for orgs that simply haven't
+  // configured a cap but are well within normal usage.
+  const CU_SPIKE_THRESHOLD = 1_000_000;
+  const highCuProjects = consumption.filter((p) =>
+    typeof p.compute_unit_seconds === 'number' && p.compute_unit_seconds > CU_SPIKE_THRESHOLD
+  );
+
   const spendingIssues: string[] = [];
   for (const limit of spendingLimits) {
     if (limit.fetch_status === 'forbidden') continue; // plan doesn't expose it
-    if (limit.spending_limit_cents == null || limit.spending_limit_cents === 0) {
-      spendingIssues.push(`org ${limit.org_id ?? 'unknown'}: no spending limit set`);
-    }
-    // CU consumption check against spending limit would require cross-join
-    // with consumption data — deferred; covered by advisor issues instead.
-  }
-
-  // CU spike detection: flag projects whose compute_unit_seconds is unusually
-  // high. The adapter includes current-period totals in the consumption record.
-  // We surface any project above 1 million CU-seconds (~278 compute hours) as
-  // a potential runaway — agents running continuous queries or pooling issues
-  // typically appear here.
-  const CU_SPIKE_THRESHOLD = 1_000_000;
-  for (const project of consumption) {
-    const cu = project.compute_unit_seconds;
-    if (typeof cu === 'number' && cu > CU_SPIKE_THRESHOLD) {
+    const noLimit = limit.spending_limit_cents == null || limit.spending_limit_cents === 0;
+    if (noLimit && highCuProjects.length > 0) {
+      // Only alert when there is active high consumption to go with the missing cap.
       spendingIssues.push(
-        `project ${project.project_id ?? 'unknown'}: high CU-seconds (${cu.toLocaleString()})`
+        `org ${limit.org_id ?? 'unknown'}: no spending limit set with ${highCuProjects.length} high-consumption project(s)`
       );
     }
+  }
+
+  for (const project of highCuProjects) {
+    spendingIssues.push(
+      `project ${project.project_id ?? 'unknown'}: high CU-seconds (${(project.compute_unit_seconds as number).toLocaleString()})`
+    );
   }
 
   return {
@@ -462,19 +461,20 @@ function compactEndpoint(ep: NeonEndpoint) {
 
 function input(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona?.inputSpecs?.[name];
-  const v = process.env[spec?.env ?? name] ?? ctx.persona?.inputs?.[name] ?? spec?.default;
-  return typeof v === 'string' && v.trim() ? v : undefined;
+  const raw = process.env[spec?.env ?? name] ?? ctx.persona?.inputs?.[name] ?? spec?.default;
+  const v = raw != null ? String(raw).trim() : '';
+  return v || undefined;
 }
 
 async function loadMemory(ctx: WorkforceCtx): Promise<MonitorMemory> {
   try {
-    const raw = await ctx.memory.recall('neon-monitor-state');
-    return (raw as MonitorMemory | null) ?? {};
+    const [item] = await ctx.memory.recall('neon monitor state', { tags: ['neon-monitor:state'], limit: 1 });
+    return item ? (JSON.parse(item.content) as MonitorMemory) : {};
   } catch {
     return {};
   }
 }
 
 async function saveMemory(ctx: WorkforceCtx, state: MonitorMemory): Promise<void> {
-  await ctx.memory.save('neon-monitor-state', state);
+  await ctx.memory.save(JSON.stringify(state), { tags: ['neon-monitor:state'], scope: 'workspace' });
 }

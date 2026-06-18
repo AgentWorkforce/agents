@@ -5,10 +5,15 @@ import { parseIntegrations } from '@agentworkforce/persona-kit';
 
 import {
   announceReadyOnce,
+  commentBody,
+  commenterLogin,
+  conflictResolveHarnessPrompt,
   deriveReviewDecision,
   evaluateMergeOnGreenState,
   handleSlackMergeRequest,
+  isAuthorizedConflictCommander,
   labelNames,
+  matchesConflictDirective,
   parseSlackMergeRequest,
   postSlackPrUpdate,
   prReadyStateAllowsHumanReview,
@@ -18,6 +23,21 @@ import {
   reviewAuthorAllowlistDecision,
   rollupFromCheckSummary,
 } from '../.test-build/review/agent.js';
+
+function conflictCtx({ approvers, reviewAuthors } = {}) {
+  return {
+    persona: {
+      inputSpecs: {
+        APPROVERS: { env: '__TEST_APPROVERS__' },
+        REVIEW_AUTHORS: { env: '__TEST_REVIEW_AUTHORS__' },
+      },
+      inputs: {
+        ...(approvers ? { APPROVERS: approvers } : {}),
+        ...(reviewAuthors ? { REVIEW_AUTHORS: reviewAuthors } : {}),
+      },
+    },
+  };
+}
 
 test('reviewAuthorAllowlistDecision lets configured authors through', () => {
   assert.equal(reviewAuthorAllowlistDecision(new Set(['willwashburn']), 'willwashburn'), null);
@@ -124,6 +144,100 @@ test('readPr surfaces the draft flag so the draft gate can hold off', () => {
     },
     repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
   })?.draft, false);
+});
+
+test('matchesConflictDirective fires only on an explicit fix/resolve-conflicts ask', () => {
+  assert.equal(matchesConflictDirective('@relay fix conflicts'), true);
+  assert.equal(matchesConflictDirective('hey @relay-bot RESOLVE conflict now'), true);
+  assert.equal(matchesConflictDirective('@relay resolve conflicts please'), true);
+  // The directive words must be adjacent — filler between them does not fire,
+  // so a force-update is never triggered by a loose mention.
+  assert.equal(matchesConflictDirective('@relay-bot please RESOLVE the conflict'), false);
+  // A passing mention or a plain observation must NOT trigger a force-update.
+  assert.equal(matchesConflictDirective('@relay this PR has a conflict'), false);
+  assert.equal(matchesConflictDirective('there is a merge conflict here'), false);
+  assert.equal(matchesConflictDirective(''), false);
+});
+
+test('commentBody / commenterLogin read the issue_comment payload defensively', () => {
+  const payload = { comment: { body: '@relay fix conflicts', user: { login: 'KhaliqGant' } } };
+  assert.equal(commentBody(payload), '@relay fix conflicts');
+  assert.equal(commenterLogin(payload), 'khaliqgant');
+  assert.equal(commentBody({}), '');
+  assert.equal(commenterLogin({}), '');
+});
+
+test('readPr reads a PR from an issue_comment payload when the issue is a pull request', () => {
+  const pr = readPr({
+    action: 'created',
+    issue: {
+      number: 77,
+      html_url: 'https://github.com/AgentWorkforce/agents/pull/77',
+      user: { login: 'WillWashburn' }, // the PR opener — must win as author
+      state: 'open',
+      pull_request: { url: 'https://api.github.com/.../pulls/77' },
+    },
+    comment: { body: '@relay fix conflicts', user: { login: 'KhaliqGant' } },
+    repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
+    sender: { login: 'KhaliqGant' },
+  });
+  assert.equal(pr?.number, 77);
+  assert.equal(pr?.author, 'WillWashburn');
+  assert.equal(pr?.url, 'https://github.com/AgentWorkforce/agents/pull/77');
+});
+
+test('readPr ignores an issue_comment on a plain issue (no pull_request marker)', () => {
+  assert.equal(readPr({
+    action: 'created',
+    issue: { number: 5, html_url: 'https://github.com/AgentWorkforce/agents/issues/5' },
+    comment: { body: '@relay fix conflicts' },
+    repository: { name: 'agents', owner: { login: 'AgentWorkforce' } },
+  }), undefined);
+});
+
+test('isAuthorizedConflictCommander never takes the order from a bot', () => {
+  const pr = { owner: 'AgentWorkforce', repo: 'agents', number: 1, author: 'someone' };
+  assert.equal(isAuthorizedConflictCommander(conflictCtx(), 'relay-conflict-autofix[bot]', pr), false);
+  assert.equal(isAuthorizedConflictCommander(conflictCtx(), '', pr), false);
+});
+
+test('isAuthorizedConflictCommander is open when no trust lists are configured', () => {
+  const pr = { owner: 'AgentWorkforce', repo: 'agents', number: 1, author: 'willwashburn' };
+  assert.equal(isAuthorizedConflictCommander(conflictCtx(), 'anyone', pr), true);
+});
+
+test('isAuthorizedConflictCommander gates on APPROVERS/REVIEW_AUTHORS and the PR author', () => {
+  const pr = { owner: 'AgentWorkforce', repo: 'agents', number: 1, author: 'WillWashburn' };
+  // PR author may always fix their own PR's conflicts even if not on a list.
+  assert.equal(isAuthorizedConflictCommander(conflictCtx({ approvers: 'khaliqgant' }), 'willwashburn', pr), true);
+  // A listed approver qualifies.
+  assert.equal(isAuthorizedConflictCommander(conflictCtx({ approvers: 'khaliqgant' }), 'khaliqgant', pr), true);
+  // A REVIEW_AUTHORS member qualifies too.
+  assert.equal(isAuthorizedConflictCommander(conflictCtx({ reviewAuthors: 'octocat' }), 'octocat', pr), true);
+  // A stranger, with a list configured, does not.
+  assert.equal(isAuthorizedConflictCommander(conflictCtx({ approvers: 'khaliqgant' }), 'randuser', pr), false);
+});
+
+test('conflictResolveHarnessPrompt keeps the no-git boundary and the safety/escape-hatch rules', () => {
+  const prompt = conflictResolveHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 99 });
+  // Reads cloud's merged tree + conflicted-file manifest.
+  assert.match(prompt, /\.workforce\/conflicted-files\.txt/);
+  assert.match(prompt, /cloud has already merged the base branch into the working tree/);
+  // No git in the harness; cloud finalizes + pushes the merge.
+  assert.match(prompt, /Do NOT use git or the gh CLI/);
+  assert.match(prompt, /Cloud finalizes the merge commit and pushes/);
+  // Combine both sides; strip every marker.
+  assert.match(prompt, /preserves BOTH sides' intent/);
+  assert.match(prompt, /leave no <<<<<<<, =======, or >>>>>>> behind/);
+  // Same safety guardrails as review.
+  assert.match(prompt, /fail-closed state into a\s+fail-open one/);
+  assert.match(prompt, /Never weaken or delete a test/);
+  assert.match(prompt, /Never touch lifecycle, termination, reaper/);
+  // Human-judgment escape hatch → cloud aborts the merge.
+  assert.match(prompt, /## Unresolved conflicts/);
+  assert.match(prompt, /Cloud aborts the\s+merge/);
+  // CI-deep verification of the merged tree.
+  assert.match(prompt, /verify the merged tree the way CI does/);
 });
 
 test('labelNames normalizes github label arrays defensively', () => {

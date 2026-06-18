@@ -20,16 +20,13 @@
 import {
   defineAgent,
   encodeSegment,
+  listJsonFiles,
   readJsonFile,
   resolveMountRoot,
   type IntegrationClientOptions,
   type WorkforceCtx
 } from '@agentworkforce/runtime';
 import { githubClient, slackClient } from '@relayfile/relay-helpers';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-
-const execFileAsync = promisify(execFile);
 
 export interface Pr {
   owner: string;
@@ -516,19 +513,10 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
 
 async function verifyReadyForHumanReview(ctx: WorkforceCtx, pr: Pr): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync('gh', [
-      'pr',
-      'view',
-      String(pr.number),
-      '--repo',
-      `${pr.owner}/${pr.repo}`,
-      '--json',
-      'state,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid',
-    ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
-    const state = parsePrReadyState(stdout);
-    // Populate the head SHA from GitHub's authoritative current head. Some
-    // webhook payloads (e.g. check_run.completed) don't carry it, and without a
-    // SHA the ready-announce dedupe can't key on the commit and would re-ping.
+    const state = await readPrReviewState(pr);
+    // Populate the head SHA from the adapter's projected head. Some webhook
+    // payloads (e.g. check_run.completed) don't carry it, and without a SHA the
+    // ready-announce dedupe can't key on the commit and would re-ping.
     if (typeof state.headRefOid === 'string' && state.headRefOid.trim()) {
       pr.headSha = state.headRefOid.trim();
     }
@@ -567,22 +555,133 @@ interface PullRequestReadyState {
   url?: unknown;
 }
 
-function parsePrReadyState(stdout: string): PullRequestReadyState {
-  const parsed = JSON.parse(stdout) as unknown;
-  return parsed && typeof parsed === 'object' ? parsed as PullRequestReadyState : {};
+async function readMergeOnGreenState(_ctx: WorkforceCtx, pr: Pr): Promise<PullRequestReadyState> {
+  return readPrReviewState(pr);
 }
 
-async function readMergeOnGreenState(ctx: WorkforceCtx, pr: Pr): Promise<PullRequestReadyState> {
-  const { stdout } = await execFileAsync('gh', [
-    'pr',
-    'view',
-    String(pr.number),
-    '--repo',
-    `${pr.owner}/${pr.repo}`,
-    '--json',
-    'state,isDraft,labels,mergeable,mergeStateStatus,reviewRequests,latestReviews,statusCheckRollup,headRefOid,url',
-  ], { cwd: ctx.sandbox.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 });
-  return parsePrReadyState(stdout);
+// ── PR review state from the GitHub VFS (no gh CLI) ──────────────────────────
+// `gh pr view` is unavailable here: the sandbox snapshot ships no gh binary, and
+// the harness never shells to git/gh (the cloud writeback commits file edits).
+// Rebuild the same PullRequestReadyState the gates consume from the GitHub
+// adapter's VFS projection instead:
+//   • pulls/{n}/meta.json            → state, draft, labels, head.sha
+//   • pulls/{n}/checks/_summary.json → the adapter's aggregated CI rollup
+//   • pulls/{n}/reviews/*.json       → the latest review per author
+// The adapter does NOT project mergeability (GitHub computes it asynchronously
+// and it isn't ingested), so the merge-conflict check is delegated to the merge
+// API: mergePullRequest() returns merged:false on a dirty PR and mergePr throws
+// rather than land it. Every read fails CLOSED — a missing/empty projection
+// yields a state the gates treat as not-ready / pending, never a green light.
+async function readPrReviewState(pr: Pr): Promise<PullRequestReadyState> {
+  const [meta, checks, reviews] = await Promise.all([
+    loadPrMeta(pr),
+    loadCheckSummary(pr),
+    loadReviews(pr),
+  ]);
+  const headSha = readMetaHeadSha(meta);
+  return {
+    state: typeof meta?.state === 'string' ? meta.state : undefined,
+    isDraft: meta?.draft === true,
+    // The VFS carries no mergeability field, so default to MERGEABLE rather than
+    // gate on a value we can't read. A real conflict never auto-merges: the
+    // merge API rejects it and mergePr throws.
+    mergeable: 'MERGEABLE',
+    // Drafts surface via isDraft; mirror onto mergeStateStatus too so the ready
+    // gate (which keys on DRAFT) still holds a draft back.
+    ...(meta?.draft === true ? { mergeStateStatus: 'DRAFT' } : {}),
+    labels: meta?.labels,
+    statusCheckRollup: rollupFromCheckSummary(checks),
+    latestReviews: reviews,
+    reviewDecision: deriveReviewDecision(reviews),
+    ...(headSha ? { headRefOid: headSha } : {}),
+  };
+}
+
+/** The adapter's per-PR aggregated check status at `…/pulls/{n}/checks/_summary.json`. */
+interface CheckSummary {
+  total?: number;
+  passed?: number;
+  failed?: number;
+  pending?: number;
+  conclusion?: string;
+}
+
+async function loadCheckSummary(pr: Pr): Promise<CheckSummary | undefined> {
+  try {
+    return await readJsonFile<CheckSummary>(
+      vfsClient(),
+      'github',
+      'getChecks',
+      `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/pulls/${pr.number}/checks/_summary.json`
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+async function loadReviews(pr: Pr): Promise<Array<Record<string, unknown>>> {
+  try {
+    const files = await listJsonFiles<Record<string, unknown>>(
+      vfsClient(),
+      'github',
+      'listReviews',
+      `/github/repos/${encodeSegment(pr.owner)}/${encodeSegment(pr.repo)}/pulls/${pr.number}/reviews`
+    );
+    return files.map((file) => file.value);
+  } catch {
+    return [];
+  }
+}
+
+/** The PR head SHA from the meta.json projection's `head: { sha }`. */
+function readMetaHeadSha(meta: PrMeta | undefined): string | undefined {
+  const head = meta?.head;
+  if (head && typeof head === 'object' && typeof (head as { sha?: unknown }).sha === 'string') {
+    return ((head as { sha: string }).sha).trim() || undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Turn the adapter's aggregated check counts into the statusCheckRollup shape
+ * the gate evaluators already understand. The decision keys on the counts, not
+ * on per-check files (which can linger from a prior head), so the gate matches
+ * GitHub's own "is everything done and green" verdict:
+ *   • no checks ingested yet (total 0 / missing) → empty rollup → the evaluators
+ *     fall through to mergeStateStatus, which we never report CLEAN → HOLD.
+ *   • any failing check  → a FAILURE entry → blocked.
+ *   • any pending check  → an IN_PROGRESS entry → pending.
+ *   • all complete+passing → a single SUCCESS entry → green.
+ */
+export function rollupFromCheckSummary(summary: CheckSummary | undefined): Array<Record<string, unknown>> {
+  const total = typeof summary?.total === 'number' ? summary.total : 0;
+  if (!summary || total === 0) return [];
+  const failed = typeof summary.failed === 'number' ? summary.failed : 0;
+  const pending = typeof summary.pending === 'number' ? summary.pending : 0;
+  const passed = typeof summary.passed === 'number' ? summary.passed : 0;
+  const rollup: Array<Record<string, unknown>> = [];
+  if (failed > 0) {
+    rollup.push({ name: `${failed} failing check${failed === 1 ? '' : 's'}`, status: 'COMPLETED', conclusion: 'FAILURE' });
+  }
+  if (pending > 0) {
+    rollup.push({ name: `${pending} pending check${pending === 1 ? '' : 's'}`, status: 'IN_PROGRESS', conclusion: null });
+  }
+  if (failed === 0 && pending === 0) {
+    rollup.push({ name: `${passed} check${passed === 1 ? '' : 's'}`, status: 'COMPLETED', conclusion: 'SUCCESS' });
+  }
+  return rollup;
+}
+
+/**
+ * Derive gh's `reviewDecision` from the projected reviews: if any author's
+ * latest review requested changes, the PR isn't the human's turn. Mirrors the
+ * one reviewDecision value the ready gate keys on (CHANGES_REQUESTED).
+ */
+export function deriveReviewDecision(reviews: Array<Record<string, unknown>>): string | undefined {
+  for (const [, review] of latestReviewsByAuthor(reviews)) {
+    if (normalizeState(review.state) === 'CHANGES_REQUESTED') return 'CHANGES_REQUESTED';
+  }
+  return undefined;
 }
 
 /** Whether the PR is still open. A missing `state` is treated as open so the

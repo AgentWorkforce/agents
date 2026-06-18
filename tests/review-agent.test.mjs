@@ -5,6 +5,7 @@ import { parseIntegrations } from '@agentworkforce/persona-kit';
 
 import {
   announceReadyOnce,
+  deriveReviewDecision,
   evaluateMergeOnGreenState,
   handleSlackMergeRequest,
   labelNames,
@@ -15,6 +16,7 @@ import {
   resolveAuthorLogin,
   reviewHarnessPrompt,
   reviewAuthorAllowlistDecision,
+  rollupFromCheckSummary,
 } from '../.test-build/review/agent.js';
 
 test('reviewAuthorAllowlistDecision lets configured authors through', () => {
@@ -197,6 +199,57 @@ test('evaluateMergeOnGreenState requires label, green checks, and requested bot 
       { author: { login: 'gemini-code-assist[bot]', type: 'Bot' }, state: 'CHANGES_REQUESTED', submittedAt: '2026-06-10T00:00:00Z' },
     ],
   }).outcome, 'blocked');
+});
+
+test('rollupFromCheckSummary maps the adapter check summary to gate-ready rollups', () => {
+  // No checks ingested yet (missing / total 0) → empty rollup. The gates then
+  // fall through to mergeStateStatus (which the VFS path never reports CLEAN),
+  // so the PR HOLDS instead of going green on absent CI.
+  assert.deepEqual(rollupFromCheckSummary(undefined), []);
+  assert.deepEqual(rollupFromCheckSummary({ total: 0, passed: 0, failed: 0, pending: 0 }), []);
+
+  // All complete and passing → one SUCCESS entry the evaluators read as green.
+  const green = rollupFromCheckSummary({ total: 3, passed: 3, failed: 0, pending: 0 });
+  assert.equal(evaluateMergeOnGreenState({
+    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE',
+    labels: [{ name: 'merge-on-green' }], statusCheckRollup: green,
+  }).outcome, 'ready');
+
+  // A pending check → IN_PROGRESS → the merge-on-green gate stays pending.
+  const pending = rollupFromCheckSummary({ total: 2, passed: 1, failed: 0, pending: 1 });
+  assert.equal(evaluateMergeOnGreenState({
+    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE',
+    labels: [{ name: 'merge-on-green' }], statusCheckRollup: pending,
+  }).outcome, 'pending');
+
+  // A failing check → FAILURE → blocked.
+  const failing = rollupFromCheckSummary({ total: 2, passed: 1, failed: 1, pending: 0 });
+  assert.equal(evaluateMergeOnGreenState({
+    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE',
+    labels: [{ name: 'merge-on-green' }], statusCheckRollup: failing,
+  }).outcome, 'blocked');
+
+  // Green checks also satisfy the human-review ready gate.
+  assert.equal(prReadyStateAllowsHumanReview({
+    state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: green,
+  }), true);
+});
+
+test('deriveReviewDecision flags CHANGES_REQUESTED from the latest review per author', () => {
+  // No reviews → undefined (not blocking).
+  assert.equal(deriveReviewDecision([]), undefined);
+
+  // A later APPROVED supersedes an earlier CHANGES_REQUESTED from the same author.
+  assert.equal(deriveReviewDecision([
+    { author: { login: 'coderabbitai[bot]' }, state: 'CHANGES_REQUESTED', submitted_at: '2026-06-10T00:00:00Z' },
+    { author: { login: 'coderabbitai[bot]' }, state: 'APPROVED', submitted_at: '2026-06-11T00:00:00Z' },
+  ]), undefined);
+
+  // An outstanding CHANGES_REQUESTED (the author's latest) blocks.
+  assert.equal(deriveReviewDecision([
+    { author: { login: 'willwashburn' }, state: 'APPROVED', submitted_at: '2026-06-10T00:00:00Z' },
+    { author: { login: 'coderabbitai[bot]' }, state: 'CHANGES_REQUESTED', submitted_at: '2026-06-11T00:00:00Z' },
+  ]), 'CHANGES_REQUESTED');
 });
 
 test('parseSlackMergeRequest extracts a GitHub PR URL from merge requests', () => {

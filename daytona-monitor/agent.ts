@@ -14,6 +14,7 @@ import {
   defineAgent,
   isCronTickEvent,
   isRelaycastMessageEvent,
+  listJsonFiles,
   readJsonFile,
   resolveMountRoot,
   type AgentEvent,
@@ -21,8 +22,13 @@ import {
   type WorkforceCtx
 } from '@agentworkforce/runtime';
 import { slackClient } from '@relayfile/relay-helpers';
-// Adapter-published path for the org usage record (/daytona/usage/<orgId>.json).
-import { daytonaUsagePath } from '@relayfile/adapter-daytona';
+// Adapter-published paths for the VFS records:
+//   • /daytona/usage/<orgId>.json    (org quota/usage, polled hourly)
+//   • /daytona/sandboxes/<id>.json   (one record per sandbox, materialized from
+//                                     sandbox.created / sandbox.state.updated)
+// `daytonaSandboxPath(id)` returns the per-record canonical path; we derive the
+// directory (`/daytona/sandboxes`) from it so the layout stays adapter-owned.
+import { daytonaSandboxPath, daytonaUsagePath } from '@relayfile/adapter-daytona';
 // Fresh, auto-refreshed Daytona Auth0 access token (auth once → refreshed
 // forever). Owned by ./lib/daytona-auth.ts; persists rotated refresh tokens.
 import { getDaytonaAccessToken } from './lib/daytona-auth.js';
@@ -266,14 +272,47 @@ async function handleUsageScan(ctx: WorkforceCtx): Promise<void> {
   const quotaPct = numInput(ctx, 'QUOTA_ALERT_PCT', 80);
   const staleHours = numInput(ctx, 'STALE_HOURS', 12);
 
-  const token = await getDaytonaAccessToken(orgId);
-  const auth = { Authorization: `Bearer ${token}`, [ORG_HEADER]: orgId, Accept: 'application/json' };
+  // Token is OPTIONAL. The cloud is supposed to inject DAYTONA_ACCESS_TOKEN into
+  // the sandbox, but doesn't yet (cloud#2287); when it's absent and there's no
+  // local `daytona login` config either, getDaytonaAccessToken() throws. Capture
+  // that as `token = null` and keep going on the token-free VFS path rather than
+  // aborting the whole run silently.
+  let token: string | null = null;
+  try {
+    token = await getDaytonaAccessToken(orgId);
+  } catch (err) {
+    ctx.log?.('warn', 'daytona auth unavailable; continuing on VFS-only path', {
+      orgId,
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
+  const auth = token
+    ? { Authorization: `Bearer ${token}`, [ORG_HEADER]: orgId, Accept: 'application/json' }
+    : null;
 
+  // Read usage (VFS-first, REST fallback only when we have a token) and the
+  // sandbox list (VFS-first, REST fallback only when we have a token). Either
+  // source can come back empty/undefined; we only bail loudly when we got
+  // NEITHER signal — see below.
   const usage = await readUsage(ctx, orgId, auth);
-  const sandboxes = await getAllSandboxes(auth);
+  const sandboxes = await readSandboxes(ctx, auth);
+
+  // Could not reach Daytona at all: no usage record AND no sandbox records (no
+  // VFS data) AND no token to hit the REST API. Post one clear message instead
+  // of dying invisibly (the run otherwise teardown-badges as `Terminated`).
+  if (usage == null && sandboxes == null) {
+    const res = await slackClient().post(
+      channel,
+      ":warning: *Daytona monitor* can't reach Daytona — no DAYTONA_ACCESS_TOKEN was injected into the sandbox (tracked in cloud#2287)."
+    );
+    if (!res.ts) throw new Error(`Slack post to ${channel} got no writeback receipt (silent drop)`);
+    return;
+  }
 
   const last = await loadSnapshot(ctx);
-  const { alerts, running } = evaluateSignals(usage, sandboxes, {
+  const usageForSignals = usage ?? {};
+  const sandboxesForSignals = sandboxes ?? [];
+  const { alerts, running } = evaluateSignals(usageForSignals, sandboxesForSignals, {
     quotaPct,
     staleHours,
     now: Date.now(),
@@ -396,12 +435,16 @@ async function getAllSandboxes(headers: Record<string, string>): Promise<Sandbox
  * direct REST call), and fall back to the Daytona REST API while the adapter's
  * usage sync is still rolling out (relayfile-adapters#155). `evaluateSignals`
  * sees the same `UsageResponse` shape either way.
+ *
+ * Returns `null` when usage is unreachable — no mounted record AND no token to
+ * hit REST — so the caller can decide whether it has ANY signal to act on
+ * (see handleUsageScan's loud-failure path).
  */
 async function readUsage(
   ctx: WorkforceCtx,
   orgId: string,
-  auth: Record<string, string>
-): Promise<UsageResponse> {
+  auth: Record<string, string> | null
+): Promise<UsageResponse | null> {
   try {
     return await readJsonFile<UsageResponse>(vfsClient(), 'daytona', 'getUsage', daytonaUsagePath(orgId));
   } catch (err) {
@@ -413,8 +456,85 @@ async function readUsage(
       orgId,
       error: err instanceof Error ? err.message : String(err)
     });
-    return getJson<UsageResponse>(`${DAYTONA_API}/organizations/${orgId}/usage`, auth);
+    // No token → can't hit REST. Report "no usage signal" instead of throwing.
+    if (!auth) return null;
+    try {
+      return await getJson<UsageResponse>(`${DAYTONA_API}/organizations/${orgId}/usage`, auth);
+    } catch (restErr) {
+      ctx.log?.('warn', 'daytona usage REST fallback failed', {
+        orgId,
+        error: restErr instanceof Error ? restErr.message : String(restErr)
+      });
+      return null;
+    }
   }
+}
+
+// Directory holding the per-sandbox VFS records — derived from the adapter's own
+// `daytonaSandboxPath` helper so the layout (/daytona/sandboxes/<id>.json) stays
+// adapter-owned rather than hardcoded here.
+const DAYTONA_SANDBOXES_DIR = daytonaSandboxPath('x').replace(/\/[^/]+$/, '');
+
+/**
+ * Full sandbox list. Prefer the @relayfile/adapter-daytona VFS mount
+ * (/daytona/sandboxes/<id>.json, one record per sandbox materialized from the
+ * sandbox.created / sandbox.state.updated webhooks — token-free), and fall back
+ * to the REST list endpoint only when we hold a token. Each VFS record carries
+ * the normalized top-level fields (id/state/errorReason/timestamps) plus the
+ * raw provider body under `payload`; we coerce both shapes into our canonical
+ * `Sandbox` via `normalizeSandbox`.
+ *
+ * Returns `null` when sandboxes are unreachable — no mounted records AND no
+ * token to hit REST — so the caller can detect "no signal at all".
+ */
+async function readSandboxes(
+  ctx: WorkforceCtx,
+  auth: Record<string, string> | null
+): Promise<Sandbox[] | null> {
+  try {
+    const files = await listJsonFiles<Record<string, unknown>>(
+      vfsClient(),
+      'daytona',
+      'listSandboxes',
+      DAYTONA_SANDBOXES_DIR
+    );
+    // Skip adapter housekeeping records (_index.json) — they aren't sandboxes.
+    const records = files.filter((f) => !/\/_[^/]*\.json$/.test(f.path));
+    if (records.length > 0) {
+      return records.map((f) => sandboxFromVfsRecord(f.value));
+    }
+    // Empty mount tree: fall through to REST when we have a token, else report
+    // no signal. (A live-but-empty org is indistinguishable from a not-yet-synced
+    // mount here; REST is authoritative when reachable.)
+  } catch (err) {
+    ctx.log?.('info', 'daytona sandboxes VFS read failed; falling back to REST /sandbox', {
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
+  if (!auth) return null;
+  try {
+    return await getAllSandboxes(auth);
+  } catch (restErr) {
+    ctx.log?.('warn', 'daytona sandboxes REST fallback failed', {
+      error: restErr instanceof Error ? restErr.message : String(restErr)
+    });
+    return null;
+  }
+}
+
+/**
+ * Coerce a VFS sandbox record into our canonical `Sandbox`. The adapter stores
+ * normalized top-level fields (id/state/errorReason/timestamps) alongside the
+ * raw provider body under `payload`; `normalizeSandbox` already reads every
+ * field shape Daytona has used, so we merge the record over its payload and run
+ * it through the same normalizer the webhook path uses.
+ */
+function sandboxFromVfsRecord(record: Record<string, unknown>): Sandbox {
+  const payload =
+    record.payload && typeof record.payload === 'object'
+      ? (record.payload as Record<string, unknown>)
+      : {};
+  return normalizeSandbox({ ...payload, ...record });
 }
 
 /** Anchor relayfile reads to the mount root (never the runner CWD). */

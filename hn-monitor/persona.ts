@@ -8,7 +8,8 @@ export default definePersona({
   id: 'hn-monitor',
   intent: 'relay-orchestrator',
   tags: ['discovery'],
-  description: 'Scans Hacker News a few times a day for topics you care about and posts a summary to Slack.',
+  description:
+    'Scans Hacker News a few times a day for topics you care about and posts a summary to Slack. Retains the last ~30 days of digests — DM the agent to ask questions about what it has recently posted.',
   cloud: true,
 
   // `slack` gives the handler the ctx.slack client to post the digest.
@@ -41,7 +42,11 @@ export default definePersona({
   systemPrompt: 'Summarize Hacker News stories into a short, skimmable Slack digest.',
   harnessSettings: { reasoning: 'low', timeoutSeconds: 120 },
 
-  memory: { enabled: true, scopes: ['workspace'], ttlDays: 7 },
+  // Inbox so a user can DM the agent and ask about recently posted digests.
+  relay: { inbox: ['@self'] },
+  // 30-day retention gives the rolling window of posted digests for the Q&A
+  // path for free — recalled `hn-monitor:post` records age out after ttlDays.
+  memory: { enabled: true, scopes: ['workspace'], ttlDays: 30 },
 
   onEvent: './agent.ts'
 });

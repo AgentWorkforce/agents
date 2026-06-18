@@ -74,14 +74,15 @@ export default defineAgent({
       await handleInboxMessage(ctx, event);
       return;
     }
-    // Real-time path: a Monitoring incident webhook — alert the moment a policy
-    // fires, instead of waiting for the next hourly tick.
-    if (isGcpMonitoringEvent(event)) {
-      await handleMonitoringWebhook(ctx, event);
-      return;
-    }
-    // Clock path: the full hourly state scan.
-    if (isCronTickEvent(event)) {
+    // Real-time path: a Monitoring incident webhook — run the SAME full scan as
+    // the hourly tick, just sooner. Our scan is pure VFS reads (no GCP token, no
+    // pagination), so a per-webhook scan is cheap; routing through handleScan
+    // means the webhook and the cron tick share one snapshot, so we never
+    // re-alert an unchanged condition and a `closed` incident clears the dedup
+    // signature the moment the alerts mount no longer shows it firing. (Reading
+    // the mount also sidesteps the nested Monitoring incident payload shape —
+    // the adapter is the source of truth, not the webhook envelope.)
+    if (isGcpMonitoringEvent(event) || isCronTickEvent(event)) {
       await handleScan(ctx);
       return;
     }
@@ -139,62 +140,7 @@ function isGcpMonitoringEvent(event: AgentEvent): boolean {
   return typeof event.type === 'string' && event.type.startsWith('gcp.monitoring.');
 }
 
-/**
- * Real-time webhook handler. On a Monitoring incident we re-read the alert
- * mount (falling back to the webhook payload), run it through the same signal
- * formatting as the hourly scan, and post immediately only when an alert is
- * firing. A closed/resolved incident produces no alert — we stay silent.
- */
-async function handleMonitoringWebhook(ctx: WorkforceCtx, event: AgentEvent): Promise<void> {
-  const channel = input(ctx, 'SLACK_CHANNEL');
-  if (!channel) throw new Error('SLACK_CHANNEL is required');
-  const project = input(ctx, 'GCP_PROJECT_ID') ?? DEFAULT_PROJECT_ID;
-
-  const fromPayload = await extractAlert(event);
-  const alerts = fromPayload ? [fromPayload] : await readCollection<GcpAlert>(ctx, 'getAlerts', ALERTS_INDEX);
-
-  const { alerts: lines } = evaluateSignals([], alerts, undefined, {
-    billingAlertUsd: numInput(ctx, 'BILLING_ALERT_USD', 500)
-  });
-  if (lines.length === 0) {
-    ctx.log?.('info', 'gcp monitoring webhook: no firing alert', { type: event.type });
-    return;
-  }
-
-  const res = await slackClient().post(
-    channel,
-    `:satellite: *GCP watcher* (real-time) — project \`${project}\`\n${lines.join('\n')}`
-  );
-  if (!res.ts) throw new Error(`Slack post to ${channel} got no writeback receipt (silent drop)`);
-}
-
-/** Pull the alert record carried in the webhook envelope (`expand('full')`). */
-async function extractAlert(event: AgentEvent): Promise<GcpAlert | undefined> {
-  try {
-    const full = (await event.expand('full')) as { data?: unknown } | undefined;
-    const data = full?.data;
-    if (data && typeof data === 'object') return normalizeAlert(data as Record<string, unknown>);
-  } catch {
-    // expansion is best-effort; fall through to the VFS read.
-  }
-  return undefined;
-}
-
-/** Coerce a raw Monitoring incident webhook record into our canonical shape. */
-function normalizeAlert(raw: Record<string, unknown>): GcpAlert {
-  const str = (...vals: unknown[]): string | undefined =>
-    vals.find((v): v is string => typeof v === 'string' && v.length > 0);
-  const state = str(raw.state, raw.newState);
-  return {
-    policyId: str(raw.policyId, raw.policy_name, raw.policyName),
-    displayName: str(raw.displayName, raw.display_name, raw.conditionName, raw.condition_name),
-    firing: state ? state.toLowerCase() === 'open' : raw.firing === true,
-    conditionName: str(raw.conditionName, raw.condition_name),
-    startedAt: str(raw.startedAt, raw.started_at)
-  };
-}
-
-/** The hourly full state scan. */
+/** The full state scan — run on the hourly tick and on each Monitoring webhook. */
 async function handleScan(ctx: WorkforceCtx): Promise<void> {
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (!channel) throw new Error('SLACK_CHANNEL is required');

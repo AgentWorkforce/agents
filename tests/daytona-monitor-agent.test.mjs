@@ -742,6 +742,99 @@ test('a healthy sandbox.state.updated webhook stays silent (no Slack post)', asy
   });
 });
 
+// ── inbox (chat) path ────────────────────────────────────────────────────────
+
+function relaycastMessageEvent(text) {
+  return envelopeToAgentEvent({
+    id: 'evt-inbox-test',
+    workspace: 'ws-test',
+    type: 'relaycast.message',
+    occurredAt: new Date(FIXED_NOW).toISOString(),
+    resource: { id: 'msg-1', text },
+    data: { text, message: { text } },
+  });
+}
+
+function inboxCtx(llmAnswer) {
+  const logs = [];
+  return {
+    persona: {
+      inputs: { SLACK_CHANNEL: 'C-daytona-alerts', DAYTONA_ORG_ID: ORG_ID },
+      inputSpecs: {},
+    },
+    memory: { recall: async () => [], save: async () => ({ id: 'unused' }) },
+    log: (level, message, attrs) => logs.push({ level, message, attrs }),
+    llm: { complete: async (prompt) => llmAnswer ?? `Mock answer for: ${prompt.slice(0, 50)}` },
+    _logs: logs,
+  };
+}
+
+test('inbox chat path fetches Daytona data and posts LLM answer to Slack', async (t) => {
+  await withWebhookEnv(async (mountRoot) => {
+    t.mock.method(Date, 'now', () => FIXED_NOW);
+    const fetchCalls = [];
+    t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+      const href = String(url);
+      fetchCalls.push(href);
+      assert.equal(init.headers.Authorization, 'Bearer cached-daytona-access');
+
+      if (href === `https://app.daytona.io/api/organizations/${ORG_ID}/usage`) {
+        return Response.json({ regionUsage: [{ regionId: 'us', totalCpuQuota: 10, currentCpuUsage: 5 }] });
+      }
+      if (href === 'https://app.daytona.io/api/sandbox') {
+        return Response.json({ items: [{ id: 'ok-1', name: 'ok-1', state: 'started' }] });
+      }
+      assert.fail(`unexpected fetch: ${href}`);
+    });
+
+    const slackPayloadPromise = answerSlackWriteback(mountRoot);
+    const ctxObj = inboxCtx('All sandboxes are healthy. 1 running, 0 errors.');
+    const event = relaycastMessageEvent('How are our sandboxes doing?');
+    await agent.handler(ctxObj, event);
+    const slackPayload = await slackPayloadPromise;
+
+    assert.deepEqual(fetchCalls, [
+      `https://app.daytona.io/api/organizations/${ORG_ID}/usage`,
+      'https://app.daytona.io/api/sandbox',
+    ]);
+    assert.equal(slackPayload.text, 'All sandboxes are healthy. 1 running, 0 errors.');
+  });
+});
+
+test('inbox chat path skips empty messages', async (t) => {
+  await withWebhookEnv(async () => {
+    const ctxObj = inboxCtx();
+    const event = relaycastMessageEvent('   ');
+    await agent.handler(ctxObj, event);
+
+    assert.ok(
+      ctxObj._logs.some((l) => l.message.includes('no text')),
+      'expected a logged skip for empty message',
+    );
+  });
+});
+
+test('inbox chat path still posts when Daytona fetch fails', async (t) => {
+  await withWebhookEnv(async (mountRoot) => {
+    t.mock.method(Date, 'now', () => FIXED_NOW);
+    t.mock.method(globalThis, 'fetch', async () => {
+      throw new Error('network down');
+    });
+
+    const slackPayloadPromise = answerSlackWriteback(mountRoot);
+    const ctxObj = inboxCtx('I could not fetch live data, but here is what I know.');
+    const event = relaycastMessageEvent('Status?');
+    await agent.handler(ctxObj, event);
+    const slackPayload = await slackPayloadPromise;
+
+    assert.equal(slackPayload.text, 'I could not fetch live data, but here is what I know.');
+    assert.ok(
+      ctxObj._logs.some((l) => l.message.includes('failed to fetch Daytona data')),
+      'expected a warning log for fetch failure',
+    );
+  });
+});
+
 // Config-invariant pin (creating-cloud-persona §1/§6): readUsage reads the
 // adapter usage record from /daytona/usage/**, so that subtree MUST be mounted.
 // Cloud derives mounts only from triggers + each integration's scope; a missing

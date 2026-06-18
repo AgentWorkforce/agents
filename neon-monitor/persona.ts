@@ -83,12 +83,10 @@ export default definePersona({
       description: 'Alert when the number of endpoints currently in a waking/suspended-thrash state exceeds this count.',
       env: 'WAKING_ENDPOINTS_THRESHOLD',
       default: '2'
-    },
-    SPENDING_ALERT_PCT: {
-      description: 'Alert when spending reaches this percent of the org spending limit.',
-      env: 'SPENDING_ALERT_PCT',
-      default: '80'
     }
+    // SPENDING_ALERT_PCT removed: the percent-of-limit comparison was deferred
+    // (the cron sweep alerts on missing-limit + high-CU instead), so the input
+    // was dead config. Re-add it only when the percent threshold is implemented.
   },
 
   harnessSettings: { reasoning: 'medium', timeoutSeconds: 120 },

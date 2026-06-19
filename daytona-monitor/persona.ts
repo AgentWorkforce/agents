@@ -58,7 +58,7 @@ export default definePersona({
     }
   },
 
-  harnessSettings: { reasoning: 'medium', timeoutSeconds: 120 },
+  harnessSettings: { reasoning: 'medium', timeoutSeconds: 1800 },
   relay: { inbox: ['@self'] },
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 90 },
 

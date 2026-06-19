@@ -89,7 +89,7 @@ export default definePersona({
     // was dead config. Re-add it only when the percent threshold is implemented.
   },
 
-  harnessSettings: { reasoning: 'medium', timeoutSeconds: 120 },
+  harnessSettings: { reasoning: 'medium', timeoutSeconds: 1600 },
   relay: { inbox: ['@self'] },
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 90 },
 

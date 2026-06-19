@@ -74,7 +74,7 @@ export default defineAgent({
 export async function handleInboxMessage(
   ctx: WorkforceCtx,
   event: AgentEvent,
-  client: SlackPoster = slackClient({ writebackTimeoutMs: 15_000 })
+  client: SlackPoster = slackClient({ writebackTimeoutMs: 45_000 })
 ): Promise<void> {
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (!channel) throw new Error('SLACK_CHANNEL is required');
@@ -138,7 +138,7 @@ export async function postFreshStories(
   channel: string,
   seen: number[],
   fresh: Story[],
-  client: SlackPoster = slackClient({ writebackTimeoutMs: 15_000 })
+  client: SlackPoster = slackClient({ writebackTimeoutMs: 45_000 })
 ): Promise<void> {
   // Claim the stories as seen BEFORE the post. Cron delivery is at-least-once: a
   // single tick can re-invoke this handler (cloud re-runs a delivery whose lease

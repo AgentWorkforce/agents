@@ -40,7 +40,7 @@ export default definePersona({
   harness: 'claude',
   model: 'claude-haiku-4-5-20251001',
   systemPrompt: 'Summarize Hacker News stories into a short, skimmable Slack digest.',
-  harnessSettings: { reasoning: 'low', timeoutSeconds: 120 },
+  harnessSettings: { reasoning: 'low', timeoutSeconds: 1800 },
 
   // Inbox so a user can DM the agent and ask about recently posted digests.
   relay: { inbox: ['@self'] },

@@ -28,7 +28,7 @@ export default definePersona({
   },
 
   // Pure fetch + DM — no model needed.
-  harnessSettings: { reasoning: 'low', timeoutSeconds: 120 },
+  harnessSettings: { reasoning: 'low', timeoutSeconds: 600 },
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 30 },
 
   onEvent: './agent.ts'

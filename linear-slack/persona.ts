@@ -119,7 +119,7 @@ export default definePersona({
   harnessSettings: {
     reasoning: 'medium',
     // The harness has to boot, mount, and navigate the board on demand — give it room.
-    timeoutSeconds: 300,
+    timeoutSeconds: 600,
   },
 
   onEvent: './agent.ts',

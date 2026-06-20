@@ -82,14 +82,33 @@ function resolveSeed(seed) {
   return { vfs: seed.vfs, contents: readFileSync(path.join(SEEDS_DIR, seed.file), 'utf8') };
 }
 
-function buildEnvelope(testCase) {
-  const f = testCase.fixture;
-  const env = { id: `evt_${testCase.id}`, workspace: 'ws-local', type: f.type, occurredAt: '2026-06-10T12:00:00.000Z' };
+function buildEnvelope(testCase, turn, idx = 0) {
+  const f = testCase.fixture ?? {};
+  const type = f.type ?? turn?.type;
+  const env = { id: `evt_${testCase.id}_${idx}`, workspace: 'ws-local', type, occurredAt: '2026-06-10T12:00:00.000Z' };
   if (f.name) env.name = f.name;
   if (f.cron) env.cron = f.cron;
   if (f.paths) env.paths = f.paths;
-  if (f.resource) env.resource = f.resource;
+  // A multi-turn `turn` carries chat fields (text/channel/messageId) that ride in
+  // `resource` (and channel/messageId are promoted to top-level for relaycast).
+  if (turn) {
+    env.resource = { ...(f.resource ?? {}), ...turn };
+    if (turn.channel) env.channel = turn.channel;
+    if (turn.messageId) env.messageId = turn.messageId;
+  } else if (f.resource) {
+    env.resource = f.resource;
+    if (f.resource.channel) env.channel = f.resource.channel;
+    if (f.resource.messageId) env.messageId = f.resource.messageId;
+  }
   return env;
+}
+
+/** Envelopes for a case: one per `turns` entry (multi-turn chat), else one. */
+function buildEnvelopes(testCase) {
+  if (Array.isArray(testCase.turns) && testCase.turns.length > 0) {
+    return testCase.turns.map((turn, i) => buildEnvelope(testCase, turn, i));
+  }
+  return [buildEnvelope(testCase)];
 }
 
 /** Agent dir relative to repo root — supports flat (`linear-slack`) and nested
@@ -173,20 +192,26 @@ async function runSimulate(testCase) {
       simulateInvocation({
         persona,
         handler: resolveHandler(mod),
-        envelopes: [buildEnvelope(testCase)],
+        // Multi-turn cases run every turn through ONE simulateInvocation so the
+        // in-memory ctx.memory persists across turns — that shared state is how
+        // we exercise conversational continuity end-to-end here.
+        envelopes: buildEnvelopes(testCase),
         agent: { inputValues: testCase.inputs ?? {} },
         files,
         now: () => new Date('2026-06-10T12:00:00Z'),
       })
     );
-    const run = rec.runs?.[0] ?? {};
-    const sim = run.simulation ?? { sideEffects: [], capturedLogs: [] };
+    // Aggregate side effects/logs across all turns; status/eventSource come from
+    // the LAST turn (a multi-turn case is judged on where it ended up).
+    const runs = rec.runs ?? [];
+    const last = runs[runs.length - 1] ?? {};
+    const sims = runs.map((r) => r.simulation ?? { sideEffects: [], capturedLogs: [] });
     return {
-      status: run.status ?? 'failed',
-      eventSource: run.trigger?.eventSource ?? null,
-      sideEffectKinds: sim.sideEffects.map((s) => s.kind),
-      logs: sim.capturedLogs.map((l) => l.message),
-      error: run.error ?? null,
+      status: last.status ?? 'failed',
+      eventSource: last.trigger?.eventSource ?? runs[0]?.trigger?.eventSource ?? null,
+      sideEffectKinds: sims.flatMap((s) => s.sideEffects.map((e) => e.kind)),
+      logs: sims.flatMap((s) => s.capturedLogs.map((l) => l.message)),
+      error: runs.find((r) => r.error)?.error ?? null,
       reply: null,
     };
   } finally {
@@ -239,11 +264,15 @@ async function runLive(testCase) {
   subs.useSink(sink);
 
   let lastHarnessReply = null;
+  // Every model output in order — for multi-turn chat we judge the LAST turn's
+  // reply (single-turn keeps the existing lastHarnessReply semantics).
+  const replies = [];
   const harness = {
     async run(args) {
       sink.sideEffects.push({ kind: 'harness.run', at: new Date().toISOString(), args: { promptChars: args.prompt.length } });
       const output = opencodeRun(args.prompt, mount);
       lastHarnessReply = output;
+      replies.push(output);
       return { output, exitCode: 0, durationMs: 0 };
     },
   };
@@ -252,6 +281,7 @@ async function runLive(testCase) {
       sink.sideEffects.push({ kind: 'llm.complete', at: new Date().toISOString(), args: { promptChars: prompt.length } });
       const output = opencodeRun(prompt, mount);
       lastHarnessReply = lastHarnessReply ?? output;
+      replies.push(output);
       return output;
     },
   };
@@ -281,29 +311,41 @@ async function runLive(testCase) {
   // outlive the handler, and tearing the dir down mid-write makes the client
   // fall back to cwd and litter a `slack/` tree into the repo. /tmp is fine to
   // leave for the OS to reap.
-  const event = envelopeToAgentEvent(buildEnvelope(testCase));
+  // One event per turn; multi-turn cases share `ctx` (and ctx.memory) so
+  // continuity is exercised across turns.
+  const events = buildEnvelopes(testCase).map((e) => envelopeToAgentEvent(e));
+  const lastEvent = events[events.length - 1];
   // v4 events have no `.source`; derive it from the dotted type for the check.
-  const eventSource = event?.type === 'cron.tick' ? 'cron' : (event?.type?.split('.')[0] ?? null);
+  const eventSource = lastEvent?.type === 'cron.tick' ? 'cron' : (lastEvent?.type?.split('.')[0] ?? null);
   let status = 'succeeded';
   let error = null;
   try {
     const mod = await tsImport(pathToFileURL(agentEntry(testCase.agent)).href, import.meta.url);
-    if (!event) throw new Error('envelopeToAgentEvent returned null (unsupported envelope)');
     const handler = resolveHandler(mod);
     process.env.RELAYFILE_MOUNT_ROOT = mount;
     process.env.WORKSPACE_ROOT = mount;
-    await withCaseEnv(personaSpec, testCase.inputs ?? {}, {}, () => handler(ctx, event));
+    await withCaseEnv(personaSpec, testCase.inputs ?? {}, {}, async () => {
+      for (let i = 0; i < events.length; i++) {
+        const event = events[i];
+        if (!event) throw new Error(`envelopeToAgentEvent returned null for turn ${i} (unsupported envelope)`);
+        await handler(ctx, event);
+      }
+    });
   } catch (err) {
     status = 'failed';
     error = err instanceof Error ? err.message : String(err);
   }
+  // For multi-turn chat, judge the LAST turn's reply; otherwise keep prior semantics.
+  const reply = Array.isArray(testCase.turns) && testCase.turns.length > 0
+    ? (replies[replies.length - 1] ?? lastHarnessReply)
+    : lastHarnessReply;
   return {
     status,
     eventSource,
     sideEffectKinds: sink.sideEffects.map((s) => s.kind),
     logs: sink.logs.map((l) => l.message),
     error,
-    reply: lastHarnessReply,
+    reply,
   };
 }
 

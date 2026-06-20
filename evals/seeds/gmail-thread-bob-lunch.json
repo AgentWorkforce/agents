@@ -1,0 +1,20 @@
+{
+  "id": "T_bob_lunch",
+  "historyId": "100200",
+  "snippet": "Lunch Thursday at noon works for me — see you at the usual spot.",
+  "messageIds": ["m_bl1"],
+  "messageCount": 1,
+  "messages": [
+    {
+      "id": "m_bl1",
+      "threadId": "T_bob_lunch",
+      "labelIds": ["INBOX", "CATEGORY_PERSONAL", "UNREAD"],
+      "snippet": "Lunch Thursday at noon works for me — see you at the usual spot. Want to talk through the hiring plan.",
+      "internalDate": "1780531200000",
+      "subject": "lunch this week?",
+      "from": "\"Bob Diaz\" <bob@example.org>",
+      "to": "\"You\" <me@example.com>",
+      "date": "Thu, 04 Jun 2026 12:00:00 -0700"
+    }
+  ]
+}

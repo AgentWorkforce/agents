@@ -1,0 +1,31 @@
+{
+  "id": "T_github_pr",
+  "historyId": "100250",
+  "snippet": "github-actions[bot] left a comment: all checks have passed on PR #481.",
+  "messageIds": ["m_gh1", "m_gh2"],
+  "messageCount": 2,
+  "messages": [
+    {
+      "id": "m_gh1",
+      "threadId": "T_github_pr",
+      "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+      "snippet": "alice opened a pull request: Add CSV streaming to the export endpoint (#481).",
+      "internalDate": "1780617600000",
+      "subject": "[acme/widget] Add CSV streaming to the export endpoint (PR #481)",
+      "from": "\"Alice Chen\" <notifications@github.com>",
+      "to": "\"acme/widget\" <widget@noreply.github.com>",
+      "date": "Fri, 05 Jun 2026 12:00:00 -0700"
+    },
+    {
+      "id": "m_gh2",
+      "threadId": "T_github_pr",
+      "labelIds": ["INBOX", "CATEGORY_UPDATES", "UNREAD"],
+      "snippet": "github-actions[bot] left a comment: all checks have passed on PR #481. Ready for review.",
+      "internalDate": "1780704000000",
+      "subject": "Re: [acme/widget] Add CSV streaming to the export endpoint (PR #481)",
+      "from": "\"github-actions[bot]\" <notifications@github.com>",
+      "to": "\"acme/widget\" <widget@noreply.github.com>",
+      "date": "Sat, 06 Jun 2026 12:00:00 -0700"
+    }
+  ]
+}

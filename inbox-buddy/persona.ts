@@ -15,11 +15,11 @@ import { definePersona } from '@agentworkforce/persona-kit';
  * that legacy adapter path is unused by cloud; see lib/gmail.ts). No Gmail token
  * lives in the agent.
  *
- * sandbox: false — a read-classify-reply chat persona that touches provider data
- * only through relayfile (VFS helpers) and replies via slackClient. No shell /
- * repo checkout / PR capabilities, so it runs in the persona runner (ms, no
- * Daytona cold start) for a responsive chat loop. ctx.llm.complete and the VFS
- * read helpers both work under sandbox:false.
+ * sandbox: true — REQUIRED. A `sandbox:false` (lightweight) delivery skips the
+ * relayfile-mount daemon, so the VFS is never mirrored to the filesystem and the
+ * handler's `/google-mail/threads` reads come back empty. The proven Slack-chat
+ * agent (linear-slack) is also sandbox:true. The box reads Gmail from the
+ * mounted VFS and answers with ctx.llm.complete (no harness needed).
  */
 export default definePersona({
   id: 'inbox-buddy',
@@ -28,7 +28,7 @@ export default definePersona({
   description:
     'Chat in a dedicated Slack channel to ask about your Gmail. Holds a multi-turn conversation, remembers earlier turns, and reasons over full email threads (e.g. "summarize that thread with Alice about the export").',
   cloud: true,
-  sandbox: false,
+  sandbox: true,
 
   // ctx.llm.complete drives the conversation. useSubscription lets cloud resolve
   // the deployer's active Anthropic credential per fire.

@@ -104,6 +104,12 @@ export default defineAgent({
       {
         on: 'message.created',
         paths: ['/slack/channels/${SLACK_CHANNEL}/**'],
+        // Gate the WAKE on an actual mention so the cloud only provisions a
+        // Daytona box when the agent is addressed — without this, every message
+        // in the board channel provisions a box + runs the harness just to be
+        // self-filtered (sandbox-per-message waste). The handler still strips
+        // the mention and reads the rest.
+        match: '@mention',
       },
     ],
   },

@@ -136,6 +136,22 @@ async function handleSlackMention(ctx: WorkforceCtx, event: AgentEvent): Promise
     ctx.log?.('info', 'joke-bot.slack-no-target', { reason: 'missing channel/ts' });
     return;
   }
+  // Channel guard: only ever reply in the configured channel. The slack trigger
+  // wakes across channels (broad slack scope feeds the wake-path match, and the
+  // trigger `match` gate isn't enforced cloud-side yet), so without this joke-bot
+  // would answer @mentions in ANY channel. Fail CLOSED — if SLACK_CHANNEL is
+  // unset/miswired, don't reply at all (matching the relay/cron paths), rather
+  // than falling through to the event's channel. Normalize `id__name` → `id`.
+  const want = input(ctx, 'SLACK_CHANNEL');
+  const chanId = channel.split('__')[0];
+  if (!want) {
+    ctx.log?.('warn', 'joke-bot.slack-no-channel', { reason: 'SLACK_CHANNEL not set; failing closed' });
+    return;
+  }
+  if (chanId !== want) {
+    ctx.log?.('info', 'joke-bot.slack-wrong-channel', { channel: chanId, want });
+    return;
+  }
   if (data.is_bot === true || data.bot_id || (typeof data.subtype === 'string' && data.subtype)) {
     ctx.log?.('info', 'joke-bot.slack-skip', { reason: 'bot or non-plain message' });
     return;

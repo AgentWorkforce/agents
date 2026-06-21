@@ -13,7 +13,7 @@ Instantly launch this agent on Agent Relay
 
 > Built as part of the relayfile → relayfile-cloud migration (Stream D): the
 > extracted service runs on Cloudflare Workers with D1, R2, KV, Queues, and
-> Durable Objects — and needs cost/usage monitoring that alerts on spend
+> Durable Objects — and requires cost/usage monitoring that alerts on spend
 > thresholds before costs surprise the team.
 
 ## How it watches
@@ -74,7 +74,7 @@ queue backlogs?"). It loads the full VFS picture and replies via
 
 ## How it's wired
 
-```
+```text
 Cloudflare API ──▶ cloudflare-relay (Nango syncs) ──▶ /cloudflare/** VFS mounts
      │                                                     │
      │ (5 usage syncs)                                     │

@@ -5,10 +5,11 @@ import { definePersona } from '@agentworkforce/persona-kit';
  * channel to ask about your Gmail. It remembers earlier turns and reasons over
  * full Gmail threads (not single messages).
  *
- * Human channel = Slack (the relay inbox is agent-to-agent, so it is NOT used
- * for human chat). This mirrors the in-production `linear-slack` agent: a slack
- * trigger watches ONE channel (SLACK_CHANNEL); the handler answers every fresh
- * human message there and replies in Slack.
+ * Human channel = Slack via `@mention`. The trigger is `app_mention` (the
+ * webhook-driven path the in-production review-agent uses): the message rides in
+ * the event payload, so it works independent of the relayfile slack mount
+ * (whose ingestion can lag/stall — e.g. during the relayfile migration). The
+ * relay inbox is agent-to-agent, so it is NOT used for human chat.
  *
  * Reads Gmail ONLY from the relayfile VFS mount materialized by the google-mail
  * Nango connection. The canonical mount root is `/google-mail` (NOT `/gmail` —
@@ -53,8 +54,9 @@ export default definePersona({
 
   inputs: {
     SLACK_CHANNEL: {
-      description: 'The dedicated Slack channel inbox-buddy chats in. Its id is interpolated into the trigger watch path so the agent only wakes for this channel.',
+      description: 'Optional: restrict replies to one Slack channel id. Unset = reply wherever the app is @mentioned. (app_mention is webhook-driven, so no channel watch path is interpolated.)',
       env: 'SLACK_CHANNEL',
+      optional: true,
       picker: { provider: 'slack', resource: 'channels' }
     }
   },

@@ -46,12 +46,15 @@ const THREAD_LOAD_LIMIT = 200;
 
 export default defineAgent({
   triggers: {
-    // Channel-scoped watch path is the wake gate: the cloud dispatcher
-    // intersects this against the event's relayfile path before provisioning, so
-    // the agent only wakes for its chat channel. `${SLACK_CHANNEL}` is a
-    // deploy-time placeholder (single quotes keep it literal) that cloud
-    // substitutes with the picker-chosen channel id (AgentWorkforce/cloud#1999).
-    slack: [{ on: 'message.created', paths: ['/slack/channels/${SLACK_CHANNEL}/**'] }]
+    // `app_mention` is WEBHOOK-driven: the Slack Events webhook delivers the
+    // message in the event PAYLOAD, independent of the relayfile mount. We
+    // deliberately do NOT use `message.created` — that fires only on *ingested*
+    // message records (persona-deploy.ts: "watch ingested message records"), so
+    // a stalled slack sync (the relayfile migration) silently kills it. The
+    // message text rides in `event.expand('full').data`; the gmail mount it
+    // reads for context is separate (and fresh). Same shape the in-production
+    // review-agent (pr-reviewer) uses to reply to Slack mentions.
+    slack: [{ on: 'app_mention' }]
   },
   handler: async (ctx, event) => {
     await handleSlackMessage(ctx, event);
@@ -73,20 +76,24 @@ export async function handleSlackMessage(
     now?: () => Date;
   } = {}
 ): Promise<void> {
+  // Diagnostic: deployments logs only surface the message STRING (not data
+  // fields), so encode the event type / skip reason into the message itself.
+  ctx.log?.('info', `inbox-buddy.event type=${event.type}`);
+
   if (!event.type.startsWith('slack.')) {
-    ctx.log?.('info', 'inbox-buddy.skip', { reason: 'non-slack event', type: event.type });
+    ctx.log?.('info', `inbox-buddy.skip reason=non-slack-event type=${event.type}`);
     return;
   }
 
   const msg = readSlackMessage((await event.expand('full')).data);
   if (!msg) {
-    ctx.log?.('info', 'inbox-buddy.skip', { reason: 'unparseable slack payload' });
+    ctx.log?.('info', 'inbox-buddy.skip reason=unparseable-payload');
     return;
   }
 
   const reason = skipReason(msg, input(ctx, 'SLACK_CHANNEL'));
   if (reason) {
-    ctx.log?.('info', 'inbox-buddy.skip', { reason, channel: msg.channel });
+    ctx.log?.('info', `inbox-buddy.skip reason=${reason.replace(/\s+/g, '-')} channel=${msg.channel} configured=${input(ctx, 'SLACK_CHANNEL') ?? 'unset'}`);
     return;
   }
 
@@ -98,11 +105,13 @@ export async function handleSlackMessage(
   const root = resolveMountRoot({});
   const threads = await loadRecentThreads({ relayfileMountRoot: root }, THREAD_LOAD_LIMIT);
 
-  ctx.log?.('info', 'inbox-buddy.context', {
+  const focused = focusedThreadIds(threads, question);
+  // String form for deployments-logs visibility; data form for tests/structured sinks.
+  ctx.log?.('info', `inbox-buddy.context channel=${msg.channel} priorTurns=${prior.length} threadsLoaded=${threads.length} focused=${focused.join('|') || 'none'}`, {
     conversationKey: key,
     priorTurns: prior.length,
     threadsLoaded: threads.length,
-    focusedThreads: focusedThreadIds(threads, question)
+    focusedThreads: focused
   });
 
   const userPrompt = buildPrompt({ question, transcript: prior, threads });

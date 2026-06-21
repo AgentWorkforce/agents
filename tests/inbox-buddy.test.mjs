@@ -107,7 +107,7 @@ function slackEvent({ channel = 'C_CHAT', ts, text, user = 'U_HUMAN', threadTs, 
   return envelopeToAgentEvent({
     id: `evt_${ts}`,
     workspace: 'ws-test',
-    type: 'slack.message.created',
+    type: 'slack.app_mention',
     occurredAt: '2026-06-10T12:00:00.000Z',
     resource
   });
@@ -235,7 +235,7 @@ test('handleSlackMessage loads threads from the mount and focuses the right one'
       slackEvent({ ts: '1', text: 'recap the Alice export thread' }),
       { complete: async (p) => { seenPrompt = p; return 'ok'; }, slack: makeSlack() }
     );
-    const ctxLog = ctx.logs.find((l) => l.message === 'inbox-buddy.context');
+    const ctxLog = ctx.logs.find((l) => l.message.startsWith('inbox-buddy.context'));
     assert.ok(ctxLog, 'expected a context log');
     assert.equal(ctxLog.data.threadsLoaded, 4);
     assert.equal(ctxLog.data.focusedThreads[0], 'T_alice_export');
@@ -257,7 +257,7 @@ test('handleSlackMessage ignores bot messages (no model call, no reply) — loop
   );
   assert.equal(completeCalls, 0);
   assert.equal(slack.calls.length, 0);
-  assert.ok(ctx.logs.some((l) => l.message === 'inbox-buddy.skip' && l.data.reason === 'bot message'));
+  assert.ok(ctx.logs.some((l) => l.message.startsWith('inbox-buddy.skip') && l.message.includes('reason=bot-message')));
 });
 
 test('handleSlackMessage replies in-thread when the message is threaded', async () => {

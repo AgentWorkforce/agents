@@ -26,6 +26,18 @@ export default definePersona({
     'A conversational joke bot: DM it via the relay inbox and it replies in Slack with a pop-culture / current-events joke. Exists to confirm conversational agents + multi-turn threading work, and to test the claude/codex/opencode harnesses.',
   cloud: true,
 
+  // sandbox:true (default) is required: the reply is a Slack WRITEBACK
+  // (slackClient().post → relayfile mount), and sandbox:false bypasses the
+  // relayfile mount, so the reply can't be written. The run is still fast — the
+  // handler answers via ctx.llm.complete (one LLM call), NOT ctx.harness.run
+  // (which boots a full CLI session and took minutes). Cost is just the box
+  // cold-start; trigger `match` (once cloud enforces it) limits when it provisions.
+  sandbox: true,
+
+  // ctx.llm.complete() resolves against the deployer's connected subscription
+  // credential (rides in providerEnv; the deploy log shows it selected for ctx.llm).
+  useSubscription: true,
+
   // Swap this between 'claude' | 'codex' | 'opencode' to test each provider.
   // The joke is produced by ctx.harness.run, so the harness here is what runs.
   harness: 'claude',

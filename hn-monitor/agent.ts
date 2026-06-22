@@ -93,7 +93,7 @@ export async function handleInboxMessage(
   ctx.log('info', 'hn-monitor.inbox.recalled', { posts: posts.length });
 
   const context = posts.length
-    ? posts.map((p) => `### Posted ${p.postedAt}\n${p.digest}`).join('\n\n')
+    ? posts.map((p) => `### Posted ${p.postedAt ?? 'Unknown'}\n${p.digest ?? ''}`).join('\n\n')
     : 'No Hacker News digests have been posted yet.';
 
   const prompt = [
@@ -117,7 +117,7 @@ export async function handleInboxMessage(
   } catch (error) {
     ctx.log('warn', 'hn-monitor.llm-fallback', { error: String(error) });
     const titles = posts
-      .flatMap((p) => p.stories.map((s) => `- ${s.title} ${s.url}`))
+      .flatMap((p) => (p.stories ?? []).map((s) => `- ${s.title ?? 'Untitled'} ${s.url ?? ''}`))
       .slice(0, 15)
       .join('\n');
     answer = titles
@@ -294,5 +294,5 @@ async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
       // skip records that aren't valid JSON
     }
   }
-  return posts.sort((a, b) => (a.postedAt < b.postedAt ? 1 : -1));
+  return posts.sort((a, b) => (b.postedAt ?? '').localeCompare(a.postedAt ?? ''));
 }

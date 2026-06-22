@@ -1,0 +1,267 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { envelopeToAgentEvent } from '@agentworkforce/runtime';
+
+import {
+  readTelegramMessage,
+  bareChatId,
+  conversationKeyForTelegram,
+  skipReason,
+  replyToMessage
+} from '../.test-build/shared/telegram.js';
+import { handleTelegramMessage as inboxHandle } from '../.test-build/inbox-buddy-telegram/agent.js';
+import { handleTelegramMention, handleJokeOfTheDay } from '../.test-build/joke-bot-telegram/agent.js';
+import { checkReleases } from '../.test-build/spotify-releases-telegram/agent.js';
+import { postFreshStories, handleTelegramMessage as hnHandle } from '../.test-build/hn-monitor-telegram/agent.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SEEDS = path.join(HERE, '..', 'evals', 'seeds');
+
+const ORIG_MOUNT_ROOT = process.env.RELAYFILE_MOUNT_ROOT;
+function restoreMountRoot() {
+  if (ORIG_MOUNT_ROOT === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+  else process.env.RELAYFILE_MOUNT_ROOT = ORIG_MOUNT_ROOT;
+}
+
+function telegramEvent({ chatId = '123', messageId = '10', text = 'hi', fromIsBot = false, threadId } = {}) {
+  const resource = { chatId, messageId, text, from: { is_bot: fromIsBot } };
+  if (threadId) resource.messageThreadId = threadId;
+  return envelopeToAgentEvent({
+    id: `evt_${messageId}`,
+    workspace: 'ws-test',
+    type: 'telegram.message',
+    occurredAt: '2026-06-10T12:00:00.000Z',
+    resource
+  });
+}
+
+/** A fake Telegram sender capturing send() calls. */
+function makeTelegram() {
+  const sends = [];
+  return {
+    sends,
+    async send(chatId, text, opts) {
+      sends.push({ chatId, text, opts });
+      return { ok: true, messageId: `${sends.length}` };
+    }
+  };
+}
+
+function makeCtx() {
+  const store = [];
+  let seq = 0;
+  return {
+    logs: [],
+    log(level, message, data) { this.logs.push({ level, message, data }); },
+    memory: {
+      async save(content, opts = {}) { store.push({ content, tags: opts.tags ?? [], scope: opts.scope, seq: seq++ }); return { id: `m${seq}` }; },
+      async recall(_q, opts = {}) {
+        const tags = opts.tags ?? [];
+        return store
+          .filter((r) => tags.every((t) => r.tags.includes(t)))
+          .sort((a, b) => b.seq - a.seq)
+          .slice(0, opts.limit ?? 50)
+          .map((r) => ({ id: `m${r.seq}`, content: r.content, tags: r.tags, scope: r.scope, createdAt: '' }));
+      }
+    },
+    llm: { async complete() { throw new Error('inject deps.complete in tests'); } }
+  };
+}
+
+// ── shared transport ──────────────────────────────────────────────────────────
+
+test('readTelegramMessage parses a telegram.message payload', async () => {
+  const ev = telegramEvent({ chatId: '42', messageId: '7', text: 'tell me a joke', threadId: '3' });
+  const msg = readTelegramMessage((await ev.expand('full')).data);
+  assert.equal(msg.chatId, '42');
+  assert.equal(msg.messageId, '7');
+  assert.equal(msg.text, 'tell me a joke');
+  assert.equal(msg.threadId, '3');
+  assert.equal(msg.fromIsBot, false);
+});
+
+test('bareChatId strips the __title suffix', () => {
+  assert.equal(bareChatId('42__general'), '42');
+  assert.equal(bareChatId('42'), '42');
+});
+
+test('conversationKeyForTelegram keys on bare chat, plus forum topic', () => {
+  assert.equal(conversationKeyForTelegram({ chatId: '42__x', messageId: '1', text: 'a', fromIsBot: false }), '42');
+  assert.equal(conversationKeyForTelegram({ chatId: '42', messageId: '1', text: 'a', fromIsBot: false, threadId: '9' }), '42:9');
+});
+
+test('skipReason: bot loop guard, wrong chat, empty text', () => {
+  assert.equal(skipReason({ chatId: '1', messageId: '1', text: 'hi', fromIsBot: true }, '1'), 'bot message');
+  assert.equal(skipReason({ chatId: '2', messageId: '1', text: 'hi', fromIsBot: false }, '1'), 'not the configured chat');
+  assert.equal(skipReason({ chatId: '1', messageId: '1', text: '   ', fromIsBot: false }, '1'), 'empty message text');
+  assert.equal(skipReason({ chatId: '1__g', messageId: '1', text: 'real', fromIsBot: false }, '1'), null);
+});
+
+test('replyToMessage threads on the source message id', async () => {
+  const tg = makeTelegram();
+  const ctx = makeCtx();
+  await replyToMessage(ctx, tg, { chatId: '5__chat', messageId: '99', text: 'q', fromIsBot: false }, 'an answer');
+  assert.equal(tg.sends.length, 1);
+  assert.equal(tg.sends[0].chatId, '5');
+  assert.equal(tg.sends[0].text, 'an answer');
+  assert.equal(tg.sends[0].opts.replyToMessageId, 99);
+});
+
+// ── inbox-buddy-telegram ───────────────────────────────────────────────────────
+
+function seedGmailMount() {
+  const mount = mkdtempSync(path.join(tmpdir(), 'ibt-'));
+  const dir = path.join(mount, 'google-mail', 'threads');
+  mkdirSync(dir, { recursive: true });
+  for (const [id, file] of Object.entries({
+    T_alice_export: 'gmail-thread-alice-export.json',
+    T_bob_lunch: 'gmail-thread-bob-lunch.json'
+  })) {
+    writeFileSync(path.join(dir, `${id}.json`), readFileSync(path.join(SEEDS, file), 'utf8'));
+  }
+  return mount;
+}
+
+test('inbox-buddy-telegram: answers a Gmail question and threads the reply + records the turn', async () => {
+  const mount = seedGmailMount();
+  process.env.RELAYFILE_MOUNT_ROOT = mount;
+  try {
+    const ctx = makeCtx();
+    const tg = makeTelegram();
+    let seenPrompt = '';
+    await inboxHandle(
+      { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '123' }, inputSpecs: {} } },
+      telegramEvent({ chatId: '123', messageId: '5', text: 'recap the Alice export thread' }),
+      { complete: async (p) => { seenPrompt = p; return 'Alice sends the numbers Friday.'; }, telegram: tg, now: () => new Date('2026-06-10T12:00:00Z') }
+    );
+    assert.match(seenPrompt, /Threads in focus/);
+    assert.equal(tg.sends.length, 1);
+    assert.equal(tg.sends[0].chatId, '123');
+    assert.equal(tg.sends[0].opts.replyToMessageId, 5);
+    assert.match(tg.sends[0].text, /Friday/);
+    // The turn was persisted for continuity (transcript saved under the conv tag).
+    assert.ok(ctx.logs.some((l) => l.message?.includes('inbox-buddy-telegram.context')));
+  } finally {
+    restoreMountRoot();
+    rmSync(mount, { recursive: true, force: true });
+  }
+});
+
+test('inbox-buddy-telegram: skips the bot\'s own messages (loop guard)', async () => {
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  await inboxHandle(
+    { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '123' }, inputSpecs: {} } },
+    telegramEvent({ chatId: '123', messageId: '6', text: 'echo', fromIsBot: true }),
+    { complete: async () => 'should not run', telegram: tg }
+  );
+  assert.equal(tg.sends.length, 0);
+});
+
+// ── joke-bot-telegram ──────────────────────────────────────────────────────────
+
+test('joke-bot-telegram: replies with a joke and saves the turn', async () => {
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  await handleTelegramMention(
+    { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '77' }, inputSpecs: {} } },
+    telegramEvent({ chatId: '77', messageId: '8', text: 'joke about cron jobs' }),
+    { complete: async () => 'Why did the cron job cross the road? At 0 0 * * *.', telegram: tg }
+  );
+  assert.equal(tg.sends.length, 1);
+  assert.equal(tg.sends[0].chatId, '77');
+  assert.equal(tg.sends[0].opts.replyToMessageId, 8);
+  assert.match(tg.sends[0].text, /cron/);
+  // Conversation turn saved for callback humor.
+  const saved = await ctx.memory.recall('x', { tags: ['joke-convo:telegram:77'] });
+  assert.equal(saved.length, 1);
+});
+
+test('joke-bot-telegram: joke of the day posts to the configured chat', async () => {
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  await handleJokeOfTheDay(
+    { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '77__general' }, inputSpecs: {} } },
+    { complete: async () => 'A daily zinger.', telegram: tg }
+  );
+  assert.equal(tg.sends.length, 1);
+  assert.equal(tg.sends[0].chatId, '77');
+  assert.match(tg.sends[0].text, /Joke of the day/);
+});
+
+// ── spotify-releases-telegram ──────────────────────────────────────────────────
+
+test('spotify-releases-telegram: missing SPOTIFY_TOKEN fails loudly', async () => {
+  const ctx = makeCtx();
+  await assert.rejects(
+    () => checkReleases({ ...ctx, persona: { inputs: { TELEGRAM_CHAT: '5' }, inputSpecs: {} } }, { telegram: makeTelegram() }),
+    /SPOTIFY_TOKEN is required/
+  );
+});
+
+test('spotify-releases-telegram: missing TELEGRAM_CHAT fails loudly', async () => {
+  const ctx = makeCtx();
+  await assert.rejects(
+    () => checkReleases({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, { telegram: makeTelegram() }),
+    /TELEGRAM_CHAT is required/
+  );
+});
+
+// ── hn-monitor-telegram ────────────────────────────────────────────────────────
+
+const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
+
+test('hn-monitor-telegram: threads the digest under a count header and saves the post', async () => {
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  await postFreshStories({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, '900__hn', [10], [STORY], {
+    complete: async () => 'digest body',
+    telegram: tg
+  });
+  // Two sends: a header (top-level) then the body threaded under the header's id.
+  assert.equal(tg.sends.length, 2);
+  assert.equal(tg.sends[0].chatId, '900');
+  assert.match(tg.sends[0].text, /Hacker News/);
+  assert.equal(tg.sends[0].opts, undefined);
+  assert.match(tg.sends[1].text, /digest body/);
+  assert.equal(tg.sends[1].opts.replyToMessageId, 1); // header's messageId
+  // seen claimed + post record saved.
+  const seen = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:seen'] });
+  assert.deepEqual(JSON.parse(seen[0].content), [10, 20]);
+  const posts = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:post'] });
+  assert.equal(posts.length, 1);
+});
+
+test('hn-monitor-telegram: a no-receipt header releases the claim and throws', async () => {
+  const ctx = makeCtx();
+  const tg = { sends: [], async send(chatId, text, opts) { this.sends.push({ chatId, text, opts }); return { ok: false }; } };
+  await assert.rejects(
+    () => postFreshStories({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, '900', [10], [STORY], { complete: async () => 'body', telegram: tg }),
+    /no writeback receipt/
+  );
+  // Claim was released (restored to prior seen set) so the next tick retries.
+  const seen = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:seen'] });
+  assert.deepEqual(JSON.parse(seen[0].content), [10]);
+});
+
+test('hn-monitor-telegram: Q&A path answers from recalled posts', async () => {
+  const ctx = makeCtx();
+  // Seed a prior post record.
+  await ctx.memory.save(JSON.stringify({ postedAt: '2026-06-17T09:00:00.000Z', digest: 'TypeScript 5.6 released', stories: [{ title: 'TypeScript 5.6', url: 'https://ex.com/ts', points: 200 }] }), { tags: ['hn-monitor-telegram:post'], scope: 'workspace' });
+  const tg = makeTelegram();
+  let prompt = '';
+  await hnHandle(
+    { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '900' }, inputSpecs: {} } },
+    telegramEvent({ chatId: '900', messageId: '12', text: 'what typescript news?' }),
+    { complete: async (p) => { prompt = p; return 'TypeScript 5.6 was posted.'; }, telegram: tg }
+  );
+  assert.match(prompt, /TypeScript 5\.6 released/);
+  assert.equal(tg.sends.length, 1);
+  assert.match(tg.sends[0].text, /TypeScript 5\.6 was posted\./);
+  assert.equal(tg.sends[0].opts.replyToMessageId, 12);
+});

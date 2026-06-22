@@ -1,0 +1,42 @@
+{
+  "id": "T_alice_export",
+  "historyId": "100300",
+  "snippet": "Sounds good — I'll send the final Q3 export numbers by Friday.",
+  "messageIds": ["m_ax1", "m_ax2", "m_ax3"],
+  "messageCount": 3,
+  "messages": [
+    {
+      "id": "m_ax1",
+      "threadId": "T_alice_export",
+      "labelIds": ["INBOX", "IMPORTANT", "CATEGORY_PERSONAL"],
+      "snippet": "Hi — can you pull the Q3 revenue export before our review? Need the by-region breakdown.",
+      "internalDate": "1780790400000",
+      "subject": "Q3 revenue export",
+      "from": "\"Alice Chen\" <alice@acme.com>",
+      "to": "\"You\" <me@example.com>",
+      "date": "Sun, 07 Jun 2026 09:00:00 -0700"
+    },
+    {
+      "id": "m_ax2",
+      "threadId": "T_alice_export",
+      "labelIds": ["INBOX", "SENT"],
+      "snippet": "On it. The by-region breakdown needs the new currency conversion — will have a draft tomorrow.",
+      "internalDate": "1780876800000",
+      "subject": "Re: Q3 revenue export",
+      "from": "\"You\" <me@example.com>",
+      "to": "\"Alice Chen\" <alice@acme.com>",
+      "date": "Mon, 08 Jun 2026 09:00:00 -0700"
+    },
+    {
+      "id": "m_ax3",
+      "threadId": "T_alice_export",
+      "labelIds": ["INBOX", "IMPORTANT", "UNREAD"],
+      "snippet": "Sounds good — I'll send the final Q3 export numbers by Friday. Also looping in finance for sign-off.",
+      "internalDate": "1780963200000",
+      "subject": "Re: Q3 revenue export",
+      "from": "\"Alice Chen\" <alice@acme.com>",
+      "to": "\"You\" <me@example.com>, \"Finance\" <finance@acme.com>",
+      "date": "Tue, 09 Jun 2026 09:00:00 -0700"
+    }
+  ]
+}

@@ -1,6 +1,8 @@
 GCP Watcher
 ===========
 
+<img src="./banner.png" alt="GCP Watcher">
+
 A proactive agent that watches your GCP project's **Cloud Run services**,
 **Monitoring alert policies**, and **billing/cost**, and posts a Slack alert only
 when something needs attention. Notification-only — it never mutates GCP.

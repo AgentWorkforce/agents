@@ -38,10 +38,15 @@ function inboxEvent(text) {
 
 const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
 
-test('postFreshStories claims fresh ids before summarizing, then keeps them on a successful post', async () => {
+test('postFreshStories claims fresh ids before summarizing, then threads the digest under a header on success', async () => {
   const { ctx, events, saved } = makeCtx();
   const posts = [];
-  const client = { async post(channel, text) { posts.push({ channel, text }); return { ts: '1710000000.1' }; } };
+  const client = {
+    async post(channel, text, opts) {
+      posts.push({ channel, text, opts });
+      return { ts: `1710000000.${posts.length}`, ref: `ref-${posts.length}` };
+    },
+  };
 
   await postFreshStories(ctx, 'C123', [10], [STORY], client);
 
@@ -51,11 +56,14 @@ test('postFreshStories claims fresh ids before summarizing, then keeps them on a
     content: JSON.stringify([10, 20]),
     opts: { tags: ['hn-monitor:seen'], scope: 'workspace' },
   });
-  // summarize() wraps the LLM output in a header before posting.
-  assert.equal(posts.length, 1);
+  // Two posts: a compact count header (top-level) then the digest body threaded
+  // under it via `replyTo: <header ref>` (server-side threading).
+  assert.equal(posts.length, 2);
   assert.equal(posts[0].channel, 'C123');
   assert.match(posts[0].text, /Hacker News/);
-  assert.match(posts[0].text, /digest body/);
+  assert.equal(posts[0].opts, undefined);
+  assert.match(posts[1].text, /digest body/);
+  assert.deepEqual(posts[1].opts, { replyTo: 'ref-1' });
 
   // A successful post writes an `hn-monitor:post` record for the Q&A path.
   assert.deepEqual(saved[1].opts, { tags: ['hn-monitor:post'], scope: 'workspace' });
@@ -70,7 +78,12 @@ test('postFreshStories posts a plain fallback digest when the LLM throws, and st
     llm: { async complete() { events.push('llm'); throw new Error('llm exploded'); } },
   });
   const posts = [];
-  const client = { async post(channel, text) { posts.push({ channel, text }); return { ts: '1710000000.2' }; } };
+  const client = {
+    async post(channel, text, opts) {
+      posts.push({ channel, text, opts });
+      return { ts: `1710000000.${posts.length}`, ref: `ref-${posts.length}` };
+    },
+  };
 
   // summarize() no longer throws on an LLM failure — it falls back to a plain
   // digest built from the story lines, so the post still lands and is retained.
@@ -79,12 +92,14 @@ test('postFreshStories posts a plain fallback digest when the LLM throws, and st
   assert.deepEqual(events, ['save', 'llm', 'save']);
   // The claim is kept (post succeeded), not rolled back.
   assert.equal(saved[0].content, JSON.stringify([10, 20]));
-  // The fallback digest carries the header and the actual story title/url.
-  assert.equal(posts.length, 1);
-  assert.equal(posts[0].channel, 'C123');
+  // Header (top-level) + fallback digest threaded under it; the fallback body
+  // carries the actual story title/url.
+  assert.equal(posts.length, 2);
   assert.match(posts[0].text, /Hacker News/);
-  assert.match(posts[0].text, /Agent Workforce cron leases/);
-  assert.match(posts[0].text, /example\.com\/20/);
+  assert.equal(posts[0].opts, undefined);
+  assert.match(posts[1].text, /Agent Workforce cron leases/);
+  assert.match(posts[1].text, /example\.com\/20/);
+  assert.deepEqual(posts[1].opts, { replyTo: 'ref-1' });
   // The post record is still persisted for the Q&A path.
   assert.deepEqual(saved[1].opts, { tags: ['hn-monitor:post'], scope: 'workspace' });
   const record = JSON.parse(saved[1].content);

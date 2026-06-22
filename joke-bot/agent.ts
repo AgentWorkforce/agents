@@ -108,7 +108,7 @@ export default defineAgent({
     }
     if (!isRelaycastMessageEvent(event)) return;
 
-    const channel = input(ctx, 'SLACK_CHANNEL');
+    const channel = input(ctx, 'SLACK_CHANNEL')?.split('__')[0];
     if (!channel) {
       ctx.log?.('warn', 'joke-bot.no-channel', { reason: 'SLACK_CHANNEL not set; cannot reply' });
       return;
@@ -142,7 +142,7 @@ async function handleSlackMention(ctx: WorkforceCtx, event: AgentEvent): Promise
   // would answer @mentions in ANY channel. Fail CLOSED — if SLACK_CHANNEL is
   // unset/miswired, don't reply at all (matching the relay/cron paths), rather
   // than falling through to the event's channel. Normalize `id__name` → `id`.
-  const want = input(ctx, 'SLACK_CHANNEL');
+  const want = input(ctx, 'SLACK_CHANNEL')?.split('__')[0];
   const chanId = channel.split('__')[0];
   if (!want) {
     ctx.log?.('warn', 'joke-bot.slack-no-channel', { reason: 'SLACK_CHANNEL not set; failing closed' });
@@ -162,23 +162,25 @@ async function handleSlackMention(ctx: WorkforceCtx, event: AgentEvent): Promise
     return;
   }
   const threadTs = typeof data.thread_ts === 'string' && data.thread_ts ? data.thread_ts : ts;
-  const question = rawText.replace(/<@[^>]+>/g, '').trim();
+  // Strip ONLY the leading bot mention; preserve any other mentions in the text
+  // (e.g. "@joke-bot tell a joke about @alice" keeps @alice).
+  const question = rawText.replace(/^\s*<@[^>]+>\s*/, '').trim();
   if (!question) {
     ctx.log?.('info', 'joke-bot.slack-empty', { reason: 'no text after stripping mention' });
     return;
   }
 
-  const tag = `joke-convo:slack:${channel}:${threadTs}`;
+  const tag = `joke-convo:slack:${chanId}:${threadTs}`;
   const reply = await joke(ctx, buildPrompt(await recall(ctx, tag), question));
-  const result = await slackClient({ writebackTimeoutMs: 15_000 }).reply(channel, threadTs, reply);
+  const result = await slackClient({ writebackTimeoutMs: 15_000 }).reply(chanId, threadTs, reply);
   if (!result?.ts) throw new Error('Slack reply returned no receipt ts');
   await remember(ctx, tag, question, reply);
-  ctx.log?.('info', 'joke-bot.slack-replied', { channel, threadTs, chars: reply.length });
+  ctx.log?.('info', 'joke-bot.slack-replied', { channel: chanId, threadTs, chars: reply.length });
 }
 
 /** Scheduled path: post one topical joke of the day. */
 async function handleJokeOfTheDay(ctx: WorkforceCtx): Promise<void> {
-  const channel = input(ctx, 'SLACK_CHANNEL');
+  const channel = input(ctx, 'SLACK_CHANNEL')?.split('__')[0];
   if (!channel) {
     ctx.log?.('warn', 'joke-bot.no-channel', { reason: 'SLACK_CHANNEL not set; skipping joke of the day' });
     return;

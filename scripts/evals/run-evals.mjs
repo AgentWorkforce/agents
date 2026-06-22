@@ -82,14 +82,35 @@ function resolveSeed(seed) {
   return { vfs: seed.vfs, contents: readFileSync(path.join(SEEDS_DIR, seed.file), 'utf8') };
 }
 
-function buildEnvelope(testCase) {
-  const f = testCase.fixture;
-  const env = { id: `evt_${testCase.id}`, workspace: 'ws-local', type: f.type, occurredAt: '2026-06-10T12:00:00.000Z' };
+function buildEnvelope(testCase, turn, idx = 0) {
+  const f = testCase.fixture ?? {};
+  const type = f.type ?? turn?.type;
+  const env = { id: `evt_${testCase.id}_${idx}`, workspace: 'ws-local', type, occurredAt: '2026-06-10T12:00:00.000Z' };
   if (f.name) env.name = f.name;
   if (f.cron) env.cron = f.cron;
   if (f.paths) env.paths = f.paths;
-  if (f.resource) env.resource = f.resource;
+  // A multi-turn `turn` carries chat fields (text/channel/messageId) that ride in
+  // `resource` (and channel/messageId are promoted to top-level for relaycast).
+  if (turn) {
+    env.resource = { ...(f.resource ?? {}), ...turn };
+    // Promote routing fields from the MERGED resource so a turn that omits
+    // channel/messageId still inherits them from fixture.resource.
+    if (env.resource.channel) env.channel = env.resource.channel;
+    if (env.resource.messageId) env.messageId = env.resource.messageId;
+  } else if (f.resource) {
+    env.resource = f.resource;
+    if (f.resource.channel) env.channel = f.resource.channel;
+    if (f.resource.messageId) env.messageId = f.resource.messageId;
+  }
   return env;
+}
+
+/** Envelopes for a case: one per `turns` entry (multi-turn chat), else one. */
+function buildEnvelopes(testCase) {
+  if (Array.isArray(testCase.turns) && testCase.turns.length > 0) {
+    return testCase.turns.map((turn, i) => buildEnvelope(testCase, turn, i));
+  }
+  return [buildEnvelope(testCase)];
 }
 
 /** Agent dir relative to repo root — supports flat (`linear-slack`) and nested
@@ -137,7 +158,7 @@ function withCaseEnv(persona, inputs, extraEnv, fn) {
 }
 
 // ── deterministic checks shared by both executors ─────────────────────────────
-function checkExpectations(testCase, { status, eventSource, sideEffectKinds, logs, error }) {
+function checkExpectations(testCase, { status, eventSource, sideEffectKinds, logs, error, reply }) {
   const e = testCase.expect ?? {};
   const checks = [];
   const add = (name, pass, detail) => checks.push({ name, pass, detail });
@@ -146,7 +167,21 @@ function checkExpectations(testCase, { status, eventSource, sideEffectKinds, log
   if (e.eventSource) add(`source=${e.eventSource}`, eventSource === e.eventSource, `got ${eventSource}`);
   for (const k of e.sideEffectsAll ?? []) add(`has ${k}`, sideEffectKinds.includes(k), sideEffectKinds.join(','));
   if (e.sideEffectsAny) add(`any of [${e.sideEffectsAny}]`, e.sideEffectsAny.some((k) => sideEffectKinds.includes(k)), sideEffectKinds.join(','));
-  if (e.logsAny) add(`log any [${e.logsAny}]`, e.logsAny.some((m) => logs.includes(m)), logs.join(','));
+  // Substring match: agents legitimately enrich a log message (e.g.
+  // `inbox-buddy.context channel=… threadsLoaded=…`), so match a prefix/substring
+  // rather than the whole line. Exact messages still match.
+  if (e.logsAny) add(`log any [${e.logsAny}]`, e.logsAny.some((m) => logs.some((l) => l.includes(m))), logs.join(','));
+  // Machine-checked grounding: assert the reply text actually contains the
+  // required facts (case-insensitive substrings), so a hallucinated reply fails
+  // without needing the LLM judge. Only enforced when a real reply was produced
+  // (live runs); dry runs have no reply, so the check is skipped, not failed.
+  if (e.replyContains) {
+    const have = typeof reply === 'string' ? reply : '';
+    if (have) {
+      const missing = e.replyContains.filter((s) => !have.toLowerCase().includes(String(s).toLowerCase()));
+      add(`reply ⊇ [${e.replyContains}]`, missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : 'ok');
+    }
+  }
   return checks;
 }
 
@@ -173,20 +208,26 @@ async function runSimulate(testCase) {
       simulateInvocation({
         persona,
         handler: resolveHandler(mod),
-        envelopes: [buildEnvelope(testCase)],
+        // Multi-turn cases run every turn through ONE simulateInvocation so the
+        // in-memory ctx.memory persists across turns — that shared state is how
+        // we exercise conversational continuity end-to-end here.
+        envelopes: buildEnvelopes(testCase),
         agent: { inputValues: testCase.inputs ?? {} },
         files,
         now: () => new Date('2026-06-10T12:00:00Z'),
       })
     );
-    const run = rec.runs?.[0] ?? {};
-    const sim = run.simulation ?? { sideEffects: [], capturedLogs: [] };
+    // Aggregate side effects/logs across all turns; status/eventSource come from
+    // the LAST turn (a multi-turn case is judged on where it ended up).
+    const runs = rec.runs ?? [];
+    const last = runs[runs.length - 1] ?? {};
+    const sims = runs.map((r) => r.simulation ?? { sideEffects: [], capturedLogs: [] });
     return {
-      status: run.status ?? 'failed',
-      eventSource: run.trigger?.eventSource ?? null,
-      sideEffectKinds: sim.sideEffects.map((s) => s.kind),
-      logs: sim.capturedLogs.map((l) => l.message),
-      error: run.error ?? null,
+      status: last.status ?? 'failed',
+      eventSource: last.trigger?.eventSource ?? runs[0]?.trigger?.eventSource ?? null,
+      sideEffectKinds: sims.flatMap((s) => s.sideEffects.map((e) => e.kind)),
+      logs: sims.flatMap((s) => s.capturedLogs.map((l) => l.message)),
+      error: runs.find((r) => r.error)?.error ?? null,
       reply: null,
     };
   } finally {
@@ -239,11 +280,15 @@ async function runLive(testCase) {
   subs.useSink(sink);
 
   let lastHarnessReply = null;
+  // Every model output in order — for multi-turn chat we judge the LAST turn's
+  // reply (single-turn keeps the existing lastHarnessReply semantics).
+  const replies = [];
   const harness = {
     async run(args) {
       sink.sideEffects.push({ kind: 'harness.run', at: new Date().toISOString(), args: { promptChars: args.prompt.length } });
       const output = opencodeRun(args.prompt, mount);
       lastHarnessReply = output;
+      replies.push(output);
       return { output, exitCode: 0, durationMs: 0 };
     },
   };
@@ -252,6 +297,7 @@ async function runLive(testCase) {
       sink.sideEffects.push({ kind: 'llm.complete', at: new Date().toISOString(), args: { promptChars: prompt.length } });
       const output = opencodeRun(prompt, mount);
       lastHarnessReply = lastHarnessReply ?? output;
+      replies.push(output);
       return output;
     },
   };
@@ -281,29 +327,47 @@ async function runLive(testCase) {
   // outlive the handler, and tearing the dir down mid-write makes the client
   // fall back to cwd and litter a `slack/` tree into the repo. /tmp is fine to
   // leave for the OS to reap.
-  const event = envelopeToAgentEvent(buildEnvelope(testCase));
+  // One event per turn; multi-turn cases share `ctx` (and ctx.memory) so
+  // continuity is exercised across turns.
+  const events = buildEnvelopes(testCase).map((e) => envelopeToAgentEvent(e));
+  const lastEvent = events[events.length - 1];
   // v4 events have no `.source`; derive it from the dotted type for the check.
-  const eventSource = event?.type === 'cron.tick' ? 'cron' : (event?.type?.split('.')[0] ?? null);
+  const eventSource = lastEvent?.type === 'cron.tick' ? 'cron' : (lastEvent?.type?.split('.')[0] ?? null);
   let status = 'succeeded';
   let error = null;
+  // Reply count just before the FINAL turn ran, so we only judge a reply the
+  // last turn actually produced (never silently reuse an earlier turn's output).
+  let lastTurnReplyStart = 0;
   try {
     const mod = await tsImport(pathToFileURL(agentEntry(testCase.agent)).href, import.meta.url);
-    if (!event) throw new Error('envelopeToAgentEvent returned null (unsupported envelope)');
     const handler = resolveHandler(mod);
     process.env.RELAYFILE_MOUNT_ROOT = mount;
     process.env.WORKSPACE_ROOT = mount;
-    await withCaseEnv(personaSpec, testCase.inputs ?? {}, {}, () => handler(ctx, event));
+    await withCaseEnv(personaSpec, testCase.inputs ?? {}, {}, async () => {
+      for (let i = 0; i < events.length; i++) {
+        const event = events[i];
+        if (!event) throw new Error(`envelopeToAgentEvent returned null for turn ${i} (unsupported envelope)`);
+        lastTurnReplyStart = replies.length;
+        await handler(ctx, event);
+      }
+    });
   } catch (err) {
     status = 'failed';
     error = err instanceof Error ? err.message : String(err);
   }
+  // For multi-turn chat, judge ONLY a reply the final turn actually produced —
+  // if the last turn emitted no output, return null rather than masking the
+  // failure with an earlier turn's reply. Single-turn keeps prior semantics.
+  const reply = Array.isArray(testCase.turns) && testCase.turns.length > 0
+    ? (replies.length > lastTurnReplyStart ? replies[replies.length - 1] : null)
+    : lastHarnessReply;
   return {
     status,
     eventSource,
     sideEffectKinds: sink.sideEffects.map((s) => s.kind),
     logs: sink.logs.map((l) => l.message),
     error,
-    reply: lastHarnessReply,
+    reply,
   };
 }
 

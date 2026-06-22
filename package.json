@@ -17,7 +17,7 @@
     "@agentworkforce/persona-kit": "^4.0.0",
     "@agentworkforce/runtime": "^4.0.0",
     "@relayfile/adapter-daytona": "^0.1.1",
-    "@relayfile/relay-helpers": "^0.4.1"
+    "@relayfile/relay-helpers": "^0.4.2"
   },
   "devDependencies": {
     "@types/node": "^22",

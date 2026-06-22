@@ -2,14 +2,14 @@
  * Shared Telegram transport for the `*-telegram` agent variants.
  *
  * Mirrors `inbox-buddy/lib/slack.ts` but for the Telegram adapter
- * (`@relayfile/adapter-telegram`). `telegramClient()` is the generic
- * `providerClient('telegram')` — it has no ergonomic `.post()/.reply()` yet
- * (tracked in AgentWorkforce/relayfile-adapters#222) — so this wraps the
- * low-level `.messages.write({ chatId }, { text, ... })` behind a small `send()`
- * API and provides the message parsing + guards every telegram agent needs.
+ * (`@relayfile/adapter-telegram`). Uses the ergonomic `telegramClient()`
+ * (relay-helpers ≥0.4.2) — `.sendMessage(chatId, text, opts)`, which returns
+ * `{ ok, messageId, ... }` and applies writeback idempotency for us — behind a
+ * small injectable `send()` seam, plus the message parsing + guards every
+ * telegram agent needs.
  *
- * Telegram threading is native: pass `reply_to_message_id` (and
- * `message_thread_id` for forum topics). No `thread_ts`/`parentRef` dance.
+ * Telegram threading is native: pass `replyToMessageId` (and `threadId` for
+ * forum topics). No `thread_ts`/`parentRef` dance.
  */
 import type { WorkforceCtx } from '@agentworkforce/runtime';
 import { telegramClient } from '@relayfile/relay-helpers';
@@ -101,23 +101,21 @@ export interface TelegramSender {
 const WRITEBACK_TIMEOUT_MS = 15_000;
 
 /**
- * Default sender over `telegramClient().messages.write`. Returns `ok:false` when
- * the writeback produced no receipt (cloud writeback often outruns the wait) —
- * callers decide whether that's fatal. Receipt id is read generically
- * (`externalId ?? created ?? id`); there is no telegram-specific receipt helper
- * yet (relayfile-adapters#222).
+ * Default sender over the ergonomic `telegramClient().sendMessage` — which
+ * builds the request body, applies writeback idempotency, and returns
+ * `{ ok, messageId, ... }` directly. `ok:false` means the writeback produced no
+ * receipt (cloud writeback often outruns the wait) — callers decide if that's
+ * fatal.
  */
 export function defaultTelegram(): TelegramSender {
   const tg = telegramClient({ writebackTimeoutMs: WRITEBACK_TIMEOUT_MS });
   return {
     async send(chatId, text, opts) {
-      const body: Record<string, unknown> = { text };
-      if (opts?.replyToMessageId) body.reply_to_message_id = opts.replyToMessageId;
-      if (opts?.threadId) body.message_thread_id = opts.threadId;
-      const res = await tg.messages.write({ chatId: bareChatId(chatId) }, body);
-      const receipt = (res as { receipt?: { externalId?: string; created?: string; id?: string } }).receipt;
-      const messageId = receipt?.externalId ?? receipt?.created ?? receipt?.id;
-      return { ok: Boolean(messageId), messageId: messageId ?? undefined };
+      const res = await tg.sendMessage(bareChatId(chatId), text, {
+        replyToMessageId: opts?.replyToMessageId,
+        threadId: opts?.threadId
+      });
+      return { ok: res.ok, messageId: res.messageId || undefined };
     }
   };
 }

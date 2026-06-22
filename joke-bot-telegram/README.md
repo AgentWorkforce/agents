@@ -1,5 +1,11 @@
 # joke-bot-telegram
 
+<img src="./banner.png" alt="Joke Bot Telegram">
+
+Instantly launch this agent on Agent Relay
+
+[![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?persona=https://github.com/AgentWorkforce/agents/blob/main/joke-bot-telegram/persona.ts)
+
 The **Telegram** sibling of [`joke-bot`](../joke-bot) — message it on Telegram and it replies with a pop-culture / current-events joke, holding a multi-turn conversation (callback humor). Also posts a daily **joke of the day** to the configured chat.
 
 ## How it works

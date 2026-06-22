@@ -1,5 +1,11 @@
 # inbox-buddy-telegram
 
+<img src="./banner.png" alt="Inbox Buddy Telegram">
+
+Instantly launch this agent on Agent Relay
+
+[![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?persona=https://github.com/AgentWorkforce/agents/blob/main/inbox-buddy-telegram/persona.ts)
+
 The **Telegram** sibling of [`inbox-buddy`](../inbox-buddy) — chat with it on Telegram to ask about your Gmail. Same conversational agent (multi-turn continuity + full email-thread reasoning), just a different chat surface.
 
 ```text

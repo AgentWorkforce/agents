@@ -43,6 +43,15 @@ export interface PostRecord {
   stories: Array<{ title: string; url: string; points: number }>;
 }
 
+interface PendingThreadBody {
+  chat: string;
+  header: string;
+  body: string;
+  replyToMessageId?: number;
+  createdAt: string;
+  stories: Array<{ title: string; url: string; points: number }>;
+}
+
 export default defineAgent({
   schedules: [{ name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' }],
   triggers: {
@@ -58,6 +67,8 @@ export default defineAgent({
 
     const chat = input(ctx, 'TELEGRAM_CHAT');
     if (!chat) throw new Error('TELEGRAM_CHAT is required');
+    if (await retryPendingThreadBody(ctx, chat)) return;
+
     const topics = list(input(ctx, 'TOPICS')).map((t) => t.toLowerCase());
 
     const stories = await fetchFrontPage();
@@ -146,10 +157,18 @@ export async function postFreshStories(
   // re-post a duplicate header — so only release the claim + rethrow while
   // nothing has posted yet.
   let headerPosted = false;
+  let pending: PendingThreadBody | null = null;
   try {
     ctx.log?.('info', 'hn-monitor-telegram.summarizing', { fresh: fresh.length });
     const { header, body } = await summarize(ctx, fresh, deps.complete);
     const tg = deps.telegram ?? defaultTelegram();
+    pending = {
+      chat: bareChatId(chat),
+      header,
+      body,
+      createdAt: new Date().toISOString(),
+      stories: fresh.map((s) => ({ title: s.title, url: s.url, points: s.points }))
+    };
 
     // Native Telegram threading: post the header, then post the digest with
     // reply_to_message_id = the header's delivered message id. ok:false means the
@@ -159,6 +178,7 @@ export async function postFreshStories(
     headerPosted = true;
     ctx.log?.('info', 'hn-monitor-telegram.header-posted', { messageId: head.messageId });
     const replyToMessageId = head.messageId ? Number(head.messageId) || undefined : undefined;
+    pending.replyToMessageId = replyToMessageId;
     const reply = await tg.send(bareChatId(chat), body, { replyToMessageId });
     if (!reply.ok) throw new Error(`Telegram threaded digest to ${bareChatId(chat)} got no writeback receipt (silent drop)`);
     ctx.log?.('info', 'hn-monitor-telegram.posted', { messageId: head.messageId });
@@ -175,17 +195,52 @@ export async function postFreshStories(
       await saveSeen(ctx, seen).catch(() => {});
       throw err;
     }
+    if (pending) {
+      await savePendingThreadBody(ctx, pending)
+        .catch((error) => ctx.log?.('error', 'hn-monitor-telegram.pending-save-failed', { error: String(error) }));
+    }
     // The header already posted; releasing + rethrowing would duplicate it on
-    // the runtime's retry. Keep the claim and log loudly instead.
+    // the runtime's retry. Keep the claim and let the next scan retry the body.
     ctx.log?.('error', 'hn-monitor-telegram.thread-incomplete', { error: err instanceof Error ? err.message : String(err) });
   }
+}
+
+export async function retryPendingThreadBody(
+  ctx: WorkforceCtx,
+  chat: string,
+  deps: { telegram?: TelegramSender } = {}
+): Promise<boolean> {
+  const pending = await loadPendingThreadBody(ctx);
+  if (!pending) return false;
+  const targetChat = bareChatId(chat);
+  if (bareChatId(pending.chat) !== targetChat) return false;
+
+  const tg = deps.telegram ?? defaultTelegram();
+  const reply = await tg.send(targetChat, pending.body, { replyToMessageId: pending.replyToMessageId });
+  if (!reply.ok) {
+    ctx.log?.('error', 'hn-monitor-telegram.pending-body-retry-failed', { chat: targetChat });
+    return true;
+  }
+
+  await savePost(ctx, {
+    postedAt: new Date().toISOString(),
+    digest: `${pending.header}\n${pending.body}`,
+    stories: pending.stories
+  });
+  await clearPendingThreadBody(ctx);
+  ctx.log?.('info', 'hn-monitor-telegram.pending-body-posted', { chat: targetChat });
+  return true;
 }
 
 /** Top ~30 front-page stories via the public HN Algolia API. Returns [] on any
  *  network/parse failure so a transient outage doesn't crash the run. */
 async function fetchFrontPage(): Promise<Story[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
   try {
-    const res = await fetch('https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30');
+    const res = await fetch('https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30', {
+      signal: controller.signal
+    });
     if (!res.ok) return [];
     const data = (await res.json()) as { hits: Array<{ objectID: string; title: string; url: string | null; points: number }> };
     return data.hits.map((h) => ({
@@ -196,6 +251,8 @@ async function fetchFrontPage(): Promise<Story[]> {
     }));
   } catch {
     return [];
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -258,6 +315,24 @@ async function saveSeen(ctx: WorkforceCtx, ids: number[]): Promise<void> {
 }
 async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<void> {
   await ctx.memory.save(JSON.stringify(record), { tags: ['hn-monitor-telegram:post'], scope: 'workspace' });
+}
+async function loadPendingThreadBody(ctx: WorkforceCtx): Promise<PendingThreadBody | null> {
+  const [item] = await ctx.memory.recall('hn-monitor pending telegram body', {
+    tags: ['hn-monitor-telegram:pending-thread-body'],
+    limit: 1
+  });
+  if (!item?.content) return null;
+  try {
+    return JSON.parse(item.content) as PendingThreadBody | null;
+  } catch {
+    return null;
+  }
+}
+async function savePendingThreadBody(ctx: WorkforceCtx, pending: PendingThreadBody): Promise<void> {
+  await ctx.memory.save(JSON.stringify(pending), { tags: ['hn-monitor-telegram:pending-thread-body'], scope: 'workspace' });
+}
+async function clearPendingThreadBody(ctx: WorkforceCtx): Promise<void> {
+  await ctx.memory.save('null', { tags: ['hn-monitor-telegram:pending-thread-body'], scope: 'workspace' });
 }
 /** Recalls recent posted digests, newest first, dropping any malformed record. */
 async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {

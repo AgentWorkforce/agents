@@ -17,7 +17,7 @@ import {
 import { handleTelegramMessage as inboxHandle } from '../.test-build/inbox-buddy-telegram/agent.js';
 import { handleTelegramMention, handleJokeOfTheDay } from '../.test-build/joke-bot-telegram/agent.js';
 import { checkReleases } from '../.test-build/spotify-releases-telegram/agent.js';
-import { postFreshStories, handleTelegramMessage as hnHandle } from '../.test-build/hn-monitor-telegram/agent.js';
+import { postFreshStories, retryPendingThreadBody, handleTelegramMessage as hnHandle } from '../.test-build/hn-monitor-telegram/agent.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SEEDS = path.join(HERE, '..', 'evals', 'seeds');
@@ -182,6 +182,34 @@ test('joke-bot-telegram: replies with a joke and saves the turn', async () => {
   assert.equal(saved.length, 1);
 });
 
+test('joke-bot-telegram: replays memory oldest-first', async () => {
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  await ctx.memory.save('User: first\njoke-bot: first reply', { tags: ['joke-convo:telegram:77'], scope: 'workspace' });
+  await ctx.memory.save('User: second\njoke-bot: second reply', { tags: ['joke-convo:telegram:77'], scope: 'workspace' });
+  let prompt = '';
+  await handleTelegramMention(
+    { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '77' }, inputSpecs: {} } },
+    telegramEvent({ chatId: '77', messageId: '9', text: 'callback?' }),
+    { complete: async (p) => { prompt = p; return 'A callback joke.'; }, telegram: tg }
+  );
+  assert.ok(prompt.indexOf('User: first') < prompt.indexOf('User: second'));
+});
+
+test('joke-bot-telegram: sends a fallback when joke generation fails', async () => {
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  await handleTelegramMention(
+    { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '77' }, inputSpecs: {} } },
+    telegramEvent({ chatId: '77', messageId: '10', text: 'joke about outages' }),
+    { complete: async () => { throw new Error('llm unavailable'); }, telegram: tg }
+  );
+  assert.equal(tg.sends.length, 1);
+  assert.match(tg.sends[0].text, /dead mic/);
+  const saved = await ctx.memory.recall('x', { tags: ['joke-convo:telegram:77'] });
+  assert.equal(saved.length, 1);
+});
+
 test('joke-bot-telegram: joke of the day posts to the configured chat', async () => {
   const ctx = makeCtx();
   const tg = makeTelegram();
@@ -210,6 +238,60 @@ test('spotify-releases-telegram: missing TELEGRAM_CHAT fails loudly', async () =
     () => checkReleases({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, { telegram: makeTelegram() }),
     /TELEGRAM_CHAT is required/
   );
+});
+
+test('spotify-releases-telegram: sends same-day releases once and advances only after delivery', async () => {
+  const originalFetch = globalThis.fetch;
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  await ctx.memory.save('2026-06-10', { tags: ['spotify-releases-telegram:last-check'], scope: 'workspace' });
+  globalThis.fetch = async (url) => {
+    const s = String(url);
+    if (s.includes('/me/following')) {
+      return Response.json({ artists: { items: [{ id: 'a1', name: 'Artist One' }] } });
+    }
+    return Response.json({
+      items: [{ name: 'Same Day Single', release_date: '2026-06-10', external_urls: { spotify: 'https://open.spotify.com/album/1' } }]
+    });
+  };
+  try {
+    await checkReleases(
+      { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '5', SPOTIFY_TOKEN: 'tok' }, inputSpecs: {} } },
+      { telegram: tg }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(tg.sends.length, 1);
+  assert.match(tg.sends[0].text, /Same Day Single/);
+  const notified = await ctx.memory.recall('x', { tags: ['spotify-releases-telegram:notified'] });
+  assert.deepEqual(JSON.parse(notified[0].content), ['https://open.spotify.com/album/1']);
+});
+
+test('spotify-releases-telegram: does not checkpoint after a Telegram no-receipt send', async () => {
+  const originalFetch = globalThis.fetch;
+  const ctx = makeCtx();
+  const tg = { sends: [], async send(chatId, text, opts) { this.sends.push({ chatId, text, opts }); return { ok: false }; } };
+  globalThis.fetch = async (url) => {
+    const s = String(url);
+    if (s.includes('/me/following')) {
+      return Response.json({ artists: { items: [{ id: 'a1', name: 'Artist One' }] } });
+    }
+    return Response.json({
+      items: [{ name: 'Undelivered Single', release_date: '2026-06-10', external_urls: { spotify: 'https://open.spotify.com/album/2' } }]
+    });
+  };
+  try {
+    await checkReleases(
+      { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '5', SPOTIFY_TOKEN: 'tok' }, inputSpecs: {} } },
+      { telegram: tg }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(tg.sends.length, 1);
+  assert.equal((await ctx.memory.recall('x', { tags: ['spotify-releases-telegram:last-check'] })).length, 0);
+  assert.equal((await ctx.memory.recall('x', { tags: ['spotify-releases-telegram:notified'] })).length, 0);
 });
 
 // ── hn-monitor-telegram ────────────────────────────────────────────────────────
@@ -247,6 +329,33 @@ test('hn-monitor-telegram: a no-receipt header releases the claim and throws', a
   // Claim was released (restored to prior seen set) so the next tick retries.
   const seen = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:seen'] });
   assert.deepEqual(JSON.parse(seen[0].content), [10]);
+});
+
+test('hn-monitor-telegram: a no-receipt body saves pending state and retries without reposting header', async () => {
+  const ctx = makeCtx();
+  const tg = {
+    sends: [],
+    async send(chatId, text, opts) {
+      this.sends.push({ chatId, text, opts });
+      return this.sends.length === 1 ? { ok: true, messageId: '101' } : { ok: false };
+    }
+  };
+  await postFreshStories({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, '900', [10], [STORY], {
+    complete: async () => 'body',
+    telegram: tg
+  });
+  assert.equal(tg.sends.length, 2);
+  const pending = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:pending-thread-body'] });
+  assert.equal(JSON.parse(pending[0].content).replyToMessageId, 101);
+  assert.equal((await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:post'] })).length, 0);
+
+  const retryTg = makeTelegram();
+  assert.equal(await retryPendingThreadBody({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, '900', { telegram: retryTg }), true);
+  assert.equal(retryTg.sends.length, 1);
+  assert.equal(retryTg.sends[0].opts.replyToMessageId, 101);
+  assert.equal((await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:post'] })).length, 1);
+  const latestPending = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:pending-thread-body'] });
+  assert.equal(latestPending[0].content, 'null');
 });
 
 test('hn-monitor-telegram: Q&A path answers from recalled posts', async () => {

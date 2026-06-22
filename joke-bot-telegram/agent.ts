@@ -42,6 +42,8 @@ const COMEDIAN_PREAMBLE =
   'setup→punchline over puns. Good-natured: no slurs, no punching down, nothing mean about the ' +
   'person you are talking to. If the user is continuing an earlier bit, build on it (callback humor). ' +
   'Output ONLY the reply text — no preamble, no quotes, no stage directions.';
+const LLM_TIMEOUT_MS = 30_000;
+const FALLBACK_JOKE = "I hit a dead mic for a second, but I'm still here. Try me again?";
 
 export default defineAgent({
   schedules: [{ name: 'joke-of-the-day', cron: '0 16 * * *', tz: 'UTC' }],
@@ -89,7 +91,13 @@ export async function handleTelegramMention(
   const question = msg.text.trim();
   const key = conversationKeyForTelegram(msg);
   const tag = `joke-convo:telegram:${key}`;
-  const reply = await joke(ctx, buildPrompt(await recall(ctx, tag), question), deps.complete);
+  let reply: string;
+  try {
+    reply = await joke(ctx, buildPrompt(await recall(ctx, tag), question), deps.complete);
+  } catch (error) {
+    ctx.log?.('warn', 'joke-bot-telegram.llm-fallback', { error: String(error) });
+    reply = FALLBACK_JOKE;
+  }
   await replyToMessage(ctx, tg, msg, reply);
   await remember(ctx, tag, question, reply);
   ctx.log?.('info', 'joke-bot-telegram.replied', { chat: bareChatId(msg.chatId), chars: reply.length });
@@ -103,11 +111,17 @@ export async function handleJokeOfTheDay(ctx: WorkforceCtx, deps: JokeDeps = {})
     return;
   }
   const tg = deps.telegram ?? defaultTelegram();
-  const reply = await joke(
-    ctx,
-    'Give me one short, original "joke of the day" about recent tech / pop-culture / current events.',
-    deps.complete
-  );
+  let reply: string;
+  try {
+    reply = await joke(
+      ctx,
+      'Give me one short, original "joke of the day" about recent tech / pop-culture / current events.',
+      deps.complete
+    );
+  } catch (error) {
+    ctx.log?.('warn', 'joke-bot-telegram.jotd.llm-fallback', { error: String(error) });
+    reply = FALLBACK_JOKE;
+  }
   const res = await tg.send(bareChatId(chat), `🃏 Joke of the day:\n${reply}`);
   if (!res.ok) ctx.log?.('warn', 'joke-bot-telegram.jotd.no-receipt', { chat: bareChatId(chat) });
   else ctx.log?.('info', 'joke-bot-telegram.jotd-posted', { chat: bareChatId(chat) });
@@ -122,7 +136,7 @@ async function joke(
   complete?: (prompt: string) => Promise<string>
 ): Promise<string> {
   const run = complete ?? ((p: string) => ctx.llm.complete(p, { maxTokens: 300 }));
-  const reply = (await run(`${COMEDIAN_PREAMBLE}\n\n${context}`)).trim();
+  const reply = (await withTimeout(run(`${COMEDIAN_PREAMBLE}\n\n${context}`), LLM_TIMEOUT_MS, 'ctx.llm.complete')).trim();
   if (!reply) throw new Error('ctx.llm.complete returned an empty reply');
   return reply;
 }
@@ -144,11 +158,12 @@ function toLines(records: unknown): string[] {
 }
 
 async function recall(ctx: WorkforceCtx, tag: string): Promise<string[]> {
-  return toLines(
+  const lines = toLines(
     await ctx.memory
       .recall('recent joke-bot conversation', { tags: [tag], limit: CONVO_TURNS, scope: 'workspace' })
       .catch(() => [])
   );
+  return lines.reverse();
 }
 
 async function remember(ctx: WorkforceCtx, tag: string, user: string, reply: string): Promise<void> {
@@ -163,4 +178,16 @@ function input(ctx: WorkforceCtx, name: string): string | undefined {
   const raw = process.env[spec?.env ?? name] ?? ctx.persona?.inputs?.[name] ?? spec?.default;
   const v = raw != null ? String(raw).trim() : '';
   return v || undefined;
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
 }

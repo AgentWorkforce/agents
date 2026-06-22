@@ -130,7 +130,11 @@ export async function handleInboxMessage(
 }
 
 interface SlackPoster {
-  post(channel: string, text: string): Promise<{ ts: string }>;
+  // Mirrors @relayfile/relay-helpers slackClient().post: returns the delivered
+  // `ts` plus a draft `ref`. Passing a prior post's `ref` as `opts.replyTo`
+  // threads the new message under it via the cloud's server-side ordered dispatch
+  // (no parent-receipt round-trip — see slack.d.ts).
+  post(channel: string, text: string, opts?: { replyTo?: string }): Promise<{ ts: string; ref?: string }>;
 }
 
 export async function postFreshStories(
@@ -146,33 +150,50 @@ export async function postFreshStories(
   // first means a concurrent re-invocation loads these ids as already-seen and
   // stays silent instead of double-posting.
   await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
+  // Once the header lands in the channel, a thrown handler is RETRIED by the
+  // runtime and would re-post a duplicate header — so only release the claim +
+  // rethrow while nothing has been posted yet (see catch below). Mirrors the
+  // server-side threading pattern in internal-agents x-reply-radar.
+  let headerPosted = false;
   try {
     ctx.log('info', 'hn-monitor.summarizing', { fresh: fresh.length });
-    const digest = await summarize(ctx, fresh);
+    const { header, body } = await summarize(ctx, fresh);
+    ctx.log('info', 'hn-monitor.posting', { channel });
+
+    // Thread the digest under a compact count header: post the header, then post
+    // the body with `replyTo: head.ref` so the cloud orders it after the header
+    // delivers and sets thread_ts server-side — no parent-receipt round-trip.
     // post() resolves with ts:'' (no throw) when the writeback gets no receipt,
     // so an empty ts is a SILENT DROP, not success — make it a loud failure
-    // (matches daytona-monitor / pr-reviewer). Without this, a dropped digest
-    // looked like a success and was never retried.
-    ctx.log('info', 'hn-monitor.posting', { channel });
-    const res = await client.post(channel, digest);
-    if (!res.ts) throw new Error(`Slack post to ${channel} got no writeback receipt (silent drop)`);
-    ctx.log('info', 'hn-monitor.posted', { ts: res.ts });
+    // (matches daytona-monitor / pr-reviewer).
+    const head = await client.post(channel, header);
+    if (!head.ts) throw new Error(`Slack header post to ${channel} got no writeback receipt (silent drop)`);
+    headerPosted = true;
+    ctx.log('info', 'hn-monitor.header-posted', { ts: head.ts });
+    const reply = await client.post(channel, body, { replyTo: head.ref });
+    if (!reply.ts) throw new Error(`Slack threaded digest to ${channel} got no writeback receipt (silent drop)`);
+    ctx.log('info', 'hn-monitor.posted', { ts: head.ts, threadTs: reply.ts });
+
     // Retain the digest so a user can DM the agent and ask about recent posts.
     // ttlDays (30) on memory ages these out, giving a rolling ~30-day window.
     await savePost(ctx, {
       postedAt: new Date().toISOString(),
-      digest,
+      digest: `${header}\n${body}`,
       stories: fresh.map((s) => ({ title: s.title, url: s.url, points: s.points }))
     });
   } catch (err) {
-    // The claim was provisional: summarize or post failed, so RELEASE it by
-    // restoring the prior seen set. The next tick then retries this digest
-    // instead of dropping it forever — the old behavior marked the stories seen
-    // permanently, so a single transient LLM/Slack failure made the agent go
-    // silent for good. Releasing keeps the double-post guard (ids stay claimed
-    // for the duration of the attempt) while making a failed run self-heal.
-    await saveSeen(ctx, seen).catch(() => {});
-    throw err;
+    if (!headerPosted) {
+      // Nothing landed in the channel yet (summarize or the header post failed),
+      // so the claim was provisional: RELEASE it by restoring the prior seen set
+      // and rethrow, so the next tick retries this digest instead of dropping it
+      // forever. Releasing keeps the double-post guard (ids stay claimed for the
+      // duration of the attempt) while making a failed run self-heal.
+      await saveSeen(ctx, seen).catch(() => {});
+      throw err;
+    }
+    // The header already posted; releasing + rethrowing would make the runtime's
+    // retry re-post a duplicate header. Keep the claim and log loudly instead.
+    ctx.log('error', 'hn-monitor.thread-incomplete', { error: err instanceof Error ? err.message : String(err) });
   }
 }
 
@@ -194,13 +215,14 @@ async function fetchFrontPage(): Promise<Story[]> {
   }
 }
 
-async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<string> {
+/** Split into the count `header` (the channel-level parent message) and the
+ *  `body` (the digest, threaded under it). ctx.llm.complete() can hang
+ *  indefinitely (cloud/runtime bug — see PR) or error, so summarize() must
+ *  ALWAYS return a postable body: race the call against a timeout, and on
+ *  timeout/error fall back to a plain bulleted digest from the story lines. */
+async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header: string; body: string }> {
   const lines = stories.map((s) => `- ${s.title} (${s.points} pts) ${s.url}`).join('\n');
   const header = `:newspaper: *Hacker News* — ${stories.length} new match(es)`;
-  // ctx.llm.complete() can hang indefinitely (cloud/runtime bug — see PR) or
-  // error. summarize() must ALWAYS return a postable string so the digest still
-  // lands: race the call against a timeout, and on timeout/error fall back to a
-  // plain bulleted digest built from the story lines we already have.
   try {
     const digest = await withTimeout(
       ctx.llm.complete(
@@ -210,10 +232,10 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<string> {
       45_000,
       'ctx.llm.complete'
     );
-    return `${header}\n${digest.trim()}`;
+    return { header, body: digest.trim() };
   } catch (error) {
     ctx.log('warn', 'hn-monitor.llm-fallback', { error: String(error) });
-    return `${header}\n${lines}`;
+    return { header, body: lines };
   }
 }
 

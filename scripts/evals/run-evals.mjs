@@ -165,7 +165,10 @@ function checkExpectations(testCase, { status, eventSource, sideEffectKinds, log
   if (e.eventSource) add(`source=${e.eventSource}`, eventSource === e.eventSource, `got ${eventSource}`);
   for (const k of e.sideEffectsAll ?? []) add(`has ${k}`, sideEffectKinds.includes(k), sideEffectKinds.join(','));
   if (e.sideEffectsAny) add(`any of [${e.sideEffectsAny}]`, e.sideEffectsAny.some((k) => sideEffectKinds.includes(k)), sideEffectKinds.join(','));
-  if (e.logsAny) add(`log any [${e.logsAny}]`, e.logsAny.some((m) => logs.includes(m)), logs.join(','));
+  // Substring match: agents legitimately enrich a log message (e.g.
+  // `inbox-buddy.context channel=… threadsLoaded=…`), so match a prefix/substring
+  // rather than the whole line. Exact messages still match.
+  if (e.logsAny) add(`log any [${e.logsAny}]`, e.logsAny.some((m) => logs.some((l) => l.includes(m))), logs.join(','));
   return checks;
 }
 

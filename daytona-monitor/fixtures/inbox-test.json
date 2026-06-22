@@ -1,0 +1,11 @@
+{
+  "id": "evt-inbox-test-1",
+  "workspace": "ws-test",
+  "type": "relaycast.message",
+  "occurredAt": "2026-06-17T12:00:00Z",
+  "resource": {
+    "channel": "dm_inbox_test",
+    "messageId": "m-inbox-test-1",
+    "text": "What's the current sandbox status? Any errors or stale sandboxes running?"
+  }
+}

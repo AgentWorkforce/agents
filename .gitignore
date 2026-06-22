@@ -4,6 +4,12 @@ node_modules/
 */persona.json
 .claude/
 
+# Local agent CLI/tooling state + build output — never commit
+.agentworkforce/
+.test-build/
+# OpenCode CLI config — contains live relay credentials, must stay local
+opencode.json
+
 # Relay VFS runtime state — rewritten on every reconcile cycle, never commit it
 .relay/
 memory/workspace/.relay/

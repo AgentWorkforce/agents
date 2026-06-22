@@ -53,12 +53,18 @@ export async function loadConversation(ctx: WorkforceCtx, key: string): Promise<
   }
 }
 
-/** Persist the transcript (trimmed to the last MAX_TURNS) for a conversation. */
+/** Persist the transcript (trimmed to the last MAX_TURNS) for a conversation.
+ *  Best-effort: a transient memory outage should degrade continuity, not abort
+ *  the chat reply — so we log and continue (same tolerance as loadConversation). */
 export async function saveConversation(ctx: WorkforceCtx, key: string, turns: ConvTurn[]): Promise<void> {
-  await ctx.memory.save(JSON.stringify(turns.slice(-MAX_TURNS)), {
-    tags: [convTag(key)],
-    scope: 'workspace'
-  });
+  try {
+    await ctx.memory.save(JSON.stringify(turns.slice(-MAX_TURNS)), {
+      tags: [convTag(key)],
+      scope: 'workspace'
+    });
+  } catch (error) {
+    ctx.log?.('warn', 'inbox-buddy.conversation-save-failed', { key, error: String(error) });
+  }
 }
 
 /**

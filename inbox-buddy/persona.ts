@@ -42,9 +42,18 @@ export default definePersona({
 
   integrations: {
     // Gmail threads materialize under /google-mail (provider id `google-mail`).
-    // `/google-mail/**` mounts the threads + LAYOUT.md the handler reads. An
-    // unscoped mirror (or a `/gmail/**` scope) would mount nothing.
-    'google-mail': { scope: { paths: '/google-mail/**' } },
+    // The cloud runtime mount DROPS provider-root globs (`/google-mail/**`) via
+    // isProviderRootPath to avoid mirroring whole providers — so a `/google-mail/**`
+    // scope is granted in the token but never mirrored, and loadRecentThreads()
+    // sees an empty dir and reports no Gmail. Naming subpaths survives the filter
+    // (same stack as linear-slack), so scope the concrete subtree the handler
+    // reads (`/google-mail/threads/**`) + the root LAYOUT.md file directly.
+    'google-mail': {
+      scope: {
+        threads: '/google-mail/threads/**',
+        layout: '/google-mail/LAYOUT.md'
+      }
+    },
     // The slack trigger only mirrors the chat channel READ-ONLY at the
     // display-labelled path; slackClient().post() writes to the canonical
     // bare-id path, which only a non-empty `scope` mounts — without it every

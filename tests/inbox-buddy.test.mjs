@@ -24,6 +24,7 @@ import {
   stripLeadingMention
 } from '../.test-build/inbox-buddy/lib/slack.js';
 import { handleSlackMessage } from '../.test-build/inbox-buddy/agent.js';
+import inboxBuddyPersona from '../.test-build/inbox-buddy/persona.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SEEDS = path.join(HERE, '..', 'evals', 'seeds');
@@ -293,14 +294,23 @@ test('loadRecentThreads ignores _index.json and non-thread files', async () => {
 
 // ── persona config invariant (§1 scope trap) ──────────────────────────────────
 
-test('compiled persona scopes the REAL gmail mount (/google-mail, not legacy /gmail) + slack', async () => {
-  const persona = JSON.parse(readFileSync(path.join(HERE, '..', 'inbox-buddy', 'persona.json'), 'utf8'));
-  const parsed = parseIntegrations(persona.integrations ?? {}, 'inbox-buddy.integrations') ?? {};
+test('compiled persona scopes the REAL gmail mount (/google-mail subtree, not the dropped provider root or legacy /gmail) + slack', async () => {
+  // Read the tsc-compiled persona module (reproducible from `npm test` alone),
+  // not the gitignored `persona.json` (only produced by `npm run compile`).
+  const parsed = parseIntegrations(inboxBuddyPersona.integrations ?? {}, 'inbox-buddy.integrations') ?? {};
 
   const gmailScope = parsed['google-mail']?.scope;
   assert.ok(gmailScope && Object.keys(gmailScope).length > 0, 'google-mail must carry a non-empty scope');
-  assert.equal(gmailScope.paths, '/google-mail/**');
-  assert.notEqual(gmailScope.paths, '/gmail/**');
+  const gmailPaths = Object.values(gmailScope).filter((p) => typeof p === 'string');
+  // Must mount the concrete threads subtree the handler reads...
+  assert.ok(
+    gmailPaths.some((p) => p.startsWith('/google-mail/threads')),
+    'must scope the /google-mail/threads subtree the handler reads'
+  );
+  // ...and must NOT rely on the provider-root glob (dropped by isProviderRootPath)
+  // or the legacy /gmail provider id.
+  assert.ok(!gmailPaths.includes('/google-mail/**'), 'must not use the dropped provider-root glob');
+  assert.ok(!gmailPaths.some((p) => p.startsWith('/gmail/')), 'must not use the legacy /gmail path');
 
   // Slack is the human chat channel and is WRITTEN to → needs a non-empty scope
   // (a trigger only mirrors the display-labelled read path, not the writeback path).

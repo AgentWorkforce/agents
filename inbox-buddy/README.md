@@ -4,7 +4,7 @@ Chat with this agent in a dedicated **Slack channel** to ask about your Gmail.
 It holds a **multi-turn conversation** (remembers earlier turns) and reasons over
 **full email threads** (not single messages).
 
-```
+```text
 You → #your-channel:  What's the latest on the Q3 export thread with Alice?
 inbox-buddy →         Alice will send the final Q3 numbers by Friday and looped in finance for sign-off.
 You →                 Who did she loop in?

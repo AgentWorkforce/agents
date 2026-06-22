@@ -156,7 +156,7 @@ function withCaseEnv(persona, inputs, extraEnv, fn) {
 }
 
 // ── deterministic checks shared by both executors ─────────────────────────────
-function checkExpectations(testCase, { status, eventSource, sideEffectKinds, logs, error }) {
+function checkExpectations(testCase, { status, eventSource, sideEffectKinds, logs, error, reply }) {
   const e = testCase.expect ?? {};
   const checks = [];
   const add = (name, pass, detail) => checks.push({ name, pass, detail });
@@ -169,6 +169,17 @@ function checkExpectations(testCase, { status, eventSource, sideEffectKinds, log
   // `inbox-buddy.context channel=… threadsLoaded=…`), so match a prefix/substring
   // rather than the whole line. Exact messages still match.
   if (e.logsAny) add(`log any [${e.logsAny}]`, e.logsAny.some((m) => logs.some((l) => l.includes(m))), logs.join(','));
+  // Machine-checked grounding: assert the reply text actually contains the
+  // required facts (case-insensitive substrings), so a hallucinated reply fails
+  // without needing the LLM judge. Only enforced when a real reply was produced
+  // (live runs); dry runs have no reply, so the check is skipped, not failed.
+  if (e.replyContains) {
+    const have = typeof reply === 'string' ? reply : '';
+    if (have) {
+      const missing = e.replyContains.filter((s) => !have.toLowerCase().includes(String(s).toLowerCase()));
+      add(`reply ⊇ [${e.replyContains}]`, missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : 'ok');
+    }
+  }
   return checks;
 }
 

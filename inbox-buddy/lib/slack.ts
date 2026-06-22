@@ -74,12 +74,23 @@ export function stripLeadingMention(text: string): string {
 }
 
 /**
+ * Strip the `__name` suffix the platform appends to channel ids in some payloads
+ * (e.g. `/slack/channels/{id__name}/**`). Bare Slack ids never contain `__`, so
+ * this is a safe no-op when the id is already bare. Use it before comparing
+ * channels, keying memory, or calling the Slack API.
+ */
+export function bareChannelId(channel: string): string {
+  return channel.split('__')[0];
+}
+
+/**
  * Conversation key for continuity. A threaded message keys on its thread; a
  * top-level message keys on the CHANNEL itself, so consecutive top-level
  * messages in a dedicated chat channel form one continuous conversation.
  */
 export function conversationKeyForSlack(msg: SlackMessage): string {
-  return msg.threadTs ? `${msg.channel}:${msg.threadTs}` : msg.channel;
+  const chanId = bareChannelId(msg.channel);
+  return msg.threadTs ? `${chanId}:${msg.threadTs}` : chanId;
 }
 
 /**
@@ -90,7 +101,7 @@ export function conversationKeyForSlack(msg: SlackMessage): string {
 export function skipReason(msg: SlackMessage, boardChannel: string | undefined): string | null {
   if (msg.isBot) return 'bot message';
   if (msg.subtype) return `slack subtype ${msg.subtype}`;
-  if (boardChannel && msg.channel !== boardChannel) return 'not the chat channel';
+  if (boardChannel && bareChannelId(msg.channel) !== bareChannelId(boardChannel)) return 'not the chat channel';
   if (!stripLeadingMention(msg.text).trim()) return 'empty message text';
   return null;
 }
@@ -103,10 +114,11 @@ export async function postReply(
   msg: SlackMessage,
   text: string
 ): Promise<void> {
+  const chanId = bareChannelId(msg.channel);
   const result = msg.threadTs
-    ? await slack.reply(msg.channel, msg.threadTs, text)
-    : await slack.post(msg.channel, text);
+    ? await slack.reply(chanId, msg.threadTs, text)
+    : await slack.post(chanId, text);
   if (!result?.ts) {
-    ctx.log?.('warn', 'inbox-buddy.reply.no-receipt', { channel: msg.channel, threaded: Boolean(msg.threadTs) });
+    ctx.log?.('warn', 'inbox-buddy.reply.no-receipt', { channel: chanId, threaded: Boolean(msg.threadTs) });
   }
 }

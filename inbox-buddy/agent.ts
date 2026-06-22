@@ -21,8 +21,8 @@
 import {
   defineAgent,
   resolveMountRoot,
-  type WorkforceCtx,
-  type WorkforceEvent
+  type AgentEvent,
+  type WorkforceCtx
 } from '@agentworkforce/runtime';
 import {
   loadConversation,
@@ -57,7 +57,11 @@ export default defineAgent({
     slack: [{ on: 'app_mention' }]
   },
   handler: async (ctx, event) => {
-    await handleSlackMessage(ctx, event);
+    // defineAgent infers the event as `slack.app_mention`, but the runtime's
+    // exported event unions don't yet carry that literal, so the inferred type
+    // isn't assignable to AgentEvent. Cast across the runtime type-defs gap; the
+    // handler only touches `.type`/`.expand()`, which every event provides.
+    await handleSlackMessage(ctx, event as unknown as AgentEvent);
   }
 });
 
@@ -69,7 +73,7 @@ export default defineAgent({
  */
 export async function handleSlackMessage(
   ctx: WorkforceCtx,
-  event: WorkforceEvent,
+  event: AgentEvent,
   deps: {
     complete?: (prompt: string) => Promise<string>;
     slack?: SlackPoster;

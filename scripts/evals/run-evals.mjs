@@ -93,8 +93,10 @@ function buildEnvelope(testCase, turn, idx = 0) {
   // `resource` (and channel/messageId are promoted to top-level for relaycast).
   if (turn) {
     env.resource = { ...(f.resource ?? {}), ...turn };
-    if (turn.channel) env.channel = turn.channel;
-    if (turn.messageId) env.messageId = turn.messageId;
+    // Promote routing fields from the MERGED resource so a turn that omits
+    // channel/messageId still inherits them from fixture.resource.
+    if (env.resource.channel) env.channel = env.resource.channel;
+    if (env.resource.messageId) env.messageId = env.resource.messageId;
   } else if (f.resource) {
     env.resource = f.resource;
     if (f.resource.channel) env.channel = f.resource.channel;
@@ -333,6 +335,9 @@ async function runLive(testCase) {
   const eventSource = lastEvent?.type === 'cron.tick' ? 'cron' : (lastEvent?.type?.split('.')[0] ?? null);
   let status = 'succeeded';
   let error = null;
+  // Reply count just before the FINAL turn ran, so we only judge a reply the
+  // last turn actually produced (never silently reuse an earlier turn's output).
+  let lastTurnReplyStart = 0;
   try {
     const mod = await tsImport(pathToFileURL(agentEntry(testCase.agent)).href, import.meta.url);
     const handler = resolveHandler(mod);
@@ -342,6 +347,7 @@ async function runLive(testCase) {
       for (let i = 0; i < events.length; i++) {
         const event = events[i];
         if (!event) throw new Error(`envelopeToAgentEvent returned null for turn ${i} (unsupported envelope)`);
+        lastTurnReplyStart = replies.length;
         await handler(ctx, event);
       }
     });
@@ -349,9 +355,11 @@ async function runLive(testCase) {
     status = 'failed';
     error = err instanceof Error ? err.message : String(err);
   }
-  // For multi-turn chat, judge the LAST turn's reply; otherwise keep prior semantics.
+  // For multi-turn chat, judge ONLY a reply the final turn actually produced —
+  // if the last turn emitted no output, return null rather than masking the
+  // failure with an earlier turn's reply. Single-turn keeps prior semantics.
   const reply = Array.isArray(testCase.turns) && testCase.turns.length > 0
-    ? (replies[replies.length - 1] ?? lastHarnessReply)
+    ? (replies.length > lastTurnReplyStart ? replies[replies.length - 1] : null)
     : lastHarnessReply;
   return {
     status,

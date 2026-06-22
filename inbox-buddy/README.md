@@ -1,5 +1,7 @@
 # inbox-buddy
 
+<img src="./banner.png" alt="inbox-buddy">
+
 Chat with this agent in a dedicated **Slack channel** to ask about your Gmail.
 It holds a **multi-turn conversation** (remembers earlier turns) and reasons over
 **full email threads** (not single messages).
@@ -52,7 +54,7 @@ getting wrong:
 
 | input | required | purpose |
 |---|---|---|
-| `SLACK_CHANNEL` | yes | The dedicated Slack channel inbox-buddy chats in (id is interpolated into the trigger watch path). |
+| `SLACK_CHANNEL` | no | Optional: restrict replies to one Slack channel id. Unset = reply wherever inbox-buddy is `@mentioned`. (`app_mention` is webhook-driven, so the id is not interpolated into a watch path.) |
 
 ## Local testing
 

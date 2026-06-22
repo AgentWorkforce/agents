@@ -1,6 +1,8 @@
 Neon Monitor
 ==============
 
+<img src="./banner.png" alt="Neon Monitor">
+
 A proactive agent that watches your **Neon** database organization's
 infrastructure health — failed operations, endpoints stuck waking/thrashing,
 advisor issues, and runaway compute/spend — and posts a Slack alert only when

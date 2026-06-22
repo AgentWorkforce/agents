@@ -29,6 +29,14 @@ import inboxBuddyPersona from '../.test-build/inbox-buddy/persona.js';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SEEDS = path.join(HERE, '..', 'evals', 'seeds');
 
+// Tests pin RELAYFILE_MOUNT_ROOT to a temp dir; restore the runner's prior value
+// (rather than blindly deleting) so a pre-set env doesn't leak away between cases.
+const ORIG_MOUNT_ROOT = process.env.RELAYFILE_MOUNT_ROOT;
+function restoreMountRoot() {
+  if (ORIG_MOUNT_ROOT === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+  else process.env.RELAYFILE_MOUNT_ROOT = ORIG_MOUNT_ROOT;
+}
+
 const THREAD_FILES = {
   T_alice_export: 'gmail-thread-alice-export.json',
   T_github_pr: 'gmail-thread-github-pr.json',
@@ -220,7 +228,7 @@ test('multi-turn: turn 2 prompt replays turn 1 (continuity across messages)', as
     assert.equal(slack.calls[0].text, turn1Answer);
     assert.equal(slack.calls[1].text, turn2Answer);
   } finally {
-    delete process.env.RELAYFILE_MOUNT_ROOT;
+    restoreMountRoot();
     rmSync(mount, { recursive: true, force: true });
   }
 });
@@ -242,7 +250,7 @@ test('handleSlackMessage loads threads from the mount and focuses the right one'
     assert.equal(ctxLog.data.focusedThreads[0], 'T_alice_export');
     assert.match(seenPrompt, /Threads in focus/);
   } finally {
-    delete process.env.RELAYFILE_MOUNT_ROOT;
+    restoreMountRoot();
     rmSync(mount, { recursive: true, force: true });
   }
 });
@@ -276,7 +284,7 @@ test('handleSlackMessage replies in-thread when the message is threaded', async 
     assert.equal(slack.calls[0].kind, 'reply');
     assert.equal(slack.calls[0].threadTs, '4');
   } finally {
-    delete process.env.RELAYFILE_MOUNT_ROOT;
+    restoreMountRoot();
     rmSync(mount, { recursive: true, force: true });
   }
 });

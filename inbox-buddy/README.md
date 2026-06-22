@@ -2,6 +2,10 @@
 
 <img src="./banner.png" alt="inbox-buddy">
 
+Instantly launch this agent on Agent Relay
+
+[![Launch Agent](https://agentrelay.com/launch-agent_small.svg)](https://agentrelay.com/cloud/deploy?persona=https://github.com/AgentWorkforce/agents/blob/main/inbox-buddy/persona.ts)
+
 Chat with this agent in a dedicated **Slack channel** to ask about your Gmail.
 It holds a **multi-turn conversation** (remembers earlier turns) and reasons over
 **full email threads** (not single messages).

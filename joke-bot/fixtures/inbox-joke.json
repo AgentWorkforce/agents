@@ -1,0 +1,11 @@
+{
+  "id": "evt-jokebot-inbox-1",
+  "workspace": "ws-test",
+  "type": "relaycast.message",
+  "occurredAt": "2026-06-21T20:00:00Z",
+  "resource": {
+    "channel": "dm_inbox_test",
+    "messageId": "m-jokebot-1",
+    "text": "tell me a joke about AI hype"
+  }
+}

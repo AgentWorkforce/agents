@@ -328,7 +328,7 @@ function saveHeaderRefs(result: DeliveryResult): PendingThreadBody['headerRefs']
 
 // ── pending thread body recovery ─────────────────────────────────────────
 
-async function retryPendingThreadBody(
+export async function retryPendingThreadBody(
   ctx: WorkforceCtx,
   delivery: DeliveryClient
 ): Promise<boolean> {

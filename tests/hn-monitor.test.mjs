@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 
-import { handleQaMessage, postFreshStories } from '../.test-build/hn-monitor/agent.js';
+import { handleQaMessage, postFreshStories, retryPendingThreadBody } from '../.test-build/hn-monitor/agent.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -275,4 +275,120 @@ test('handleQaMessage with no text logs and returns without answering', async ()
 
   assert.equal(recalled, false);
   assert.equal(llmCalled, false);
+});
+
+// ── recovery tests ──────────────────────────────────────────────────────
+
+test('retryPendingThreadBody retries threaded body using saved headerRefs', async () => {
+  const saved = [];
+  const ctx = {
+    log() {},
+    persona: {
+      inputs: { SLACK_CHANNEL: 'C123' },
+      inputSpecs: {
+        SLACK_CHANNEL: { env: 'SLACK_CHANNEL', description: '', optional: true },
+        TELEGRAM_CHAT: { env: 'TELEGRAM_CHAT', description: '', optional: true },
+      }
+    },
+    memory: {
+      async save(content, opts) {
+        saved.push({ content, opts });
+      },
+      async recall(query, opts) {
+        if (opts?.tags?.includes('hn-monitor:pending-thread-body')) {
+          // Pre-saved pending body from a prior partial failure
+          return [{
+            id: 'p1',
+            content: JSON.stringify({
+              targets: 'slack',
+              header: ':newspaper: *Hacker News* — 1 new match(es)',
+              body: 'digest body',
+              createdAt: '2026-06-17T09:00:00.000Z',
+              stories: [{ title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 }],
+              headerRefs: [
+                { provider: 'slack', channel: 'C123', draftRef: 'ref-original' }
+              ],
+            }),
+          }];
+        }
+        return [];
+      },
+    },
+  };
+
+  let sentText = null;
+  let sentOpts = null;
+  const delivery = {
+    targets: ['slack'],
+    async send(text, opts) {
+      sentText = text;
+      sentOpts = opts;
+      return { ok: true, refs: [{ provider: 'slack', channel: 'C123', ts: '', draftRef: 'ref-retry' }] };
+    },
+    async publish() {
+      return { ok: true, refs: [] };
+    },
+  };
+
+  const result = await retryPendingThreadBody(ctx, delivery);
+
+  assert.equal(result, true, 'retry should succeed');
+  assert.equal(sentText, 'digest body');
+  // Should be non-blocking with replyTo reconstructed from headerRefs
+  assert.equal(sentOpts.nonBlocking, true);
+  assert.ok(sentOpts.replyTo, 'replyTo should be reconstructed from headerRefs');
+  assert.equal(sentOpts.replyTo.refs.length, 1);
+  assert.equal(sentOpts.replyTo.refs[0].draftRef, 'ref-original');
+  assert.equal(sentOpts.replyTo.refs[0].messageId, undefined, 'Slack ref has no messageId field');
+
+  // Pending state should be cleared AND post saved
+  const clearCall = saved.find((s) => s.content === 'null' && s.opts?.tags?.includes('hn-monitor:pending-thread-body'));
+  assert.ok(clearCall, 'pending state should be cleared after successful retry');
+  const postCall = saved.find((s) => s.opts?.tags?.includes('hn-monitor:post'));
+  assert.ok(postCall, 'post should be saved after successful retry');
+});
+
+test('retryPendingThreadBody clears orphaned pending body when targets change', async () => {
+  const saved = [];
+  const ctx = {
+    log() {},
+    persona: {
+      inputs: { SLACK_CHANNEL: 'C123' },
+      inputSpecs: {
+        SLACK_CHANNEL: { env: 'SLACK_CHANNEL', description: '', optional: true },
+        TELEGRAM_CHAT: { env: 'TELEGRAM_CHAT', description: '', optional: true },
+      }
+    },
+    memory: {
+      async save(content, opts) { saved.push({ content, opts }); },
+      async recall(query, opts) {
+        if (opts?.tags?.includes('hn-monitor:pending-thread-body')) {
+          return [{
+            id: 'p1',
+            content: JSON.stringify({
+              targets: 'slack',  // saved when only slack was configured
+              header: 'old header',
+              body: 'old body',
+              createdAt: '2026-06-17T09:00:00.000Z',
+              stories: [],
+              headerRefs: [],
+            }),
+          }];
+        }
+        return [];
+      },
+    },
+  };
+
+  const delivery = {
+    targets: ['slack', 'telegram'],  // now both are configured — mismatch
+    async send() { return { ok: false, refs: [] }; },
+    async publish() { return { ok: true, refs: [] }; },
+  };
+
+  const result = await retryPendingThreadBody(ctx, delivery);
+
+  assert.equal(result, false, 'retry should bail when targets mismatch');
+  const clearCall = saved.find((s) => s.content === 'null' && s.opts?.tags?.includes('hn-monitor:pending-thread-body'));
+  assert.ok(clearCall, 'orphaned pending body should be cleared when targets change');
 });

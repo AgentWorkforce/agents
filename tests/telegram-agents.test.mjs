@@ -17,7 +17,7 @@ import {
 import { handleTelegramMessage as inboxHandle } from '../.test-build/inbox-buddy-telegram/agent.js';
 import { handleTelegramMention, handleJokeOfTheDay } from '../.test-build/joke-bot-telegram/agent.js';
 import { checkReleases } from '../.test-build/spotify-releases-telegram/agent.js';
-import { postFreshStories, retryPendingThreadBody, handleTelegramMessage as hnHandle } from '../.test-build/hn-monitor-telegram/agent.js';
+import { postFreshStories, retryPendingThreadBody } from '../.test-build/hn-monitor/agent.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SEEDS = path.join(HERE, '..', 'evals', 'seeds');
@@ -294,83 +294,3 @@ test('spotify-releases-telegram: does not checkpoint after a Telegram no-receipt
   assert.equal((await ctx.memory.recall('x', { tags: ['spotify-releases-telegram:notified'] })).length, 0);
 });
 
-// ── hn-monitor-telegram ────────────────────────────────────────────────────────
-
-const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
-
-test('hn-monitor-telegram: threads the digest under a count header and saves the post', async () => {
-  const ctx = makeCtx();
-  const tg = makeTelegram();
-  await postFreshStories({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, '900__hn', [10], [STORY], {
-    complete: async () => 'digest body',
-    telegram: tg
-  });
-  // Two sends: a header (top-level) then the body threaded under the header's id.
-  assert.equal(tg.sends.length, 2);
-  assert.equal(tg.sends[0].chatId, '900');
-  assert.match(tg.sends[0].text, /Hacker News/);
-  assert.equal(tg.sends[0].opts, undefined);
-  assert.match(tg.sends[1].text, /digest body/);
-  assert.equal(tg.sends[1].opts.replyToMessageId, 1); // header's messageId
-  // seen claimed + post record saved.
-  const seen = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:seen'] });
-  assert.deepEqual(JSON.parse(seen[0].content), [10, 20]);
-  const posts = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:post'] });
-  assert.equal(posts.length, 1);
-});
-
-test('hn-monitor-telegram: a no-receipt header releases the claim and throws', async () => {
-  const ctx = makeCtx();
-  const tg = { sends: [], async send(chatId, text, opts) { this.sends.push({ chatId, text, opts }); return { ok: false }; } };
-  await assert.rejects(
-    () => postFreshStories({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, '900', [10], [STORY], { complete: async () => 'body', telegram: tg }),
-    /no writeback receipt/
-  );
-  // Claim was released (restored to prior seen set) so the next tick retries.
-  const seen = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:seen'] });
-  assert.deepEqual(JSON.parse(seen[0].content), [10]);
-});
-
-test('hn-monitor-telegram: a no-receipt body saves pending state and retries without reposting header', async () => {
-  const ctx = makeCtx();
-  const tg = {
-    sends: [],
-    async send(chatId, text, opts) {
-      this.sends.push({ chatId, text, opts });
-      return this.sends.length === 1 ? { ok: true, messageId: '101' } : { ok: false };
-    }
-  };
-  await postFreshStories({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, '900', [10], [STORY], {
-    complete: async () => 'body',
-    telegram: tg
-  });
-  assert.equal(tg.sends.length, 2);
-  const pending = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:pending-thread-body'] });
-  assert.equal(JSON.parse(pending[0].content).replyToMessageId, 101);
-  assert.equal((await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:post'] })).length, 0);
-
-  const retryTg = makeTelegram();
-  assert.equal(await retryPendingThreadBody({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, '900', { telegram: retryTg }), true);
-  assert.equal(retryTg.sends.length, 1);
-  assert.equal(retryTg.sends[0].opts.replyToMessageId, 101);
-  assert.equal((await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:post'] })).length, 1);
-  const latestPending = await ctx.memory.recall('x', { tags: ['hn-monitor-telegram:pending-thread-body'] });
-  assert.equal(latestPending[0].content, 'null');
-});
-
-test('hn-monitor-telegram: Q&A path answers from recalled posts', async () => {
-  const ctx = makeCtx();
-  // Seed a prior post record.
-  await ctx.memory.save(JSON.stringify({ postedAt: '2026-06-17T09:00:00.000Z', digest: 'TypeScript 5.6 released', stories: [{ title: 'TypeScript 5.6', url: 'https://ex.com/ts', points: 200 }] }), { tags: ['hn-monitor-telegram:post'], scope: 'workspace' });
-  const tg = makeTelegram();
-  let prompt = '';
-  await hnHandle(
-    { ...ctx, persona: { inputs: { TELEGRAM_CHAT: '900' }, inputSpecs: {} } },
-    telegramEvent({ chatId: '900', messageId: '12', text: 'what typescript news?' }),
-    { complete: async (p) => { prompt = p; return 'TypeScript 5.6 was posted.'; }, telegram: tg }
-  );
-  assert.match(prompt, /TypeScript 5\.6 released/);
-  assert.equal(tg.sends.length, 1);
-  assert.match(tg.sends[0].text, /TypeScript 5\.6 was posted\./);
-  assert.equal(tg.sends[0].opts.replyToMessageId, 12);
-});

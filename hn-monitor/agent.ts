@@ -38,6 +38,8 @@ import {
   type TelegramMessage
 } from '../shared/telegram.js';
 
+const enableTelegram = process.env.HN_MONITOR_ENABLE_TELEGRAM === '1';
+
 export interface Story {
   id: number;
   title: string;
@@ -93,9 +95,7 @@ function parseRelayMessage(event: { data?: unknown }): ParsedMessage | null {
 
 export default defineAgent({
   schedules: [{ name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' }],
-  triggers: {
-    telegram: [{ on: 'message' }]
-  },
+  ...(enableTelegram ? { triggers: { telegram: [{ on: 'message' }] } } : {}),
   handler: async (ctx, event) => {
     // Q&A path: relay inbox DM
     if (isRelaycastMessageEvent(event as unknown as AgentEvent)) {

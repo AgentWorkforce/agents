@@ -38,6 +38,8 @@ import {
   type TelegramMessage
 } from '../shared/telegram.js';
 
+const enableTelegram = process.env.HN_MONITOR_ENABLE_TELEGRAM === '1';
+
 export interface Story {
   id: number;
   title: string;
@@ -93,53 +95,49 @@ function parseRelayMessage(event: { data?: unknown }): ParsedMessage | null {
 
 export default defineAgent({
   schedules: [{ name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' }],
-  handler: handleHnMonitorEvent
+  ...(enableTelegram ? { triggers: { telegram: [{ on: 'message' }] } } : {}),
+  handler: async (ctx, event) => {
+    // Q&A path: relay inbox DM
+    if (isRelaycastMessageEvent(event as unknown as AgentEvent)) {
+      await handleQaMessage(ctx, event as unknown as AgentEvent, 'relay');
+      return;
+    }
+    // Q&A path: telegram message
+    if (typeof event.type === 'string' && event.type.startsWith('telegram.')) {
+      await handleQaMessage(ctx, event as unknown as AgentEvent, 'telegram');
+      return;
+    }
+    // Cron path
+    if (!isCronTickEvent(event as unknown as AgentEvent)) return;
+
+    const delivery = createDelivery(ctx);
+    if (delivery.targets.length === 0) {
+      ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
+      return;
+    }
+
+    // Pending thread body recovery — if a previous run posted the header but
+    // the threaded body failed, retry it before processing new stories.
+    if (await retryPendingThreadBody(ctx, delivery)) return;
+
+    const topics = list(input(ctx, 'TOPICS')).map((t) => t.toLowerCase());
+
+    const stories = await fetchFrontPage();
+    ctx.log('info', 'hn-monitor.fetched', { stories: stories.length });
+    const matches = stories.filter((s) => topics.some((t) => s.title.toLowerCase().includes(t)));
+    ctx.log('info', 'hn-monitor.matched', { matched: matches.length });
+
+    const seen = await loadSeen(ctx);
+    const fresh = matches.filter((s) => !seen.includes(s.id));
+    ctx.log('info', 'hn-monitor.fresh', { fresh: fresh.length });
+    if (fresh.length === 0) {
+      ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
+      return;
+    }
+
+    await postFreshStories(ctx, delivery, seen, fresh);
+  }
 });
-
-export async function handleHnMonitorEvent(ctx: WorkforceCtx, event: unknown): Promise<void> {
-  // Q&A path: relay inbox DM
-  if (isRelaycastMessageEvent(event as unknown as AgentEvent)) {
-    await handleQaMessage(ctx, event as unknown as AgentEvent, 'relay');
-    return;
-  }
-  // Q&A path: telegram message. Only the Telegram wrapper agent declares this
-  // trigger, but keeping the handler transport-aware lets both personas share
-  // the same implementation.
-  const eventType = typeof event === 'object' && event !== null && 'type' in event ? event.type : undefined;
-  if (typeof eventType === 'string' && eventType.startsWith('telegram.')) {
-    await handleQaMessage(ctx, event as unknown as AgentEvent, 'telegram');
-    return;
-  }
-  // Cron path
-  if (!isCronTickEvent(event as unknown as AgentEvent)) return;
-
-  const delivery = createDelivery(ctx);
-  if (delivery.targets.length === 0) {
-    ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
-    return;
-  }
-
-  // Pending thread body recovery — if a previous run posted the header but
-  // the threaded body failed, retry it before processing new stories.
-  if (await retryPendingThreadBody(ctx, delivery)) return;
-
-  const topics = list(input(ctx, 'TOPICS')).map((t) => t.toLowerCase());
-
-  const stories = await fetchFrontPage();
-  ctx.log('info', 'hn-monitor.fetched', { stories: stories.length });
-  const matches = stories.filter((s) => topics.some((t) => s.title.toLowerCase().includes(t)));
-  ctx.log('info', 'hn-monitor.matched', { matched: matches.length });
-
-  const seen = await loadSeen(ctx);
-  const fresh = matches.filter((s) => !seen.includes(s.id));
-  ctx.log('info', 'hn-monitor.fresh', { fresh: fresh.length });
-  if (fresh.length === 0) {
-    ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
-    return;
-  }
-
-  await postFreshStories(ctx, delivery, seen, fresh);
-}
 
 // ── Q&A handler ──────────────────────────────────────────────────────────
 

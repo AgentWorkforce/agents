@@ -2,21 +2,24 @@ import { definePersona } from '@agentworkforce/persona-kit';
 
 /**
  * Hacker News Monitor — scans HN a few times a day for the topics you care
- * about and posts a short digest to Slack.
+ * about and posts a digest to Slack, Telegram, or both. Configuration-driven:
+ * set SLACK_CHANNEL, TELEGRAM_CHAT, or both — the handler delivers to
+ * whichever targets are configured.
+ *
+ * Retains ~30 days of digests; DM the agent (relay inbox) or message it on
+ * Telegram to ask about recently posted stories.
  */
 export default definePersona({
   id: 'hn-monitor',
   intent: 'relay-orchestrator',
   tags: ['discovery'],
   description:
-    'Scans Hacker News a few times a day for topics you care about and posts a summary to Slack. Retains the last ~30 days of digests — DM the agent to ask questions about what it has recently posted.',
+    'Scans Hacker News a few times a day for topics you care about and posts a digest to Slack, Telegram, or both. Retains the last ~30 days of digests — DM the agent or message it on Telegram to ask about what it recently posted.',
   cloud: true,
 
-  // `slack` gives the handler the ctx.slack client to post the digest.
   integrations: {
-    // No slack trigger here (cron-only persona), so `scope` is the only
-    // thing that mounts /slack — without it every post is a silent no-op.
-    slack: { scope: { paths: '/slack/channels/**' } }
+    slack: { scope: { paths: '/slack/channels/**' } },
+    telegram: { scope: { chats: '/telegram/chats/**', layout: '/telegram/LAYOUT.md' } }
   },
 
   inputs: {
@@ -26,26 +29,25 @@ export default definePersona({
       default: 'agents,ai,typescript,developer tools'
     },
     SLACK_CHANNEL: {
-      description: 'Slack channel id to post the digest to.',
+      description: 'Slack channel id to post the digest to. Leave empty to skip Slack delivery.',
       env: 'SLACK_CHANNEL',
+      optional: true,
       picker: { provider: 'slack', resource: 'channels' }
+    },
+    TELEGRAM_CHAT: {
+      description: 'Telegram chat id to post the digest to (and answer Q&A in). Leave empty to skip Telegram delivery.',
+      env: 'TELEGRAM_CHAT',
+      optional: true
     }
   },
 
-  // ctx.llm uses this model to summarize the matching stories. The handler
-  // only gets a working ctx.llm when the deployment carries a credential:
-  // useSubscription is the standing consent that lets cloud resolve the
-  // deployer's active anthropic credential per fire (cloud#1896 fallback).
   useSubscription: true,
   harness: 'claude',
   model: 'claude-haiku-4-5-20251001',
-  systemPrompt: 'Summarize Hacker News stories into a short, skimmable Slack digest.',
+  systemPrompt: 'Summarize Hacker News stories into a short, skimmable digest.',
   harnessSettings: { reasoning: 'low', timeoutSeconds: 1800 },
 
-  // Inbox so a user can DM the agent and ask about recently posted digests.
   relay: { inbox: ['@self'] },
-  // 30-day retention gives the rolling window of posted digests for the Q&A
-  // path for free — recalled `hn-monitor:post` records age out after ttlDays.
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 30 },
 
   onEvent: './agent.ts'

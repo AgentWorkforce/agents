@@ -13,7 +13,7 @@
  *
  * Transport is configuration-driven. Set SLACK_CHANNEL, TELEGRAM_CHAT, or
  * both — the handler delivers to whichever targets are configured. Uses
- * shared/delivery for unified messaging under the hood.
+ * @agentworkforce/delivery for unified messaging under the hood.
  */
 import {
   defineAgent,
@@ -30,7 +30,7 @@ import {
   fetchWithTimeout,
   type DeliveryClient,
   type DeliveryResult
-} from '../shared/delivery/index.js';
+} from '@agentworkforce/delivery';
 import {
   readTelegramMessage,
   skipReason as telegramSkipReason,
@@ -321,8 +321,8 @@ function saveHeaderRefs(result: DeliveryResult): PendingThreadBody['headerRefs']
     // For Slack: draftRef is the relay path (parentRef). For Telegram:
     // store the messageId in draftRef so recovery can reconstruct threading.
     draftRef: 'draftRef' in r ? r.draftRef : r.messageId,
-    channel: r.provider === 'slack' ? (r as import('../shared/delivery/index.js').SlackRef).channel : undefined,
-    chatId: r.provider === 'telegram' ? (r as import('../shared/delivery/index.js').TelegramRef).chatId : undefined
+    channel: r.provider === 'slack' ? (r as import('@agentworkforce/delivery').SlackRef).channel : undefined,
+    chatId: r.provider === 'telegram' ? (r as import('@agentworkforce/delivery').TelegramRef).chatId : undefined
   }));
 }
 
@@ -374,7 +374,7 @@ export async function retryPendingThreadBody(
 /** Reconstruct MessageRefs from stored headerRefs, with correct threading ids. */
 function rebuildHeaderRefs(
   stored: PendingThreadBody['headerRefs']
-): Array<import('../shared/delivery/index.js').MessageRef> {
+): Array<import('@agentworkforce/delivery').MessageRef> {
   return stored.map((r) => {
     if (r.provider === 'telegram') {
       // For Telegram, draftRef stores the original messageId — use it for

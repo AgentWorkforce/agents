@@ -262,7 +262,7 @@ export async function postFreshStories(
     // (zero receipt round-trips). The cloud orders threaded messages under
     // the header server-side via parentRef — the x-reply-radar pattern.
     const heads = await delivery.publish(header);
-    if (heads.refs.length === 0) {
+    if (heads.refs.length === 0 || heads.refs.length < delivery.targets.length) {
       throw new Error(`Header publish failed across all targets`);
     }
     headerPosted = true;

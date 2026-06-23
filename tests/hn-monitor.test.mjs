@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 
-import { postFreshStories } from '../.test-build/hn-monitor/agent.js';
+import { handleQaMessage, postFreshStories } from '../.test-build/hn-monitor/agent.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -25,6 +25,9 @@ function fakeCtx({ llm } = {}) {
         async save(content, opts) {
           events.push('save');
           saved.push({ content, opts });
+        },
+        async recall() {
+          return [];
         },
       },
       llm: llm ?? {
@@ -64,7 +67,7 @@ function fakeDelivery(posts) {
 
 const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
 
-// ── tests ────────────────────────────────────────────────────────────────
+// ── posting tests ─────────────────────────────────────────────────────────
 
 test('postFreshStories claims fresh ids before summarizing, then threads the digest under a header', async () => {
   const { ctx, events, saved } = fakeCtx();
@@ -117,7 +120,7 @@ test('postFreshStories releases claim when header publish fails', async () => {
   const delivery = {
     targets: ['slack'],
     async publish() {
-      return { ok: false, refs: [] };
+      return { ok: true, refs: [] };
     },
     async send() {
       return { ok: false, refs: [] };
@@ -136,39 +139,140 @@ test('postFreshStories releases claim when header publish fails', async () => {
   ]);
 });
 
-test('postFreshStories saves pending state when header publishes but body fails', async () => {
+test('postFreshStories saves pending state with headerRefs when header publishes but body fails', async () => {
   const { ctx, saved } = fakeCtx();
-  let callCount = 0;
   const delivery = {
-    targets: ['slack'],
+    targets: ['slack', 'telegram'],
     async publish() {
-      callCount++;
-      return { ok: true, refs: [{ provider: 'slack', channel: 'C123', ts: '', draftRef: 'ref-1' }] };
+      return {
+        ok: true,
+        refs: [
+          { provider: 'slack', channel: 'C123', ts: '', draftRef: 'ref-slack' },
+          { provider: 'telegram', chatId: '456', messageId: 'msg-1' }
+        ]
+      };
     },
-    async send(text, opts) {
-      callCount++;
-      // Body send — simulate partial failure
-      return { ok: false, refs: [] };
+    async send() {
+      return { ok: true, refs: [] };  // fewer refs than targets = partial failure
     },
   };
 
-  // When the header publishes but the threaded body fails, postFreshStories
-  // saves pending state and returns gracefully (does NOT throw).
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  // Claim was kept (header already posted — no rollback).
   const seenSave = saved.find((s) => s.opts?.tags?.includes('hn-monitor:seen'));
   assert.equal(seenSave?.content, JSON.stringify([10, 20]));
 
-  // Pending thread body was saved for recovery on next tick.
   const pendingSave = saved.find((s) => s.opts?.tags?.includes('hn-monitor:pending-thread-body'));
   assert.ok(pendingSave, 'pending thread body should be saved on partial failure');
   const pending = JSON.parse(pendingSave.content);
   assert.equal(pending.header, ':newspaper: *Hacker News* — 1 new match(es)');
   assert.equal(pending.body, 'digest body');
+  assert.equal(pending.targets, 'slack,telegram');
+  assert.deepEqual(pending.headerRefs, [
+    { provider: 'slack', channel: 'C123', draftRef: 'ref-slack' },
+    { provider: 'telegram', chatId: '456', draftRef: 'msg-1' }
+  ]);
   assert.deepEqual(pending.stories, [{ title: STORY.title, url: STORY.url, points: STORY.points }]);
 
-  // Post record was NOT saved (body never landed).
   const postSave = saved.find((s) => s.opts?.tags?.includes('hn-monitor:post'));
   assert.equal(postSave, undefined);
+});
+
+// ── Q&A tests ────────────────────────────────────────────────────────────
+
+test('handleQaMessage recalls posted digests and answers via relay inbox', async () => {
+  const recallCalls = [];
+  let llmPrompt = '';
+  const published = [];
+  const ctx = {
+    log() {},
+    persona: {
+      inputs: { SLACK_CHANNEL: 'C123' },
+      inputSpecs: {
+        SLACK_CHANNEL: { env: 'SLACK_CHANNEL', description: '', optional: true },
+        TELEGRAM_CHAT: { env: 'TELEGRAM_CHAT', description: '', optional: true },
+      }
+    },
+    memory: {
+      async recall(query, opts) {
+        recallCalls.push({ query, opts });
+        return [{
+          content: JSON.stringify({
+            postedAt: '2026-06-17T09:00:00.000Z',
+            digest: ':newspaper: *Hacker News* — typescript 5.6 released',
+            stories: [{ title: 'TypeScript 5.6', url: 'https://ex.com/ts', points: 200 }],
+          }),
+          createdAt: '2026-06-17T09:00:00.000Z',
+          id: 'p1',
+        }];
+      },
+      async save() {},
+    },
+    llm: {
+      async complete(prompt) {
+        llmPrompt = prompt;
+        return 'TypeScript 5.6 was posted yesterday.';
+      },
+    },
+  };
+
+  const event = envelopeToAgentEvent({
+    id: 'evt-hn-inbox',
+    workspace: 'ws-test',
+    type: 'relaycast.message',
+    occurredAt: '2026-06-18T12:00:00.000Z',
+    resource: { text: 'what typescript news did you post?' },
+  });
+
+  // Inject a mock delivery so the test doesn't hit real writeback.
+  const mockDelivery = {
+    targets: ['slack'],
+    async publish(text) { published.push(text); return { ok: true, refs: [] }; },
+    async send(text, opts) { published.push(text); return { ok: true, refs: [] }; },
+  };
+
+  await handleQaMessage(ctx, event, 'relay', { delivery: mockDelivery });
+
+  assert.equal(recallCalls.length, 1);
+  assert.deepEqual(recallCalls[0].opts.tags, ['hn-monitor:post']);
+  assert.equal(recallCalls[0].opts.limit, 60);
+  assert.match(llmPrompt, /typescript 5\.6 released/);
+  assert.match(llmPrompt, /what typescript news did you post\?/);
+  assert.equal(published.length, 1);
+  assert.match(published[0], /TypeScript 5\.6 was posted yesterday\./);
+});
+
+test('handleQaMessage with no text logs and returns without answering', async () => {
+  let recalled = false;
+  let llmCalled = false;
+  const ctx = {
+    log() {},
+    persona: {
+      inputs: { SLACK_CHANNEL: 'C123' },
+      inputSpecs: {
+        SLACK_CHANNEL: { env: 'SLACK_CHANNEL', description: '', optional: true },
+        TELEGRAM_CHAT: { env: 'TELEGRAM_CHAT', description: '', optional: true },
+      }
+    },
+    memory: {
+      async recall() { recalled = true; return []; },
+      async save() {},
+    },
+    llm: {
+      async complete() { llmCalled = true; return 'should not be called'; },
+    },
+  };
+
+  const event = envelopeToAgentEvent({
+    id: 'evt-hn-inbox',
+    workspace: 'ws-test',
+    type: 'relaycast.message',
+    occurredAt: '2026-06-18T12:00:00.000Z',
+    resource: { text: '   ' },
+  });
+
+  await handleQaMessage(ctx, event, 'relay');
+
+  assert.equal(recalled, false);
+  assert.equal(llmCalled, false);
 });

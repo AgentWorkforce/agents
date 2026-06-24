@@ -1,15 +1,25 @@
 import { definePersona } from '@agentworkforce/persona-kit';
 
 /**
- * inbox-buddy — a conversational agent you chat with in a dedicated Slack
- * channel to ask about your Gmail. It remembers earlier turns and reasons over
- * full Gmail threads (not single messages).
+ * inbox-buddy — a conversational agent you chat with to ask about your Gmail. It
+ * remembers earlier turns and reasons over full Gmail threads (not single
+ * messages). Delivers over Slack, Telegram, or both — one agent, transport
+ * chosen by configuration.
  *
- * Human channel = Slack via `@mention`. The trigger is `app_mention` (the
- * webhook-driven path the in-production review-agent uses): the message rides in
- * the event payload, so it works independent of the relayfile slack mount
- * (whose ingestion can lag/stall — e.g. during the relayfile migration). The
- * relay inbox is agent-to-agent, so it is NOT used for human chat.
+ * Human chat surface(s):
+ *   - Slack via `@mention` (trigger `slack.app_mention`)
+ *   - Telegram via direct `message` (trigger `telegram.message`)
+ * Both are WEBHOOK-driven: the message rides in the event payload, so chat works
+ * independent of the relayfile slack/telegram mounts (whose ingestion can
+ * lag/stall — e.g. during the relayfile migration). The relay inbox is
+ * agent-to-agent, so it is NOT used for human chat.
+ *
+ * Optional integrations (workforce#252): `slack` and `telegram` are each
+ * declared `optional: true` and gated by `enabledByInput`. A transport's
+ * provider connection + trigger registration happen ONLY when its id input
+ * resolves non-empty — so a Slack-only deploy (set SLACK_CHANNEL, leave
+ * TELEGRAM_CHAT empty) never has to wire up a Telegram bot, and vice versa. Set
+ * both to deliver over both. `google-mail` is always required (the data source).
  *
  * Reads Gmail ONLY from the relayfile VFS mount materialized by the google-mail
  * Nango connection. The canonical mount root is `/google-mail` (NOT `/gmail` —
@@ -27,7 +37,7 @@ export default definePersona({
   intent: 'relay-orchestrator',
   tags: ['discovery'],
   description:
-    'Chat in a dedicated Slack channel to ask about your Gmail. Holds a multi-turn conversation, remembers earlier turns, and reasons over full email threads (e.g. "summarize that thread with Alice about the export").',
+    'Chat in Slack or Telegram to ask about your Gmail. Holds a multi-turn conversation, remembers earlier turns, and reasons over full email threads (e.g. "summarize that thread with Alice about the export").',
   cloud: true,
   sandbox: true,
 
@@ -54,19 +64,48 @@ export default definePersona({
         layout: '/google-mail/LAYOUT.md'
       }
     },
-    // The slack trigger only mirrors the chat channel READ-ONLY at the
-    // display-labelled path; slackClient().post() writes to the canonical
-    // bare-id path, which only a non-empty `scope` mounts — without it every
-    // reply is a silent no-op (the labelled-mirror trap).
-    slack: { scope: { paths: '/slack/channels/**' } }
+    // Slack chat surface. optional + enabledByInput (workforce#252): connected
+    // and trigger-registered ONLY when SLACK_CHANNEL is set. The slack trigger
+    // mirrors the chat channel READ-ONLY at the display-labelled path;
+    // slackClient().post() writes to the canonical bare-id path, which only a
+    // non-empty `scope` mounts — without it every reply is a silent no-op (the
+    // labelled-mirror trap).
+    slack: {
+      optional: true,
+      enabledByInput: 'SLACK_CHANNEL',
+      scope: { paths: '/slack/channels/**' }
+    },
+    // Telegram chat surface. Same opt-in gate on TELEGRAM_CHAT. Scope the
+    // concrete chats subtree (NOT `/telegram/**` — same provider-root drop),
+    // which also mounts the canonical bare-id writeback path rather than just the
+    // read-only labelled mirror.
+    telegram: {
+      optional: true,
+      enabledByInput: 'TELEGRAM_CHAT',
+      scope: { chats: '/telegram/chats/**', layout: '/telegram/LAYOUT.md' }
+    }
   },
 
   inputs: {
+    // Gate-on-id (workforce#252): providing SLACK_CHANNEL both ENABLES the Slack
+    // transport and restricts replies to that one channel. Leave empty to skip
+    // Slack entirely. (app_mention is webhook-driven, so the id is used as a
+    // gate/filter, not interpolated into a watch path.)
     SLACK_CHANNEL: {
-      description: 'Optional: restrict replies to one Slack channel id. Unset = reply wherever the app is @mentioned. (app_mention is webhook-driven, so no channel watch path is interpolated.)',
+      description:
+        'Slack channel id to chat in. Setting it enables the Slack transport and restricts replies to that channel. Leave empty to skip Slack delivery.',
       env: 'SLACK_CHANNEL',
       optional: true,
       picker: { provider: 'slack', resource: 'channels' }
+    },
+    // Gate-on-id: providing TELEGRAM_CHAT enables the Telegram transport and
+    // restricts replies to that chat. Leave empty to skip Telegram. No chat
+    // picker exists yet — enter the numeric chat id.
+    TELEGRAM_CHAT: {
+      description:
+        'Telegram chat id to chat in. Setting it enables the Telegram transport and restricts replies to that chat. Leave empty to skip Telegram delivery.',
+      env: 'TELEGRAM_CHAT',
+      optional: true
     }
   },
 

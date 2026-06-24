@@ -14,9 +14,9 @@ import {
   skipReason,
   replyToMessage
 } from '../.test-build/shared/telegram.js';
-import { handleTelegramMessage as inboxHandle } from '../.test-build/inbox-buddy-telegram/agent.js';
-import { handleTelegramMention, handleJokeOfTheDay } from '../.test-build/joke-bot-telegram/agent.js';
-import { checkReleases } from '../.test-build/spotify-releases-telegram/agent.js';
+import { handleTelegramMessage as inboxHandle } from '../.test-build/inbox-buddy/agent.js';
+import { handleTelegramMention, handleJokeOfTheDay, handleSlackMention } from '../.test-build/joke-bot/agent.js';
+import { checkReleases } from '../.test-build/spotify-releases/agent.js';
 import { postFreshStories, retryPendingThreadBody } from '../.test-build/hn-monitor/agent.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -112,7 +112,7 @@ test('replyToMessage threads on the source message id', async () => {
   assert.equal(tg.sends[0].opts.replyToMessageId, 99);
 });
 
-// ── inbox-buddy-telegram ───────────────────────────────────────────────────────
+// ── inbox-buddy (Telegram transport of the unified dual-transport agent) ───────
 
 function seedGmailMount() {
   const mount = mkdtempSync(path.join(tmpdir(), 'ibt-'));
@@ -127,7 +127,7 @@ function seedGmailMount() {
   return mount;
 }
 
-test('inbox-buddy-telegram: answers a Gmail question and threads the reply + records the turn', async () => {
+test('inbox-buddy (telegram): answers a Gmail question and threads the reply + records the turn', async () => {
   const mount = seedGmailMount();
   process.env.RELAYFILE_MOUNT_ROOT = mount;
   try {
@@ -145,14 +145,14 @@ test('inbox-buddy-telegram: answers a Gmail question and threads the reply + rec
     assert.equal(tg.sends[0].opts.replyToMessageId, 5);
     assert.match(tg.sends[0].text, /Friday/);
     // The turn was persisted for continuity (transcript saved under the conv tag).
-    assert.ok(ctx.logs.some((l) => l.message?.includes('inbox-buddy-telegram.context')));
+    assert.ok(ctx.logs.some((l) => l.message?.includes('inbox-buddy.context') && l.message?.includes('transport=telegram')));
   } finally {
     restoreMountRoot();
     rmSync(mount, { recursive: true, force: true });
   }
 });
 
-test('inbox-buddy-telegram: skips the bot\'s own messages (loop guard)', async () => {
+test('inbox-buddy (telegram): skips the bot\'s own messages (loop guard)', async () => {
   const ctx = makeCtx();
   const tg = makeTelegram();
   await inboxHandle(
@@ -163,9 +163,9 @@ test('inbox-buddy-telegram: skips the bot\'s own messages (loop guard)', async (
   assert.equal(tg.sends.length, 0);
 });
 
-// ── joke-bot-telegram ──────────────────────────────────────────────────────────
+// ── joke-bot (Telegram transport of the unified dual-transport agent) ──────────
 
-test('joke-bot-telegram: replies with a joke and saves the turn', async () => {
+test('joke-bot (telegram): replies with a joke and saves the turn', async () => {
   const ctx = makeCtx();
   const tg = makeTelegram();
   await handleTelegramMention(
@@ -182,7 +182,7 @@ test('joke-bot-telegram: replies with a joke and saves the turn', async () => {
   assert.equal(saved.length, 1);
 });
 
-test('joke-bot-telegram: replays memory oldest-first', async () => {
+test('joke-bot (telegram): replays memory oldest-first', async () => {
   const ctx = makeCtx();
   const tg = makeTelegram();
   await ctx.memory.save('User: first\njoke-bot: first reply', { tags: ['joke-convo:telegram:77'], scope: 'workspace' });
@@ -196,7 +196,7 @@ test('joke-bot-telegram: replays memory oldest-first', async () => {
   assert.ok(prompt.indexOf('User: first') < prompt.indexOf('User: second'));
 });
 
-test('joke-bot-telegram: sends a fallback when joke generation fails', async () => {
+test('joke-bot (telegram): sends a fallback when joke generation fails', async () => {
   const ctx = makeCtx();
   const tg = makeTelegram();
   await handleTelegramMention(
@@ -210,7 +210,7 @@ test('joke-bot-telegram: sends a fallback when joke generation fails', async () 
   assert.equal(saved.length, 1);
 });
 
-test('joke-bot-telegram: joke of the day posts to the configured chat', async () => {
+test('joke-bot (telegram): joke of the day posts to the configured chat', async () => {
   const ctx = makeCtx();
   const tg = makeTelegram();
   await handleJokeOfTheDay(
@@ -222,9 +222,9 @@ test('joke-bot-telegram: joke of the day posts to the configured chat', async ()
   assert.match(tg.sends[0].text, /Joke of the day/);
 });
 
-// ── spotify-releases-telegram ──────────────────────────────────────────────────
+// ── spotify-releases (Telegram transport of the unified dual-transport agent) ──
 
-test('spotify-releases-telegram: missing SPOTIFY_TOKEN fails loudly', async () => {
+test('spotify-releases (telegram): missing SPOTIFY_TOKEN fails loudly', async () => {
   const ctx = makeCtx();
   await assert.rejects(
     () => checkReleases({ ...ctx, persona: { inputs: { TELEGRAM_CHAT: '5' }, inputSpecs: {} } }, { telegram: makeTelegram() }),
@@ -232,19 +232,19 @@ test('spotify-releases-telegram: missing SPOTIFY_TOKEN fails loudly', async () =
   );
 });
 
-test('spotify-releases-telegram: missing TELEGRAM_CHAT fails loudly', async () => {
+test('spotify-releases (telegram): missing both transports fails loudly', async () => {
   const ctx = makeCtx();
   await assert.rejects(
-    () => checkReleases({ ...ctx, persona: { inputs: {}, inputSpecs: {} } }, { telegram: makeTelegram() }),
-    /TELEGRAM_CHAT is required/
+    () => checkReleases({ ...ctx, persona: { inputs: { SPOTIFY_TOKEN: 'tok' }, inputSpecs: {} } }, { telegram: makeTelegram() }),
+    /At least one of SLACK_USER or TELEGRAM_CHAT/
   );
 });
 
-test('spotify-releases-telegram: sends same-day releases once and advances only after delivery', async () => {
+test('spotify-releases (telegram): sends same-day releases once and advances only after delivery', async () => {
   const originalFetch = globalThis.fetch;
   const ctx = makeCtx();
   const tg = makeTelegram();
-  await ctx.memory.save('2026-06-10', { tags: ['spotify-releases-telegram:last-check'], scope: 'workspace' });
+  await ctx.memory.save('2026-06-10', { tags: ['spotify-releases:last-check'], scope: 'workspace' });
   globalThis.fetch = async (url) => {
     const s = String(url);
     if (s.includes('/me/following')) {
@@ -264,11 +264,11 @@ test('spotify-releases-telegram: sends same-day releases once and advances only 
   }
   assert.equal(tg.sends.length, 1);
   assert.match(tg.sends[0].text, /Same Day Single/);
-  const notified = await ctx.memory.recall('x', { tags: ['spotify-releases-telegram:notified'] });
+  const notified = await ctx.memory.recall('x', { tags: ['spotify-releases:notified'] });
   assert.deepEqual(JSON.parse(notified[0].content), ['https://open.spotify.com/album/1']);
 });
 
-test('spotify-releases-telegram: does not checkpoint after a Telegram no-receipt send', async () => {
+test('spotify-releases (telegram): does not checkpoint after a Telegram no-receipt send', async () => {
   const originalFetch = globalThis.fetch;
   const ctx = makeCtx();
   const tg = { sends: [], async send(chatId, text, opts) { this.sends.push({ chatId, text, opts }); return { ok: false }; } };
@@ -290,7 +290,102 @@ test('spotify-releases-telegram: does not checkpoint after a Telegram no-receipt
     globalThis.fetch = originalFetch;
   }
   assert.equal(tg.sends.length, 1);
-  assert.equal((await ctx.memory.recall('x', { tags: ['spotify-releases-telegram:last-check'] })).length, 0);
-  assert.equal((await ctx.memory.recall('x', { tags: ['spotify-releases-telegram:notified'] })).length, 0);
+  assert.equal((await ctx.memory.recall('x', { tags: ['spotify-releases:last-check'] })).length, 0);
+  assert.equal((await ctx.memory.recall('x', { tags: ['spotify-releases:notified'] })).length, 0);
+});
+
+// ── Slack side of the unified agents (dual-transport dispatch + fan-out) ───────
+
+/** A fake Slack client capturing post/reply/dm calls. */
+function makeSlack() {
+  const calls = [];
+  return {
+    calls,
+    async post(channel, text) { calls.push({ kind: 'post', channel, text }); return { ts: `${calls.length}.1` }; },
+    async reply(channel, threadTs, text) { calls.push({ kind: 'reply', channel, threadTs, text }); return { ts: `${calls.length}.1` }; },
+    async dm(userId, text) { calls.push({ kind: 'dm', userId, text }); return { ok: true }; }
+  };
+}
+
+function slackMentionEvent({ channel = 'C_CHAT', ts = '1', text = '<@U_BOT> hi', threadTs, isBot = false } = {}) {
+  const resource = { channel, ts, text, user: 'U_HUMAN' };
+  if (threadTs) resource.thread_ts = threadTs;
+  if (isBot) resource.is_bot = true;
+  return envelopeToAgentEvent({
+    id: `evt_${ts}`,
+    workspace: 'ws-test',
+    type: 'slack.message.created',
+    occurredAt: '2026-06-10T12:00:00.000Z',
+    resource
+  });
+}
+
+test('joke-bot (slack): replies in-thread to an @mention in the configured channel', async () => {
+  const ctx = makeCtx();
+  const slack = makeSlack();
+  await handleSlackMention(
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' }, inputSpecs: {} } },
+    slackMentionEvent({ channel: 'C_CHAT', ts: '5', threadTs: '4', text: '<@U_BOT> joke about yaml' }),
+    { complete: async () => 'YAML walks into a bar. The bar is also valid YAML.', slack }
+  );
+  assert.equal(slack.calls.length, 1);
+  assert.equal(slack.calls[0].kind, 'reply');
+  assert.equal(slack.calls[0].threadTs, '4');
+  assert.match(slack.calls[0].text, /YAML/);
+});
+
+test('joke-bot (slack): ignores an @mention in a different channel (fail closed)', async () => {
+  const ctx = makeCtx();
+  const slack = makeSlack();
+  await handleSlackMention(
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' }, inputSpecs: {} } },
+    slackMentionEvent({ channel: 'C_OTHER', ts: '6', text: '<@U_BOT> joke' }),
+    { complete: async () => 'nope', slack }
+  );
+  assert.equal(slack.calls.length, 0);
+});
+
+test('joke-bot: joke of the day fans out to BOTH transports when both configured', async () => {
+  const ctx = makeCtx();
+  const slack = makeSlack();
+  const tg = makeTelegram();
+  await handleJokeOfTheDay(
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT', TELEGRAM_CHAT: '77' }, inputSpecs: {} } },
+    { complete: async () => 'A daily zinger.', slack, telegram: tg }
+  );
+  assert.equal(slack.calls.length, 1);
+  assert.equal(slack.calls[0].kind, 'post');
+  assert.match(slack.calls[0].text, /Joke of the day/);
+  assert.equal(tg.sends.length, 1);
+  assert.equal(tg.sends[0].chatId, '77');
+  assert.match(tg.sends[0].text, /Joke of the day/);
+});
+
+test('spotify-releases (slack): DMs releases to SLACK_USER, advances checkpoint', async () => {
+  const originalFetch = globalThis.fetch;
+  const ctx = makeCtx();
+  const slack = makeSlack();
+  await ctx.memory.save('2026-06-10', { tags: ['spotify-releases:last-check'], scope: 'workspace' });
+  globalThis.fetch = async (url) => {
+    const s = String(url);
+    if (s.includes('/me/following')) return Response.json({ artists: { items: [{ id: 'a1', name: 'Artist One' }] } });
+    return Response.json({
+      items: [{ name: 'Slack Single', release_date: '2026-06-11', external_urls: { spotify: 'https://open.spotify.com/album/9' } }]
+    });
+  };
+  try {
+    await checkReleases(
+      { ...ctx, persona: { inputs: { SLACK_USER: 'U_ME', SPOTIFY_TOKEN: 'tok' }, inputSpecs: {} } },
+      { slack }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(slack.calls.length, 1);
+  assert.equal(slack.calls[0].kind, 'dm');
+  assert.equal(slack.calls[0].userId, 'U_ME');
+  assert.match(slack.calls[0].text, /Slack Single/);
+  const notified = await ctx.memory.recall('x', { tags: ['spotify-releases:notified'] });
+  assert.deepEqual(JSON.parse(notified[0].content), ['https://open.spotify.com/album/9']);
 });
 

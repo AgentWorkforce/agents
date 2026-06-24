@@ -17,9 +17,22 @@ export default definePersona({
     'Scans Hacker News a few times a day for topics you care about and posts a digest to Slack, Telegram, or both. Retains the last ~30 days of digests — DM the agent or message it on Telegram to ask about what it recently posted.',
   cloud: true,
 
+  // Optional integrations (workforce#252): each transport is `optional` and gated
+  // by `enabledByInput`, so its provider connection + trigger registration happen
+  // ONLY when the matching id input is set. Set SLACK_CHANNEL, TELEGRAM_CHAT, or
+  // both — a Slack-only deploy never has to wire up a Telegram bot, and vice
+  // versa. The handler delivers to whichever targets are configured.
   integrations: {
-    slack: { scope: { paths: '/slack/channels/**' } },
-    telegram: { scope: { chats: '/telegram/chats/**', layout: '/telegram/LAYOUT.md' } }
+    slack: {
+      optional: true,
+      enabledByInput: 'SLACK_CHANNEL',
+      scope: { paths: '/slack/channels/**' }
+    },
+    telegram: {
+      optional: true,
+      enabledByInput: 'TELEGRAM_CHAT',
+      scope: { chats: '/telegram/chats/**', layout: '/telegram/LAYOUT.md' }
+    }
   },
 
   inputs: {

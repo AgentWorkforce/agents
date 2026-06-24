@@ -1,22 +1,26 @@
 /**
- * inbox-buddy handler.
+ * inbox-buddy handler — dual-transport conversational Gmail Q&A.
  *
- * A conversational agent you chat with in a dedicated Slack channel to ask about
- * your Gmail. Built as a dogfooding forcing-function for two threading problems:
+ * A conversational agent you chat with in Slack OR Telegram to ask about your
+ * Gmail. Built as a dogfooding forcing-function for two threading problems:
  *
  *   1. Conversational continuity — remembering earlier turns in OUR chat. We
- *      persist/replay the transcript via ctx.memory keyed by the Slack
- *      conversation (lib/conversation), independent of harness session-resume.
+ *      persist/replay the transcript via ctx.memory keyed by the conversation
+ *      (lib/conversation), independent of harness session-resume.
  *   2. Email threading — resolving "that thread with X" to the right Gmail
  *      thread and reasoning over its full message list (lib/gmail, lib/prompt).
  *
- * Channel model (mirrors the in-production linear-slack agent): a `slack`
- * trigger watches ONE channel (the SLACK_CHANNEL picker input); the handler
- * answers every fresh human message there and replies in Slack. The relay inbox
- * is agent-to-agent, so it is NOT used for the human chat path.
+ * Transport is configuration-driven (workforce#252). Two webhook-driven
+ * triggers are registered — `slack.app_mention` and `telegram.message` — but the
+ * persona gates each transport on its id input (SLACK_CHANNEL / TELEGRAM_CHAT),
+ * so only the configured transport(s) actually connect + register. The handler
+ * dispatches by event type and ALWAYS replies on the origin transport, so a
+ * question asked in Slack is answered in Slack and never mirrored to Telegram.
  *
- * Reads Gmail ONLY from the relayfile VFS mount (`/google-mail/threads/**`) — no
- * Gmail token; auth lives in the google-mail Nango connection.
+ * The Gmail data path (lib/gmail / lib/prompt / lib/conversation) and the model
+ * call are transport-agnostic and shared by both paths. Reads Gmail ONLY from
+ * the relayfile VFS mount (`/google-mail/threads/**`) — no Gmail token; auth
+ * lives in the google-mail Nango connection.
  */
 import {
   defineAgent,
@@ -24,52 +28,65 @@ import {
   type AgentEvent,
   type WorkforceCtx
 } from '@agentworkforce/runtime';
-import {
-  loadConversation,
-  recordTurn
-} from './lib/conversation.js';
+import { loadConversation, recordTurn } from './lib/conversation.js';
 import { loadRecentThreads } from './lib/gmail.js';
 import { buildPrompt, focusedThreadIds, SYSTEM_PROMPT } from './lib/prompt.js';
 import {
   readSlackMessage,
   stripLeadingMention,
-  skipReason,
+  skipReason as slackSkipReason,
   conversationKeyForSlack,
   postReply,
   defaultSlack,
   type SlackMessage,
   type SlackPoster
 } from './lib/slack.js';
+import {
+  readTelegramMessage,
+  skipReason as telegramSkipReason,
+  conversationKeyForTelegram,
+  replyToMessage,
+  defaultTelegram,
+  type TelegramMessage,
+  type TelegramSender
+} from '../shared/telegram.js';
 
 const LLM_TIMEOUT_MS = 45_000;
 const THREAD_LOAD_LIMIT = 200;
 
 export default defineAgent({
   triggers: {
-    // `app_mention` is WEBHOOK-driven: the Slack Events webhook delivers the
-    // message in the event PAYLOAD, independent of the relayfile mount. We
-    // deliberately do NOT use `message.created` — that fires only on *ingested*
-    // message records (persona-deploy.ts: "watch ingested message records"), so
-    // a stalled slack sync (the relayfile migration) silently kills it. The
-    // message text rides in `event.expand('full').data`; the gmail mount it
-    // reads for context is separate (and fresh). Same shape the in-production
-    // review-agent (pr-reviewer) uses to reply to Slack mentions.
-    slack: [{ on: 'app_mention' }]
+    // Both webhook-driven: the message rides in the event PAYLOAD
+    // (event.expand('full').data), independent of the relayfile mount. We
+    // deliberately do NOT use `message.created`/relayfile watches — those fire
+    // only on *ingested* message records, so a stalled sync (the relayfile
+    // migration) silently kills them. Same shape the in-production review-agent
+    // (pr-reviewer) uses to reply to Slack mentions. Each transport's trigger is
+    // pruned at deploy when its id input is empty (persona enabledByInput).
+    slack: [{ on: 'app_mention' }],
+    telegram: [{ on: 'message' }]
   },
   handler: async (ctx, event) => {
-    // defineAgent infers the event as `slack.app_mention`, but the runtime's
-    // exported event unions don't yet carry that literal, so the inferred type
-    // isn't assignable to AgentEvent. Cast across the runtime type-defs gap; the
-    // handler only touches `.type`/`.expand()`, which every event provides.
-    await handleSlackMessage(ctx, event as unknown as AgentEvent);
+    // defineAgent infers the event as `slack.app_mention` / `telegram.message`,
+    // but the runtime's exported event unions don't yet carry those literals, so
+    // the inferred type isn't assignable to AgentEvent. Cast across the runtime
+    // type-defs gap; the handler only touches `.type`/`.expand()`, which every
+    // event provides.
+    const ev = event as unknown as AgentEvent;
+    if (ev.type.startsWith('telegram.')) {
+      await handleTelegramMessage(ctx, ev);
+    } else {
+      await handleSlackMessage(ctx, ev);
+    }
   }
 });
 
+// ── Slack chat path ──────────────────────────────────────────────────────────
+
 /**
- * Chat path: a Slack message in the chat channel. Gate it, load the conversation
- * transcript + recent Gmail threads, answer grounded in both, reply in Slack,
- * and persist the turn. `deps` is injectable so unit tests never call the
- * model/network.
+ * Chat path: a Slack message in the chat channel. Gate it, compose an answer
+ * grounded in the transcript + recent Gmail, reply in Slack, and persist the
+ * turn. `deps` is injectable so unit tests never call the model/network.
  */
 export async function handleSlackMessage(
   ctx: WorkforceCtx,
@@ -82,28 +99,110 @@ export async function handleSlackMessage(
 ): Promise<void> {
   // Diagnostic: deployments logs only surface the message STRING (not data
   // fields), so encode the event type / skip reason into the message itself.
-  ctx.log?.('info', `inbox-buddy.event type=${event.type}`);
+  ctx.log?.('info', `inbox-buddy.event transport=slack type=${event.type}`);
 
   if (!event.type.startsWith('slack.')) {
-    ctx.log?.('info', `inbox-buddy.skip reason=non-slack-event type=${event.type}`);
+    ctx.log?.('info', `inbox-buddy.skip transport=slack reason=non-slack-event type=${event.type}`);
     return;
   }
 
   const msg = readSlackMessage((await event.expand('full')).data);
   if (!msg) {
-    ctx.log?.('info', 'inbox-buddy.skip reason=unparseable-payload');
+    ctx.log?.('info', 'inbox-buddy.skip transport=slack reason=unparseable-payload');
     return;
   }
 
-  const reason = skipReason(msg, input(ctx, 'SLACK_CHANNEL'));
+  const channel = input(ctx, 'SLACK_CHANNEL');
+  const reason = slackSkipReason(msg, channel);
   if (reason) {
-    ctx.log?.('info', `inbox-buddy.skip reason=${reason.replace(/\s+/g, '-')} channel=${msg.channel} configured=${input(ctx, 'SLACK_CHANNEL') ?? 'unset'}`);
+    ctx.log?.('info', `inbox-buddy.skip transport=slack reason=${reason.replace(/\s+/g, '-')} channel=${msg.channel} configured=${channel ?? 'unset'}`);
     return;
   }
 
   const question = stripLeadingMention(msg.text).trim();
   const slack = deps.slack ?? defaultSlack();
-  const key = conversationKeyForSlack(msg);
+  const answer = await composeAnswer(ctx, {
+    transport: 'slack',
+    conversationKey: conversationKeyForSlack(msg),
+    channelLabel: msg.channel,
+    question,
+    complete: deps.complete,
+    now: deps.now
+  });
+
+  await postReply(ctx, slack, msg, answer);
+}
+
+// ── Telegram chat path ─────────────────────────────────────────────────────────
+
+/**
+ * Chat path: a Telegram message. Same shape as the Slack path — gate, compose,
+ * reply in Telegram (threading on the source message), persist the turn.
+ */
+export async function handleTelegramMessage(
+  ctx: WorkforceCtx,
+  event: AgentEvent,
+  deps: {
+    complete?: (prompt: string) => Promise<string>;
+    telegram?: TelegramSender;
+    now?: () => Date;
+  } = {}
+): Promise<void> {
+  ctx.log?.('info', `inbox-buddy.event transport=telegram type=${event.type}`);
+
+  if (!event.type.startsWith('telegram.')) {
+    ctx.log?.('info', `inbox-buddy.skip transport=telegram reason=non-telegram-event type=${event.type}`);
+    return;
+  }
+
+  const msg = readTelegramMessage((await event.expand('full')).data);
+  if (!msg) {
+    ctx.log?.('info', 'inbox-buddy.skip transport=telegram reason=unparseable-payload');
+    return;
+  }
+
+  const chat = input(ctx, 'TELEGRAM_CHAT');
+  const reason = telegramSkipReason(msg, chat);
+  if (reason) {
+    ctx.log?.('info', `inbox-buddy.skip transport=telegram reason=${reason.replace(/\s+/g, '-')} chat=${msg.chatId} configured=${chat ?? 'unset'}`);
+    return;
+  }
+
+  const question = msg.text.trim();
+  const tg = deps.telegram ?? defaultTelegram();
+  const answer = await composeAnswer(ctx, {
+    transport: 'telegram',
+    conversationKey: conversationKeyForTelegram(msg),
+    channelLabel: msg.chatId,
+    question,
+    complete: deps.complete,
+    now: deps.now
+  });
+
+  await replyToMessage(ctx, tg, msg, answer);
+}
+
+// ── shared answer core (transport-agnostic) ────────────────────────────────────
+
+/**
+ * The transport-agnostic heart of both paths: load the conversation transcript +
+ * recent Gmail threads, answer grounded in both (with a bounded model call and a
+ * deterministic fallback), and persist the turn for continuity BEFORE the caller
+ * delivers — so continuity survives a flaky reply transport. Returns the answer
+ * text for the caller to deliver on the origin transport.
+ */
+async function composeAnswer(
+  ctx: WorkforceCtx,
+  opts: {
+    transport: 'slack' | 'telegram';
+    conversationKey: string;
+    channelLabel: string;
+    question: string;
+    complete?: (prompt: string) => Promise<string>;
+    now?: () => Date;
+  }
+): Promise<string> {
+  const { transport, conversationKey: key, channelLabel, question } = opts;
   const prior = await loadConversation(ctx, key);
 
   const root = resolveMountRoot({});
@@ -111,7 +210,8 @@ export async function handleSlackMessage(
 
   const focused = focusedThreadIds(threads, question);
   // String form for deployments-logs visibility; data form for tests/structured sinks.
-  ctx.log?.('info', `inbox-buddy.context channel=${msg.channel} priorTurns=${prior.length} threadsLoaded=${threads.length} focused=${focused.join('|') || 'none'}`, {
+  ctx.log?.('info', `inbox-buddy.context transport=${transport} channel=${channelLabel} priorTurns=${prior.length} threadsLoaded=${threads.length} focused=${focused.join('|') || 'none'}`, {
+    transport,
     conversationKey: key,
     priorTurns: prior.length,
     threadsLoaded: threads.length,
@@ -119,7 +219,7 @@ export async function handleSlackMessage(
   });
 
   const userPrompt = buildPrompt({ question, transcript: prior, threads });
-  const complete = deps.complete ?? ((p: string) => ctx.llm.complete(`${SYSTEM_PROMPT}\n\n${p}`, { maxTokens: 1024 }));
+  const complete = opts.complete ?? ((p: string) => ctx.llm.complete(`${SYSTEM_PROMPT}\n\n${p}`, { maxTokens: 1024 }));
 
   // ctx.llm.complete can hang or error — bound it and fall back to a
   // deterministic answer so the chat still gets a reply.
@@ -127,14 +227,14 @@ export async function handleSlackMessage(
   try {
     answer = await withTimeout(complete(userPrompt), LLM_TIMEOUT_MS, 'ctx.llm.complete');
   } catch (error) {
-    ctx.log?.('warn', 'inbox-buddy.llm-fallback', { error: String(error) });
+    ctx.log?.('warn', 'inbox-buddy.llm-fallback', { transport, error: String(error) });
     answer = fallbackAnswer(threads.length);
   }
   answer = answer.trim() || fallbackAnswer(threads.length);
 
   // Persist BEFORE delivery so continuity survives a flaky reply transport.
-  await recordTurn(ctx, key, prior, question, answer, deps.now);
-  await postReply(ctx, slack, msg, answer);
+  await recordTurn(ctx, key, prior, question, answer, opts.now);
+  return answer;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -166,4 +266,4 @@ function input(ctx: WorkforceCtx, name: string): string | undefined {
   return v || undefined;
 }
 
-export type { SlackMessage };
+export type { SlackMessage, TelegramMessage };

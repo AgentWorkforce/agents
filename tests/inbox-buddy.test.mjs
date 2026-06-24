@@ -23,7 +23,7 @@ import {
   conversationKeyForSlack,
   stripLeadingMention
 } from '../.test-build/inbox-buddy/lib/slack.js';
-import { handleSlackMessage } from '../.test-build/inbox-buddy/agent.js';
+import inboxBuddyAgent, { handleSlackMessage } from '../.test-build/inbox-buddy/agent.js';
 import inboxBuddyPersona from '../.test-build/inbox-buddy/persona.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -117,6 +117,19 @@ function slackEvent({ channel = 'C_CHAT', ts, text, user = 'U_HUMAN', threadTs, 
     id: `evt_${ts}`,
     workspace: 'ws-test',
     type: 'slack.app_mention',
+    occurredAt: '2026-06-10T12:00:00.000Z',
+    resource
+  });
+}
+
+/** A telegram.message event (the unified agent's other transport). */
+function telegramEvent({ chatId = '123', messageId = '10', text = 'hi', fromIsBot = false, threadId } = {}) {
+  const resource = { chatId, messageId, text, from: { is_bot: fromIsBot } };
+  if (threadId) resource.messageThreadId = threadId;
+  return envelopeToAgentEvent({
+    id: `evt_${messageId}`,
+    workspace: 'ws-test',
+    type: 'telegram.message',
     occurredAt: '2026-06-10T12:00:00.000Z',
     resource
   });
@@ -300,9 +313,42 @@ test('loadRecentThreads ignores _index.json and non-thread files', async () => {
   }
 });
 
-// ── persona config invariant (§1 scope trap) ──────────────────────────────────
+// ── dual-transport dispatch (unified agent) ────────────────────────────────────
 
-test('compiled persona scopes the REAL gmail mount (/google-mail subtree, not the dropped provider root or legacy /gmail) + slack', async () => {
+test('unified agent registers BOTH slack.app_mention and telegram.message triggers', () => {
+  assert.deepEqual(inboxBuddyAgent.triggers?.slack, [{ on: 'app_mention' }]);
+  assert.deepEqual(inboxBuddyAgent.triggers?.telegram, [{ on: 'message' }]);
+});
+
+test('default handler routes by event type to the matching transport (origin-only)', async () => {
+  // Bot messages are skipped by the loop guard BEFORE any transport client is
+  // constructed, so this exercises pure dispatch with no model/network calls.
+  const ctx = makeCtx();
+  await inboxBuddyAgent.handler(ctx, slackEvent({ ts: '1', text: 'x', isBot: true }));
+  assert.ok(
+    ctx.logs.some((l) => l.message.startsWith('inbox-buddy.skip') && l.message.includes('transport=slack')),
+    'a slack.* event must route to the slack path'
+  );
+  assert.ok(
+    !ctx.logs.some((l) => l.message.includes('transport=telegram')),
+    'a slack.* event must NOT touch the telegram path'
+  );
+
+  const ctx2 = makeCtx();
+  await inboxBuddyAgent.handler(ctx2, telegramEvent({ messageId: '2', text: 'x', fromIsBot: true }));
+  assert.ok(
+    ctx2.logs.some((l) => l.message.startsWith('inbox-buddy.skip') && l.message.includes('transport=telegram')),
+    'a telegram.* event must route to the telegram path'
+  );
+  assert.ok(
+    !ctx2.logs.some((l) => l.message.includes('transport=slack')),
+    'a telegram.* event must NOT touch the slack path'
+  );
+});
+
+// ── persona config invariant (§1 scope trap + §2 optional-integration gating) ──
+
+test('compiled persona scopes the REAL gmail mount (/google-mail subtree, not the dropped provider root or legacy /gmail) + gates slack/telegram', async () => {
   // Read the tsc-compiled persona module (reproducible from `npm test` alone),
   // not the gitignored `persona.json` (only produced by `npm run compile`).
   const parsed = parseIntegrations(inboxBuddyPersona.integrations ?? {}, 'inbox-buddy.integrations') ?? {};
@@ -319,9 +365,20 @@ test('compiled persona scopes the REAL gmail mount (/google-mail subtree, not th
   // or the legacy /gmail provider id.
   assert.ok(!gmailPaths.includes('/google-mail/**'), 'must not use the dropped provider-root glob');
   assert.ok(!gmailPaths.some((p) => p.startsWith('/gmail/')), 'must not use the legacy /gmail path');
+  // google-mail is the always-on data source — it must NOT be optional.
+  assert.notEqual(parsed['google-mail']?.optional, true, 'google-mail must stay required (the data source)');
 
-  // Slack is the human chat channel and is WRITTEN to → needs a non-empty scope
-  // (a trigger only mirrors the display-labelled read path, not the writeback path).
-  const slackScope = parsed.slack?.scope;
-  assert.ok(slackScope && Object.keys(slackScope).length > 0, 'slack must carry a non-empty scope');
+  // Both chat surfaces are WRITTEN to → each needs a non-empty scope (a trigger
+  // only mirrors the display-labelled read path, not the writeback path), AND is
+  // gated opt-in via workforce#252 (optional + enabledByInput on its id input) so
+  // a single-transport deploy never connects the other provider.
+  const slack = parsed.slack;
+  assert.ok(slack?.scope && Object.keys(slack.scope).length > 0, 'slack must carry a non-empty scope');
+  assert.equal(slack.optional, true, 'slack must be optional (workforce#252)');
+  assert.equal(slack.enabledByInput, 'SLACK_CHANNEL', 'slack must be gated on SLACK_CHANNEL');
+
+  const telegram = parsed.telegram;
+  assert.ok(telegram?.scope && Object.keys(telegram.scope).length > 0, 'telegram must carry a non-empty scope');
+  assert.equal(telegram.optional, true, 'telegram must be optional (workforce#252)');
+  assert.equal(telegram.enabledByInput, 'TELEGRAM_CHAT', 'telegram must be gated on TELEGRAM_CHAT');
 });

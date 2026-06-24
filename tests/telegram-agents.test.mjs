@@ -14,7 +14,7 @@ import {
   skipReason,
   replyToMessage
 } from '../.test-build/shared/telegram.js';
-import { handleTelegramMessage as inboxHandle } from '../.test-build/inbox-buddy-telegram/agent.js';
+import { handleTelegramMessage as inboxHandle } from '../.test-build/inbox-buddy/agent.js';
 import { handleTelegramMention, handleJokeOfTheDay } from '../.test-build/joke-bot-telegram/agent.js';
 import { checkReleases } from '../.test-build/spotify-releases-telegram/agent.js';
 import { postFreshStories, retryPendingThreadBody } from '../.test-build/hn-monitor/agent.js';
@@ -112,7 +112,7 @@ test('replyToMessage threads on the source message id', async () => {
   assert.equal(tg.sends[0].opts.replyToMessageId, 99);
 });
 
-// ── inbox-buddy-telegram ───────────────────────────────────────────────────────
+// ── inbox-buddy (Telegram transport of the unified dual-transport agent) ───────
 
 function seedGmailMount() {
   const mount = mkdtempSync(path.join(tmpdir(), 'ibt-'));
@@ -127,7 +127,7 @@ function seedGmailMount() {
   return mount;
 }
 
-test('inbox-buddy-telegram: answers a Gmail question and threads the reply + records the turn', async () => {
+test('inbox-buddy (telegram): answers a Gmail question and threads the reply + records the turn', async () => {
   const mount = seedGmailMount();
   process.env.RELAYFILE_MOUNT_ROOT = mount;
   try {
@@ -145,14 +145,14 @@ test('inbox-buddy-telegram: answers a Gmail question and threads the reply + rec
     assert.equal(tg.sends[0].opts.replyToMessageId, 5);
     assert.match(tg.sends[0].text, /Friday/);
     // The turn was persisted for continuity (transcript saved under the conv tag).
-    assert.ok(ctx.logs.some((l) => l.message?.includes('inbox-buddy-telegram.context')));
+    assert.ok(ctx.logs.some((l) => l.message?.includes('inbox-buddy.context') && l.message?.includes('transport=telegram')));
   } finally {
     restoreMountRoot();
     rmSync(mount, { recursive: true, force: true });
   }
 });
 
-test('inbox-buddy-telegram: skips the bot\'s own messages (loop guard)', async () => {
+test('inbox-buddy (telegram): skips the bot\'s own messages (loop guard)', async () => {
   const ctx = makeCtx();
   const tg = makeTelegram();
   await inboxHandle(

@@ -14,9 +14,9 @@
     "evals:live": "npm run compile && node scripts/evals/run-evals.mjs --live --judge"
   },
   "dependencies": {
-    "@agentworkforce/delivery": "^4.1.10",
-    "@agentworkforce/persona-kit": "^4.1.12",
-    "@agentworkforce/runtime": "^4.0.0",
+    "@agentworkforce/delivery": "^4.1.14",
+    "@agentworkforce/persona-kit": "^4.1.14",
+    "@agentworkforce/runtime": "^4.1.14",
     "@relayfile/adapter-daytona": "^0.1.1",
     "@relayfile/relay-helpers": "^0.4.2"
   },

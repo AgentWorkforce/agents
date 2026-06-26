@@ -89,6 +89,39 @@ function parseRelayMessage(event: { data?: unknown }): ParsedMessage | null {
   return { text: text.trim(), provider: 'relay' };
 }
 
+/**
+ * Best-effort: resolve the agent that sent an inbound relay DM, so we can reply
+ * to them over the relay. The sender rides on the event's summary `actor` (cloud
+ * envelope-builder normalizes relaycast `from` → `summary.actor`); we also probe
+ * the full payload's `from`/`actor` as a fallback. Returns the agent ref (name
+ * or id) or undefined when it can't be determined (caller then falls back to
+ * Slack/Telegram). The exact field path is verified against the live relay.
+ */
+async function resolveRelaySender(event: AgentEvent, expandedFull: unknown): Promise<string | undefined> {
+  // The cloud envelope-builder normalizes the relaycast `from` to the event's
+  // summary `actor` (`{ summary: { actor: { id, displayName } } }`), present
+  // directly on the event and via `expand('summary')`. Probe those first; fall
+  // back to the ALREADY-resolved full payload's `from`/`actor` (passed in to
+  // avoid a redundant expand round-trip).
+  const actorFrom = (obj: unknown): Record<string, unknown> | undefined => {
+    const r = asRecord(obj);
+    if (!r) return undefined;
+    return (
+      asRecord(r.actor) ??
+      asRecord(asRecord(r.summary)?.actor) ??
+      asRecord(asRecord(r.data)?.actor) ??
+      asRecord(asRecord(r.data)?.from) ??
+      asRecord(r.from) ??
+      undefined
+    );
+  };
+  const actor =
+    actorFrom((event as { summary?: unknown }).summary) ??
+    actorFrom(await event.expand('summary').catch(() => undefined)) ??
+    actorFrom(expandedFull);
+  return str(actor?.id) ?? str(actor?.name) ?? str(actor?.displayName);
+}
+
 // ── agent definition ─────────────────────────────────────────────────────
 
 export default defineAgent({
@@ -214,19 +247,42 @@ export async function handleQaMessage(
       : "I couldn't generate an answer right now, and I don't have any recent posts to show.";
   }
 
+  const reply = answer.trim() || 'No answer available.';
+
+  // Relay DMs: reply over the relay to whoever DM'd us (agent-to-agent
+  // round-trip) when we can resolve the sender. Falls back to Slack/Telegram
+  // delivery below when the sender can't be determined, so there's no regression.
+  if (provider === 'relay' && ctx.relay) {
+    const sender = await resolveRelaySender(event, expanded);
+    if (sender) {
+      try {
+        const res = await ctx.relay.dm(sender, reply);
+        if (res.ok) {
+          ctx.log('info', 'hn-monitor.qa.relay-replied', { to: sender });
+          return;
+        }
+        ctx.log('warn', 'hn-monitor.qa.relay-reply-no-receipt', { to: sender });
+      } catch (error) {
+        ctx.log('warn', 'hn-monitor.qa.relay-reply-failed', { to: sender, error: String(error) });
+      }
+      // fall through to transport delivery on failure
+    }
+  }
+
   // Reply only to the origin transport so questions don't mirror everywhere.
   const delivery = deps.delivery ?? createDelivery(ctx);
   if (delivery.targets.length > 0) {
     if (provider === 'relay') {
-      // Relay DMs: reply to Slack if configured (legacy behavior).
-      // If only Telegram is configured, reply there instead.
-      const targets: Array<'slack' | 'telegram'> = delivery.targets.includes('slack') ? ['slack'] : [...delivery.targets];
+      // Fallback: relay sender unresolved — reply to Slack if configured (legacy
+      // behavior), else Telegram.
+      const nonRelayTargets = delivery.targets.filter((t): t is 'slack' | 'telegram' => t === 'slack' || t === 'telegram');
+      const targets: Array<'slack' | 'telegram'> = nonRelayTargets.includes('slack') ? ['slack'] : nonRelayTargets;
       // When using injected mock, just publish directly (target filtering is
       // the test's responsibility). When using real client, scope to targets.
       const scoped = deps.delivery
         ? delivery
         : createDelivery(ctx, undefined, targets);
-      await scoped.publish(answer.trim() || 'No answer available.');
+      await scoped.publish(reply);
     } else {
       // Telegram Q&A: reply ONLY to Telegram.
       const scoped = deps.delivery
@@ -316,14 +372,19 @@ export async function postFreshStories(
 
 /** Serialize DeliveryResult.refs into storable headerRefs. */
 function saveHeaderRefs(result: DeliveryResult): PendingThreadBody['headerRefs'] {
-  return result.refs.map((r) => ({
-    provider: r.provider,
-    // For Slack: draftRef is the relay path (parentRef). For Telegram:
-    // store the messageId in draftRef so recovery can reconstruct threading.
-    draftRef: 'draftRef' in r ? r.draftRef : r.messageId,
-    channel: r.provider === 'slack' ? (r as import('@agentworkforce/delivery').SlackRef).channel : undefined,
-    chatId: r.provider === 'telegram' ? (r as import('@agentworkforce/delivery').TelegramRef).chatId : undefined
-  }));
+  return result.refs
+    .filter(
+      (r): r is import('@agentworkforce/delivery').SlackRef | import('@agentworkforce/delivery').TelegramRef =>
+        r.provider === 'slack' || r.provider === 'telegram'
+    )
+    .map((r) => ({
+      provider: r.provider,
+      // For Slack: draftRef is the relay path (parentRef). For Telegram:
+      // store the messageId in draftRef so recovery can reconstruct threading.
+      draftRef: 'draftRef' in r ? r.draftRef : r.messageId,
+      channel: r.provider === 'slack' ? r.channel : undefined,
+      chatId: r.provider === 'telegram' ? r.chatId : undefined
+    }));
 }
 
 // ── pending thread body recovery ─────────────────────────────────────────

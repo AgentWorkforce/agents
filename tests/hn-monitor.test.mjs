@@ -242,6 +242,47 @@ test('handleQaMessage recalls posted digests and answers via relay inbox', async
   assert.match(published[0], /TypeScript 5\.6 was posted yesterday\./);
 });
 
+test('handleQaMessage replies over the relay to the sender when resolvable (A2A round-trip)', async () => {
+  const dms = [];
+  const published = [];
+  const ctx = {
+    log() {},
+    persona: { inputs: { SLACK_CHANNEL: 'C123' }, inputSpecs: {} },
+    memory: {
+      async recall() {
+        return [{ content: JSON.stringify({ postedAt: '2026-06-17T09:00:00.000Z', digest: 'd', stories: [] }), createdAt: '2026-06-17T09:00:00.000Z', id: 'p1' }];
+      },
+      async save() {},
+    },
+    llm: { async complete() { return 'Here is your answer.'; } },
+    relay: {
+      async dm(to, text) { dms.push({ to, text }); return { ok: true, messageId: 'm1' }; },
+      async post() { return { ok: true }; },
+    },
+  };
+  const event = envelopeToAgentEvent({
+    id: 'evt-hn-sender',
+    workspace: 'ws-test',
+    type: 'relaycast.message',
+    occurredAt: '2026-06-18T12:00:00.000Z',
+    resource: { text: 'recap the typescript news' },
+    summary: { actor: { id: 'local-tester' } },
+  });
+  const mockDelivery = {
+    targets: ['slack'],
+    async publish(t) { published.push(t); return { ok: true, refs: [] }; },
+    async send(t) { published.push(t); return { ok: true, refs: [] }; },
+  };
+
+  await handleQaMessage(ctx, event, 'relay', { delivery: mockDelivery });
+
+  // Replied over the relay to the inbound sender; did NOT fall back to Slack.
+  assert.equal(dms.length, 1);
+  assert.equal(dms[0].to, 'local-tester');
+  assert.match(dms[0].text, /Here is your answer\./);
+  assert.equal(published.length, 0);
+});
+
 test('handleQaMessage with no text logs and returns without answering', async () => {
   let recalled = false;
   let llmCalled = false;

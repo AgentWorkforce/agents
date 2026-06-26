@@ -97,11 +97,12 @@ function parseRelayMessage(event: { data?: unknown }): ParsedMessage | null {
  * or id) or undefined when it can't be determined (caller then falls back to
  * Slack/Telegram). The exact field path is verified against the live relay.
  */
-async function resolveRelaySender(event: AgentEvent): Promise<string | undefined> {
+async function resolveRelaySender(event: AgentEvent, expandedFull: unknown): Promise<string | undefined> {
   // The cloud envelope-builder normalizes the relaycast `from` to the event's
   // summary `actor` (`{ summary: { actor: { id, displayName } } }`), present
-  // directly on the event and via `expand('summary')`. Probe both, plus the
-  // full payload's `from`/`actor`, defensively.
+  // directly on the event and via `expand('summary')`. Probe those first; fall
+  // back to the ALREADY-resolved full payload's `from`/`actor` (passed in to
+  // avoid a redundant expand round-trip).
   const actorFrom = (obj: unknown): Record<string, unknown> | undefined => {
     const r = asRecord(obj);
     if (!r) return undefined;
@@ -117,7 +118,7 @@ async function resolveRelaySender(event: AgentEvent): Promise<string | undefined
   const actor =
     actorFrom((event as { summary?: unknown }).summary) ??
     actorFrom(await event.expand('summary').catch(() => undefined)) ??
-    actorFrom(await event.expand('full').catch(() => undefined));
+    actorFrom(expandedFull);
   return str(actor?.id) ?? str(actor?.name) ?? str(actor?.displayName);
 }
 
@@ -251,8 +252,8 @@ export async function handleQaMessage(
   // Relay DMs: reply over the relay to whoever DM'd us (agent-to-agent
   // round-trip) when we can resolve the sender. Falls back to Slack/Telegram
   // delivery below when the sender can't be determined, so there's no regression.
-  if (provider === 'relay') {
-    const sender = await resolveRelaySender(event);
+  if (provider === 'relay' && ctx.relay) {
+    const sender = await resolveRelaySender(event, expanded);
     if (sender) {
       try {
         const res = await ctx.relay.dm(sender, reply);
@@ -274,7 +275,7 @@ export async function handleQaMessage(
     if (provider === 'relay') {
       // Fallback: relay sender unresolved — reply to Slack if configured (legacy
       // behavior), else Telegram.
-      const nonRelayTargets = delivery.targets.filter((t): t is 'slack' | 'telegram' => t !== 'relaycast');
+      const nonRelayTargets = delivery.targets.filter((t): t is 'slack' | 'telegram' => t === 'slack' || t === 'telegram');
       const targets: Array<'slack' | 'telegram'> = nonRelayTargets.includes('slack') ? ['slack'] : nonRelayTargets;
       // When using injected mock, just publish directly (target filtering is
       // the test's responsibility). When using real client, scope to targets.

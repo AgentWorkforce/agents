@@ -14,6 +14,7 @@ npm run evals -- --case linear-slack.chat
 npm run evals -- --suite chat        # by kind: chat|triage|scheduled|guard
 npm run evals -- --list
 npm run evals:live            # real cheap-model replies + LLM judge
+npm run evals:hn              # focused HN feed + follow-up-chat cases
 ```
 
 `npm run evals` compiles personas first (they are gitignored — `*/persona.json`
@@ -51,6 +52,20 @@ agents that read through a relay-helpers client (e.g.
 `linearClient().getIssue` resolves `/linear/issues/by-uuid/<id>.json`) get their
 data too. Use the long seed form to drop a file at an exact VFS path:
 `{ "vfs": "/linear/issues/by-uuid/issue-1.json", "file": "linear-issue-1.json" }`.
+
+HTTP-backed agents can declare deterministic responses with an `http` list:
+
+```json
+"http": [
+  { "match": "tags=front_page", "file": "hn-front-page.json" },
+  { "match": "/api/v1/items/1001", "file": "hn-item-1001.json" }
+]
+```
+
+The first URL substring match wins. Once a case declares HTTP fixtures, an
+unmatched request fails the case instead of reaching the network. This makes
+the HN relevance/feed/chat evals repeatable on both a laptop and the SF Mac
+mini.
 
 ## What simulate can and can't see
 
@@ -90,3 +105,46 @@ error, for guard cases), `eventSource`, `sideEffectsAll` (all must appear),
 `sideEffectsAny` (≥1), `logsAny` (≥1 log message).
 
 Artifacts land in `.evals/runs/<stamp>/{result.json,summary.md}` (gitignored).
+
+## Fast HN iteration, including the Mac mini surface
+
+Keep the inner loop deterministic and local:
+
+```sh
+npm run test:hn
+npm run evals:hn
+npm run preview:hn  # read-only live HN selection + Slack-text preview
+```
+
+Use the live executor only when changing model-facing curation/chat prompts:
+
+```sh
+npm run evals:live -- --agent hn-monitor --judge
+```
+
+The SF mini is a real proactive execution surface, not remote CI. Cloudflare
+reaches its loopback-bound runner through the authenticated Tailscale Funnel at
+`https://sf-mac-mini.tailf3b8ad.ts.net` (see the Cloud repo's
+`docs/runbooks/mini-sandbox-runner.md`). After the local gates pass:
+
+1. Use a dev Cloud stage whose deployed environment has
+   `SANDBOX_PROVIDER=local`,
+   `LOCAL_SANDBOX_URL=https://sf-mac-mini.tailf3b8ad.ts.net`, and the
+   matching `MiniSandboxToken` secret.
+2. Deploy or update `hn-monitor/persona.ts` in that stage and point
+   `SLACK_CHANNEL` at a dev channel.
+3. Run the same manual trigger used for any deployed proactive persona:
+
+   ```sh
+   agentworkforce trigger hn-monitor --workspace <workspace> --cloud-url <stage-url> --json
+   agentworkforce deployments logs hn-monitor --workspace <workspace> --cloud-url <stage-url> --tail 100
+   ```
+
+4. Verify the run appears in the mini runner logs, the digest has a top-level
+   header plus threaded body in Slack, and an `app_mention` follow-up is
+   answered in that thread.
+
+This is the final end-to-end gate: Cloud owns the schedule/event wakeup,
+durability, credentials, and delivery; the mini runs the actual persona
+sandbox. The trigger posts for real, so do not run it against a production
+channel as part of the ordinary inner loop.

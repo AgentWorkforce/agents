@@ -1,0 +1,22 @@
+{
+  "hits": [
+    {
+      "objectID": "1002",
+      "title": "Show HN: Durable memory for long-running coding agents",
+      "url": "https://example.com/agent-memory",
+      "points": 34,
+      "num_comments": 12,
+      "author": "builder",
+      "created_at": "2026-07-14T09:00:00.000Z"
+    },
+    {
+      "objectID": "1098",
+      "title": "Show HN: A calmer weather dashboard",
+      "url": "https://example.com/weather",
+      "points": 80,
+      "num_comments": 20,
+      "author": "weatherfan",
+      "created_at": "2026-07-14T08:30:00.000Z"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": 1001,
+  "title": "Claude Code adds background coding agents",
+  "url": "https://example.com/claude-code-agents",
+  "points": 125,
+  "author": "alice",
+  "children": [
+    {
+      "id": 2001,
+      "author": "runtime-builder",
+      "points": 18,
+      "text": "The interesting part is isolating each agent's sandbox while preserving shared context.",
+      "children": []
+    },
+    {
+      "id": 2002,
+      "author": "reviewer",
+      "points": 9,
+      "text": "I want to see how retries and handoffs are made observable.",
+      "children": []
+    }
+  ]
+}

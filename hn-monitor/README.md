@@ -23,6 +23,16 @@ You can also chat with it:
 - DM it over Agent Relay, or message its configured Telegram chat.
 - For post-specific questions it refreshes the HN item and top comments before
   answering, and clearly treats comments as community reaction rather than fact.
+- Slack digests also keep an exact rolling state file in the mounted Slack
+  Relayfile subtree. Semantic memory remains useful history, but ordinal/title
+  follow-ups do not depend on semantic search returning the right record.
+- If both exact state and semantic memory are unavailable, a question carrying
+  a complete story title uses a conservative HN Algolia title match before
+  hydration. Ambiguous or loose keyword matches are rejected.
+
+Exact state currently follows the configured Slack channel. Telegram-only and
+relay-only follow-ups still use semantic memory plus the strict title fallback;
+an ordinal such as “story 2” therefore needs retained memory outside Slack.
 
 Focused checks:
 

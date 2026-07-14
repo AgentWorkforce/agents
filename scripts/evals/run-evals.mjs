@@ -82,6 +82,32 @@ function resolveSeed(seed) {
   return { vfs: seed.vfs, contents: readFileSync(path.join(SEEDS_DIR, seed.file), 'utf8') };
 }
 
+/** Install deterministic HTTP responses for one eval case. Each entry is
+ *  `{ match, file, status? }`; the first substring match wins. Cases that
+ *  declare fixtures fail on an unmatched request instead of leaking to the
+ *  network, which keeps feed/search evals repeatable on laptops and Mac minis. */
+function withHttpFixtures(testCase, fn) {
+  const fixtures = (testCase.http ?? []).map((fixture) => ({
+    ...fixture,
+    body: readFileSync(path.join(SEEDS_DIR, fixture.file), 'utf8'),
+  }));
+  if (fixtures.length === 0) return Promise.resolve().then(fn);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const fixture = fixtures.find((candidate) => url.includes(candidate.match));
+    if (!fixture) throw new Error(`eval HTTP request had no fixture: ${url}`);
+    return new Response(fixture.body, {
+      status: fixture.status ?? 200,
+      headers: { 'content-type': fixture.contentType ?? 'application/json' },
+    });
+  };
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => { globalThis.fetch = originalFetch; });
+}
+
 function buildEnvelope(testCase, turn, idx = 0) {
   const f = testCase.fixture ?? {};
   const type = f.type ?? turn?.type;
@@ -205,17 +231,17 @@ async function runSimulate(testCase) {
     const persona = JSON.parse(readFileSync(personaPath(testCase.agent), 'utf8'));
     const mod = await tsImport(pathToFileURL(agentEntry(testCase.agent)).href, import.meta.url);
     const rec = await withCaseEnv(persona, testCase.inputs ?? {}, { RELAYFILE_MOUNT_ROOT: tmp, WORKSPACE_ROOT: tmp }, () =>
-      simulateInvocation({
-        persona,
-        handler: resolveHandler(mod),
-        // Multi-turn cases run every turn through ONE simulateInvocation so the
-        // in-memory ctx.memory persists across turns — that shared state is how
-        // we exercise conversational continuity end-to-end here.
-        envelopes: buildEnvelopes(testCase),
-        agent: { inputValues: testCase.inputs ?? {} },
-        files,
-        now: () => new Date('2026-06-10T12:00:00Z'),
-      })
+      withHttpFixtures(testCase, () => simulateInvocation({
+          persona,
+          handler: resolveHandler(mod),
+          // Multi-turn cases run every turn through ONE simulateInvocation so the
+          // in-memory ctx.memory persists across turns — that shared state is how
+          // we exercise conversational continuity end-to-end here.
+          envelopes: buildEnvelopes(testCase),
+          agent: { inputValues: testCase.inputs ?? {} },
+          files,
+          now: () => new Date('2026-06-10T12:00:00Z'),
+        }))
     );
     // Aggregate side effects/logs across all turns; status/eventSource come from
     // the LAST turn (a multi-turn case is judged on where it ended up).
@@ -343,14 +369,16 @@ async function runLive(testCase) {
     const handler = resolveHandler(mod);
     process.env.RELAYFILE_MOUNT_ROOT = mount;
     process.env.WORKSPACE_ROOT = mount;
-    await withCaseEnv(personaSpec, testCase.inputs ?? {}, {}, async () => {
-      for (let i = 0; i < events.length; i++) {
-        const event = events[i];
-        if (!event) throw new Error(`envelopeToAgentEvent returned null for turn ${i} (unsupported envelope)`);
-        lastTurnReplyStart = replies.length;
-        await handler(ctx, event);
-      }
-    });
+    await withCaseEnv(personaSpec, testCase.inputs ?? {}, {}, () =>
+      withHttpFixtures(testCase, async () => {
+        for (let i = 0; i < events.length; i++) {
+          const event = events[i];
+          if (!event) throw new Error(`envelopeToAgentEvent returned null for turn ${i} (unsupported envelope)`);
+          lastTurnReplyStart = replies.length;
+          await handler(ctx, event);
+        }
+      })
+    );
   } catch (err) {
     status = 'failed';
     error = err instanceof Error ? err.message : String(err);

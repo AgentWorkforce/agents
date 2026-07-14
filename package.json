@@ -8,9 +8,12 @@
   "scripts": {
     "test": "rm -rf .test-build && tsc --noEmit false --outDir .test-build && node --test tests/*.test.mjs; status=$?; rm -rf .test-build; exit $status",
     "test:review": "node scripts/test.mjs tests/review-agent.test.mjs",
+    "test:hn": "node scripts/test.mjs tests/hn-monitor.test.mjs",
+    "preview:hn": "tsx scripts/preview-hn-monitor.mts",
     "typecheck": "tsc --noEmit",
     "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done",
     "evals": "npm run compile && node scripts/evals/run-evals.mjs",
+    "evals:hn": "agentworkforce persona compile ./hn-monitor/persona.ts && node scripts/evals/run-evals.mjs --agent hn-monitor",
     "evals:live": "npm run compile && node scripts/evals/run-evals.mjs --live --judge"
   },
   "dependencies": {

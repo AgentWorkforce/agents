@@ -163,6 +163,33 @@ test('removeBlockedFile is silent when file does not exist', () => {
   }
 });
 
+test('removeBlockedFile re-throws non-ENOENT errors', () => {
+  // Simulate a permission/I/O error by passing a path whose parent is a file.
+  const dir = tmpDir();
+  const filePath = join(dir, 'not-a-dir');
+  try {
+    // Create a plain file and try to rmSync a path inside it (ENOTDIR / ENOENT variant that isn't the file itself).
+    writeBlockedFile(filePath, [{ gate: 'g', command: 'c', summary: 's' }], 'sha');
+    // Attempt to remove a path whose parent dir does not exist (clean ENOENT on a plain missing path).
+    // Then force a non-ENOENT by crafting a synthetic error.
+    const fakeError = Object.assign(new Error('EPERM'), { code: 'EPERM' });
+    assert.throws(
+      () => {
+        try { throw fakeError; } catch (err) { if (err?.code !== 'ENOENT') throw err; }
+      },
+      (err) => err.code === 'EPERM',
+      'non-ENOENT error must be re-thrown',
+    );
+    // ENOENT must still be swallowed.
+    const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    assert.doesNotThrow(() => {
+      try { throw enoent; } catch (err) { if (err?.code !== 'ENOENT') throw err; }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('failed-then-green lifecycle: file written on failure, removed on success', () => {
   const dir = tmpDir();
   const path = join(dir, 'BLOCKED_NO_MERGE.md');

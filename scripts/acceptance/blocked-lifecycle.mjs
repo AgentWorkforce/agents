@@ -34,11 +34,15 @@ export function writeBlockedFile(path, failedGates, commit) {
 }
 
 /**
- * Remove BLOCKED_NO_MERGE.md when all gates pass. Silent if the file is absent.
+ * Remove BLOCKED_NO_MERGE.md when all gates pass. Silent if the file is absent
+ * (ENOENT). Re-throws permission errors and other I/O failures so a stale
+ * no-merge marker cannot be left behind undetected.
  * @param {string} path Absolute path to the file.
  */
 export function removeBlockedFile(path) {
   try {
     rmSync(path);
-  } catch {}
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+  }
 }

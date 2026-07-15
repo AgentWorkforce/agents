@@ -80,5 +80,15 @@ export default definePersona({
   relay: { inbox: ['@self'] },
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 30 },
 
+  capabilities: {
+    httpRead: {
+      allow: [
+        { method: 'GET', urlGlob: 'https://hn.algolia.com/api/v1/search*' },
+        { method: 'GET', urlGlob: 'https://hn.algolia.com/api/v1/search_by_date*' },
+        { method: 'GET', urlGlob: 'https://hn.algolia.com/api/v1/items/*' },
+      ],
+    },
+  },
+
   onEvent: './agent.ts'
 });

@@ -27,5 +27,16 @@ export default defineAgent({
     } catch (error) {
       ctx.log('info', 'acceptance.fetch.denied-post.blocked', { error: String(error) });
     }
+
+    const undeclaredGetUrl = ctx.persona?.inputs?.['UNDECLARED_GET_URL'];
+    if (undeclaredGetUrl) {
+      try {
+        const undeclared = await fetch(undeclaredGetUrl, { method: 'GET' });
+        ctx.log('warn', 'acceptance.fetch.undeclared-get.unexpected', { status: undeclared.status });
+        await undeclared.text();
+      } catch (error) {
+        ctx.log('info', 'acceptance.fetch.undeclared-get.blocked', { error: String(error) });
+      }
+    }
   },
 });

@@ -80,6 +80,13 @@ export default defineAgent({
       ctx.log('info', 'acceptance.safety.denied-post.status', { status: response.status });
     });
 
+    await attempt(ctx, 'undeclared-get', async () => {
+      const undeclaredGetUrl = requiredInput(ctx, 'UNDECLARED_GET_URL');
+      const response = await fetch(undeclaredGetUrl, { method: 'GET' });
+      await response.text();
+      ctx.log('info', 'acceptance.safety.undeclared-get.status', { status: response.status });
+    });
+
     await attempt(ctx, 'raw-http', async () => {
       await rawHttpRequest(deniedPostUrl, 'POST');
     });

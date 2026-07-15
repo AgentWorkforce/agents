@@ -3,9 +3,11 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import http from 'node:http';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { createSentinelServer } from './sentinel-server.mjs';
+import { createIntegrationHealthServer } from './integration-health-server.mjs';
 
 import {
   agentworkforceBin,
@@ -302,6 +304,8 @@ await runGate(
       'ALLOWED_GET_URL=<sentinel>',
       '--input',
       'DENIED_POST_URL=<sentinel>',
+      '--input',
+      'UNDECLARED_GET_URL=<sentinel>',
       '--output',
       '<fetch-run-record>',
     ]),
@@ -316,6 +320,8 @@ await runGate(
       'ALLOWED_GET_URL=<sentinel>',
       '--input',
       'DENIED_POST_URL=<sentinel>',
+      '--input',
+      'UNDECLARED_GET_URL=<sentinel>',
       '--output',
       '<raw-run-record>',
     ]),
@@ -340,6 +346,8 @@ await runGate(
           `ALLOWED_GET_URL=${sentinel.allowedUrl}`,
           '--input',
           `DENIED_POST_URL=${sentinel.deniedUrl}`,
+          '--input',
+          `UNDECLARED_GET_URL=${sentinel.undeclaredUrl}`,
           '--output',
           fetchRunRecordPath,
         ],
@@ -357,6 +365,8 @@ await runGate(
           `ALLOWED_GET_URL=${sentinel.allowedUrl}`,
           '--input',
           `DENIED_POST_URL=${sentinel.deniedUrl}`,
+          '--input',
+          `UNDECLARED_GET_URL=${sentinel.undeclaredUrl}`,
           '--output',
           rawRunRecordPath,
         ],
@@ -384,6 +394,10 @@ await runGate(
       const rawBlocked = rawRecord
         ? rawRecord.actions?.some((action) => action.kind === 'http.read' && action.status === 'denied' && action.data?.module === 'node:http')
         : false;
+      const undeclaredBlocked = fetchRecord
+        ? readLogLines(fetchRecord).some((entry) => entry.message === 'acceptance.fetch.undeclared-get.blocked') ||
+          fetchRecord.actions?.some((action) => action.kind === 'http.read' && action.status === 'denied' && (action.data?.url ?? '').includes('/undeclared-get'))
+        : false;
 
       return {
         exitCode:
@@ -391,10 +405,12 @@ await runGate(
           sentinel.counts.allowed.get === 2 &&
           sentinel.counts.denied.post === 0 &&
           sentinel.counts.denied.raw === 0 &&
+          sentinel.counts.undeclared.get === 0 &&
           rawImport.status === 0 &&
           rawDenied &&
           rawBlocked &&
-          blockedPost
+          blockedPost &&
+          undeclaredBlocked
             ? 0
             : 1,
         summary:
@@ -402,11 +418,13 @@ await runGate(
           sentinel.counts.allowed.get === 2 &&
           sentinel.counts.denied.post === 0 &&
           sentinel.counts.denied.raw === 0 &&
+          sentinel.counts.undeclared.get === 0 &&
           rawImport.status === 0 &&
           rawDenied &&
           rawBlocked &&
-          blockedPost
-            ? 'Declared GETs reached the sentinel twice; fetch POST and raw node:http writes were blocked before any denied write landed.'
+          blockedPost &&
+          undeclaredBlocked
+            ? 'Declared GETs reached the sentinel twice; undeclared GET, fetch POST, and raw node:http writes were blocked before any denied write landed.'
           : 'Preview network safety boundary did not match the required allow/deny behavior.',
         artifactRefs: artifacts,
       };
@@ -450,8 +468,8 @@ await runGate(
     if (previewResult.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
 
     const runRecord = previewResult.status === 0 ? readJson(runRecordPath) : null;
-    const composeRunPreviewed = runRecord?.actions.some((action) => action.kind === 'compose.run' && action.status === 'previewed');
-    const shellExecPresent = runRecord?.actions.some((action) => action.kind === 'shell.exec');
+    const composeRunPreviewed = runRecord?.actions?.some((action) => action.kind === 'compose.run' && action.status === 'previewed');
+    const shellExecPresent = runRecord?.actions?.some((action) => action.kind === 'shell.exec');
 
     return {
       exitCode: composeResult.status === 0 && previewResult.status === 0 && composeRunPreviewed && !shellExecPresent ? 0 : 1,
@@ -522,6 +540,46 @@ await runGate(
       writeArtifact('cloud-webhook-ingress-suite.txt', `${webhookIngress.stdout}\n${webhookIngress.stderr}`.trim() + '\n'),
       writeArtifact('cloud-replay-suite.txt', `${replay.stdout}\n${replay.stderr}`.trim() + '\n'),
     ];
+
+    // Integration-health CLI projection proof
+    const integHealthServer = await createIntegrationHealthServer();
+    let integHealthResult = null;
+    let integHealthStdout = '';
+    try {
+      const integHealthEnv = {
+        ...baseAgentworkforceEnv(),
+        WORKFORCE_WORKSPACE_ID: integHealthServer.workspaceId,
+        WORKFORCE_WORKSPACE_TOKEN: 'acceptance-integ-health-token',
+      };
+      integHealthResult = await runAgentworkforceAsync(
+        [
+          'integrations',
+          'github',
+          '--json',
+          `--cloud-url=${integHealthServer.url}`,
+        ],
+        { env: integHealthEnv, timeoutMs: invokeTimeoutMs },
+      );
+      integHealthStdout = integHealthResult.stdout;
+    } finally {
+      integHealthServer.close();
+    }
+    const integHealthArtifact = writeArtifact(
+      'cloud-integ-health.stdout.txt',
+      `${integHealthStdout}\n${integHealthResult?.stderr ?? ''}`.trim() + '\n',
+    );
+    const integHealthRequestsArtifact = writeArtifact(
+      'cloud-integ-health.server-requests.json',
+      JSON.stringify(integHealthServer.receivedRequests, null, 2) + '\n',
+    );
+    artifacts.push(integHealthArtifact, integHealthRequestsArtifact);
+
+    let integHealthDoc = null;
+    try { integHealthDoc = integHealthResult?.status === 0 ? JSON.parse(integHealthStdout) : null; } catch {}
+    const githubRow = integHealthDoc?.integrations?.find((row) => row.id === 'github');
+    const integHealthPopulated = !!(githubRow?.registrationHealth);
+    const integAuthPresent = integHealthServer.receivedRequests.some((r) => r.hasAuth);
+
     return {
       exitCode:
         workerTypecheck.status === 0 &&
@@ -530,7 +588,10 @@ await runGate(
         routeCoverage.status === 0 &&
         ingress.status === 0 &&
         webhookIngress.status === 0 &&
-        replay.status === 0
+        replay.status === 0 &&
+        integHealthResult?.status === 0 &&
+        integHealthPopulated &&
+        integAuthPresent
           ? 0
           : 1,
       summary:
@@ -540,9 +601,12 @@ await runGate(
         routeCoverage.status === 0 &&
         ingress.status === 0 &&
         webhookIngress.status === 0 &&
-        replay.status === 0
-          ? 'Cloud router/webhook-worker/ingress/Composio/replay parity suites passed at the sibling Cloud commit.'
-          : 'Cloud focused parity or replay suite failed.',
+        replay.status === 0 &&
+        integHealthResult?.status === 0 &&
+        integHealthPopulated &&
+        integAuthPresent
+          ? 'Cloud router/webhook-worker/ingress/Composio/replay parity suites passed at the sibling Cloud commit; integration health projection populated and auth was forwarded.'
+          : 'Cloud focused parity, replay suite, or integration health projection failed.',
       artifactRefs: artifacts,
       repositoryCommits: {
         ...repoEvidence.repositories,
@@ -721,6 +785,7 @@ await runGate('artifact-secret-scan', 'scan generated artifact contents for secr
     process.env.WORKFORCE_TOKEN,
     'relay_pa_acceptance_preview_secret',
     'xoxb-acceptance-preview-token',
+    'acceptance-integ-health-token',
   ].filter(Boolean);
   const secretPatterns = [
     ['slack-token', /\bxox(?:a|b|p|r|s)-[A-Za-z0-9-]+\b/gu],
@@ -782,6 +847,35 @@ writeFileSync(resolve(artifactRoot, 'results.json'), JSON.stringify(finalResults
 writeFileSync(resolve(artifactRoot, 'FINAL_ACCEPTANCE.md'), renderMarkdown(finalResults));
 
 const failed = results.filter((gate) => gate.exitCode !== 0);
+
+const blockedPath = resolve(artifactRoot, 'BLOCKED_NO_MERGE.md');
+if (failed.length > 0) {
+  const failedLines = failed.map((gate) => `- \`${gate.gate}\`: ${gate.summary}`).join('\n');
+  const blockedContent = [
+    '# BLOCKED_NO_MERGE',
+    '',
+    `- Repository: AgentWorkforce/agents`,
+    `- Branch: codex/issue-2619-agents-closure`,
+    `- Commit at block report: ${repoEvidence.repositories.agents}`,
+    '',
+    '## Failed gates',
+    '',
+    failedLines,
+    '',
+    '## Exact failing commands',
+    '',
+    ...failed.map((gate) => [`### ${gate.gate}`, '', '```sh', gate.command, '```', '', `Summary: ${gate.summary}`, '']).flat(),
+    '## Release / merge confirmation',
+    '',
+    '- No PR was merged from this red acceptance evidence.',
+    '- No package release was published from this worktree.',
+    '',
+  ].join('\n');
+  writeFileSync(blockedPath, blockedContent);
+} else {
+  try { rmSync(blockedPath); } catch {}
+}
+
 process.exit(failed.length === 0 ? 0 : 1);
 
 function collectRepoEvidence() {
@@ -954,47 +1048,6 @@ async function runGate(name, command, fn) {
       artifactRefs: [artifact],
     });
   }
-}
-
-async function createSentinelServer() {
-    const counts = {
-      allowed: { get: 0 },
-      denied: { post: 0, raw: 0 },
-      requests: [],
-  };
-
-  const server = http.createServer((req, res) => {
-    const body = [];
-    req.on('data', (chunk) => body.push(chunk));
-    req.on('end', () => {
-      const payload = Buffer.concat(body).toString('utf8');
-      counts.requests.push({ method: req.method, url: req.url, body: payload });
-      if (req.method === 'GET' && req.url === '/allowed-get') counts.allowed.get += 1;
-      if (req.method === 'POST' && req.url === '/denied-post') {
-        if (payload === 'raw-http-body') counts.denied.raw += 1;
-        else counts.denied.post += 1;
-      }
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
-    });
-  });
-
-  await new Promise((resolveListen, rejectListen) => {
-    server.once('error', rejectListen);
-    server.listen(0, '127.0.0.1', resolveListen);
-  });
-
-  const address = server.address();
-  if (!address || typeof address === 'string') {
-    throw new Error('Unable to allocate local sentinel server port');
-  }
-
-  return {
-    allowedUrl: `http://127.0.0.1:${address.port}/allowed-get`,
-    deniedUrl: `http://127.0.0.1:${address.port}/denied-post`,
-    counts,
-    close: () => server.close(),
-  };
 }
 
 function renderMarkdown(finalResults) {

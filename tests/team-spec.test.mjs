@@ -8,10 +8,10 @@ import { validateTeamSpec } from '../scripts/validate-team-spec.mjs';
 
 /**
  * Golden guard for every checked-in team spec: each `teams/<id>/team.json`
- * must satisfy the cloud TeamSpec contract (see scripts/validate-team-spec.mjs
- * for the mirrored rules) so the file can be POSTed to the team-binding route
- * verbatim. A spec that drifts from the contract fails at bind time with a
- * 4xx in production — this test moves that failure to CI.
+ * must satisfy the shared Compose TeamSpec contract so the file can be POSTed
+ * to the team-binding route verbatim. A spec that drifts from the contract
+ * fails at bind time with a 4xx in production — this test moves that failure
+ * to CI.
  */
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -114,12 +114,12 @@ const rejectionCases = [
   {
     label: 'persona ref without slug or path',
     spec: { ...validSpec, members: [{ name: 'a', persona: {} }] },
-    needle: 'must include slug or path',
+    needle: 'must include slug, path, or inline',
   },
   {
-    label: 'inline persona ref (unsupported in Phase-1 binding)',
-    spec: { ...validSpec, members: [{ name: 'a', persona: { inline: {} } }] },
-    needle: 'inline is not supported',
+    label: 'inline persona ref with non-object payload',
+    spec: { ...validSpec, members: [{ name: 'a', persona: { inline: 'bad' } }] },
+    needle: 'inline must be an object',
   },
   {
     label: 'owns selector claimed by two members',
@@ -141,12 +141,17 @@ const rejectionCases = [
         { name: 'b', persona: 'persona-b', owns: [{ provider: 'github' }] },
       ],
     },
-    needle: 'claimed by both',
+    needle: 'members[0].name must be a non-empty string',
   },
   {
     label: 'non-integer token budget',
     spec: { ...validSpec, tokenBudget: 1.5 },
     needle: 'tokenBudget must be a positive 32-bit integer',
+  },
+  {
+    label: 'unknown top-level field',
+    spec: { ...validSpec, extra: true },
+    needle: 'TeamSpec.extra is not a known field',
   },
 ];
 

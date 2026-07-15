@@ -5,6 +5,8 @@ import test from 'node:test';
 
 import { parse } from 'yaml';
 
+import { findMissingFlags, formatMissingFlagsMessage } from '../scripts/agentworkforce-cli.mjs';
+
 const casesDir = resolve('hn-monitor/cases');
 const fixtureDir = resolve('hn-monitor/fixtures');
 const legacyFixtureDir = resolve('evals/seeds');
@@ -135,8 +137,31 @@ test('agent-local HTTP fixtures preserve the legacy eval inputs byte-for-byte', 
   }
 });
 
-test('legacy HN eval and preview scripts remain available until platform parity', () => {
+test('HN eval and preview scripts are thin platform-invoke wrappers', () => {
   const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf8'));
-  assert.match(pkg.scripts['evals:hn'], /run-evals/u);
-  assert.match(pkg.scripts['preview:hn'], /preview-hn-monitor/u);
+  assert.equal(pkg.scripts['evals:hn'], 'node scripts/run-hn-platform-cases.mjs');
+  assert.equal(pkg.scripts['preview:hn'], 'node scripts/run-hn-platform-preview.mjs');
+
+  const casesScript = readFileSync(resolve('scripts/run-hn-platform-cases.mjs'), 'utf8');
+  const previewScript = readFileSync(resolve('scripts/run-hn-platform-preview.mjs'), 'utf8');
+
+  assert.match(casesScript, /--case/u);
+  assert.match(casesScript, /requireAgentworkforceFlags/u);
+  assert.match(previewScript, /--schedule/u);
+  assert.match(previewScript, /--reads/u);
+  assert.match(previewScript, /--model/u);
+  assert.match(previewScript, /requireAgentworkforceFlags/u);
+});
+
+test('platform invoke wrappers surface actionable missing-flag diagnostics', () => {
+  const help = 'Usage: agentworkforce invoke --fixture <file>\nFlags:\n  --fixture <file>\n';
+  assert.deepEqual(findMissingFlags(help, ['--schedule', '--reads', '--model']), [
+    '--schedule',
+    '--reads',
+    '--model',
+  ]);
+  assert.match(
+    formatMissingFlagsMessage('invoke', ['--schedule', '--reads', '--model'], help),
+    /missing required closure flags: --schedule, --reads, --model/u,
+  );
 });

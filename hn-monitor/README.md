@@ -45,7 +45,7 @@ Focused checks:
 ```sh
 npm run test:hn
 npm run evals:hn
-npm run preview:hn  # read-only live HN selection + Slack-text preview
+npm run preview:hn
 ```
 
 Platform developer loop:
@@ -58,8 +58,9 @@ agentworkforce deploy ./hn-monitor/agent.ts --mode cloud --dry-run
 ```
 
 Local invocation always previews Slack actions; it never sends them. The
-existing focused eval and preview scripts remain available until these platform
-cases reach full runtime parity.
+`npm run evals:hn` and `npm run preview:hn` scripts are now thin wrappers
+around the platform invoke surface and fail closed until the Workforce CLI
+ships the required `--case` / `--schedule --reads --model` closure flags.
 
 The Mac mini gate is a full proactive cloud run, not an SSH test. Deploy this
 persona to a Cloud stage configured with `SANDBOX_PROVIDER=local` and

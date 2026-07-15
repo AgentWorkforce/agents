@@ -71,12 +71,16 @@ export function runAgentworkforce(args, options = {}) {
     encoding: 'utf8',
     timeout: timeoutMs,
   });
+  const timedOut = timeoutMs !== undefined && result.error?.code === 'ETIMEDOUT';
+  const stderr = timedOut
+    ? `${result.stderr ?? ''}${result.stderr ? '\n' : ''}Timed out after ${timeoutMs}ms`
+    : (result.stderr ?? '');
 
   return {
-    ok: result.status === 0,
-    status: result.status ?? 1,
+    ok: !timedOut && result.status === 0,
+    status: timedOut ? 124 : (result.status ?? 1),
     stdout: result.stdout ?? '',
-    stderr: result.stderr ?? '',
+    stderr,
     command: formatCommand(args),
     error: result.error,
   };
@@ -87,6 +91,7 @@ export function runAgentworkforceAsync(args, options = {}) {
     cwd = repoRoot,
     env = {},
     input,
+    timeoutMs,
   } = options;
   const invocation = getAgentworkforceInvocation(args);
 
@@ -105,10 +110,45 @@ export function runAgentworkforceAsync(args, options = {}) {
       cwd,
       env: { ...process.env, ...env },
       stdio: 'pipe',
+      detached: process.platform !== 'win32',
     });
 
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    let timeoutId;
+
+    const resolveOnce = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      resolvePromise(result);
+    };
+
+    const killChild = () => {
+      if (child.pid === undefined) return;
+      if (process.platform !== 'win32') {
+        try {
+          process.kill(-child.pid, 'SIGTERM');
+        } catch {}
+        setTimeout(() => {
+          try {
+            process.kill(-child.pid, 'SIGKILL');
+          } catch {}
+        }, 500).unref();
+        return;
+      }
+
+      try {
+        child.kill('SIGTERM');
+      } catch {}
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {}
+      }, 500).unref();
+    };
 
     if (input !== undefined) {
       child.stdin.end(input);
@@ -120,9 +160,13 @@ export function runAgentworkforceAsync(args, options = {}) {
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
     });
-    child.on('error', rejectPromise);
+    child.on('error', (error) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      rejectPromise(error);
+    });
     child.on('close', (status) => {
-      resolvePromise({
+      if (timedOut) return;
+      resolveOnce({
         ok: status === 0,
         status: status ?? 1,
         stdout,
@@ -130,6 +174,21 @@ export function runAgentworkforceAsync(args, options = {}) {
         command: formatCommand(args),
       });
     });
+
+    if (timeoutMs !== undefined) {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        stderr = `${stderr}${stderr ? '\n' : ''}Timed out after ${timeoutMs}ms`;
+        killChild();
+        resolveOnce({
+          ok: false,
+          status: 124,
+          stdout,
+          stderr,
+          command: formatCommand(args),
+        });
+      }, timeoutMs);
+    }
   });
 }
 

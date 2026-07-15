@@ -35,6 +35,7 @@ const bundle = buildReplayBundle({
     },
     summary: { title: 'Issue labeled' },
     payload: {
+      token: 'ghp_acceptance_secret_abcdefghijklmnopqrstuvwxyz',
       issue: { number: 2619, title: 'Closure acceptance' },
       label: { name: 'acceptance' },
       sender: { login: 'octocat' },
@@ -44,9 +45,12 @@ const bundle = buildReplayBundle({
     id: 'cloud-run-acceptance-1',
     status: 'succeeded',
     summary: 'deterministic replay bundle fixture',
+    output: 'relay_pa_secret-value',
   },
   inputs: {
     SOURCE: 'cloud-replay-bundle',
+    url: 'https://x-access-token:secret@example.test/repo',
+    password: 'ordinary-secret-that-has-no-token-prefix',
   },
   state: {
     schemaVersion: 1,
@@ -55,5 +59,31 @@ const bundle = buildReplayBundle({
     memory: [{ id: 'mem-historical-1', scope: 'workspace', tags: ['acceptance-replay'] }],
   },
 });
+
+const serialized = JSON.stringify(bundle);
+if (serialized.includes('ghp_acceptance_secret_abcdefghijklmnopqrstuvwxyz')) {
+  throw new Error('Cloud replay bundle did not redact the GitHub token fixture');
+}
+if (serialized.includes('relay_pa_secret-value')) {
+  throw new Error('Cloud replay bundle did not redact relay output secrets');
+}
+if (serialized.includes('x-access-token:secret')) {
+  throw new Error('Cloud replay bundle did not redact input URL secrets');
+}
+if (serialized.includes('ordinary-secret-that-has-no-token-prefix')) {
+  throw new Error('Cloud replay bundle did not redact password fields');
+}
+if (bundle.manifest.files['event.json']?.fidelity !== 'historical') {
+  throw new Error('Cloud replay bundle event fidelity drifted');
+}
+if (bundle.manifest.files['run.json']?.fidelity !== 'historical') {
+  throw new Error('Cloud replay bundle run fidelity drifted');
+}
+if (bundle.manifest.files['inputs.redacted.json']?.fidelity !== 'historical') {
+  throw new Error('Cloud replay bundle inputs fidelity drifted');
+}
+if (bundle.manifest.files['state/manifest.json']?.fidelity !== 'historical') {
+  throw new Error('Cloud replay bundle state fidelity drifted');
+}
 
 writeFileSync(outputPath, JSON.stringify(bundle, null, 2) + '\n');

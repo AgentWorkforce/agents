@@ -1,0 +1,27 @@
+{
+  "version": "4.1.22",
+  "commands": [
+    "create",
+    "agent",
+    "list",
+    "show",
+    "persona compile",
+    "install",
+    "sources list",
+    "sources add",
+    "sources remove",
+    "integrations",
+    "trigger",
+    "harness check",
+    "pick",
+    "deploy",
+    "local-surface",
+    "invoke",
+    "runs export",
+    "deployments list",
+    "deployments logs",
+    "destroy",
+    "login",
+    "logout"
+  ]
+}

@@ -10,6 +10,7 @@ import { findMissingFlags, formatMissingFlagsMessage } from '../scripts/agentwor
 const casesDir = resolve('hn-monitor/cases');
 const fixtureDir = resolve('hn-monitor/fixtures');
 const legacyFixtureDir = resolve('evals/seeds');
+const legacyCasesPath = resolve('evals/cases.jsonl');
 
 const caseFiles = readdirSync(casesDir)
   .filter((name) => name.endsWith('.case.yaml'))
@@ -105,6 +106,19 @@ test('deterministic feed case preserves story-selection and memory coverage', ()
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.matched-agentic matched=3'));
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.posted'));
   assert.ok(deterministic.expect.effectsContain.includes('memory.save'));
+});
+
+test('legacy eval JSONL keeps the HN deterministic feed-count contract in sync', () => {
+  const legacyEntry = readFileSync(legacyCasesPath, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((entry) => entry.id === 'hn-monitor.agentic-feeds');
+  assert.ok(legacyEntry, 'missing hn-monitor.agentic-feeds in evals/cases.jsonl');
+  assert.ok(
+    legacyEntry.expect.logsAny.includes('hn-monitor.feed-scan front_page=2 show_hn=2 new=4'),
+    'legacy JSONL feed-count contract drifted from the YAML case',
+  );
 });
 
 test('Slack provider-trigger case is multi-turn and shares the HN detail fixture', () => {

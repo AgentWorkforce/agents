@@ -6,6 +6,7 @@ import {
   agentworkforceCliOverrideEnv,
   formatCommand,
   getAgentworkforceInvocation,
+  runAgentworkforceAsync,
 } from '../scripts/agentworkforce-cli.mjs';
 
 test('agentworkforce helper defaults to the installed local binary', () => {
@@ -35,5 +36,17 @@ test('agentworkforce helper accepts an explicit binary override', () => {
   assert.equal(invocation.source, 'override');
   assert.equal(invocation.command, '/tmp/workforce-cli/bin/agentworkforce');
   assert.deepEqual(invocation.argv, ['runs', 'export', '--help']);
+  delete process.env[agentworkforceCliOverrideEnv];
+});
+
+test('agentworkforce async helper returns a timeout status for hanging override commands', async () => {
+  process.env[agentworkforceCliOverrideEnv] = process.execPath;
+  const result = await runAgentworkforceAsync(
+    ['-e', 'setInterval(() => {}, 1000)'],
+    { timeoutMs: 50 },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 124);
+  assert.match(result.stderr, /Timed out after 50ms/u);
   delete process.env[agentworkforceCliOverrideEnv];
 });

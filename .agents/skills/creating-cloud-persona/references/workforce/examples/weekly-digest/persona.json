@@ -1,0 +1,39 @@
+{
+  "id": "weekly-digest",
+  "intent": "documentation",
+  "tags": [
+    "documentation"
+  ],
+  "description": "Weekly competitive-intel digest. Searches the web for mentions of configured topics, dedupes and clusters by source domain, and upserts a single GitHub issue per ISO week.",
+  "inputs": {
+    "WEEKLY_DIGEST_TOPICS": {
+      "description": "Comma-separated list of topics the agent searches for each week.",
+      "env": "WEEKLY_DIGEST_TOPICS",
+      "default": "agentworkforce,relayfile,proactive-agents"
+    },
+    "WEEKLY_DIGEST_REPO": {
+      "description": "GitHub repo to upsert the digest issue into; format \"owner/repo\".",
+      "env": "WEEKLY_DIGEST_REPO",
+      "default": "AgentWorkforce/weekly-digest"
+    }
+  },
+  "harness": "opencode",
+  "model": "opencode/gpt-5-nano",
+  "systemPrompt": "Research the configured topics and produce a clustered weekly digest.",
+  "harnessSettings": {
+    "reasoning": "medium",
+    "timeoutSeconds": 900
+  },
+  "cloud": true,
+  "integrations": {
+    "github": {}
+  },
+  "memory": {
+    "enabled": true,
+    "scopes": [
+      "workspace"
+    ],
+    "ttlDays": 90
+  },
+  "onEvent": "./agent.ts"
+}

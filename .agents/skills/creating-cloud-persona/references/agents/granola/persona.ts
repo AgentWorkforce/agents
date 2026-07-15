@@ -1,0 +1,60 @@
+import { definePersona } from '@agentworkforce/persona-kit';
+
+/**
+ * Granola Agent — when a Granola meeting recording lands, detects prospect
+ * calls, files a Linear issue with what they asked for, and opens a GitHub PR
+ * implementing it.
+ */
+export default definePersona({
+  id: 'granola-prospect',
+  intent: 'relay-orchestrator',
+  tags: ['discovery', 'implementation'],
+  description: 'When a Granola recording lands, detects prospect calls, files a Linear issue with the ask, and opens a GitHub PR implementing it.',
+  cloud: true,
+  useSubscription: true,
+
+  integrations: {
+    // Granola has no realtime webhook yet, so notes arrive via the Nango
+    // `granola-relay:fetch-notes` sync, which writes each note to the VFS at
+    // /granola/notes/<id>.json and fires a storage `file.created` event.
+    granola: {},
+    // linear has no trigger here, so `scope` is the only thing that mounts
+    // /linear — without it the issue creation and PR-link comment writes
+    // are silent no-ops. Issues draft to /linear/issues and comments to
+    // /linear/issues/{issueId}/comments; the teams subtree backs the
+    // listLinearTeams() fallback when LINEAR_TEAM_ID is unset. (Scope
+    // values must be strings — one entry per subtree, not an array.)
+    linear: {
+      scope: {
+        issues: '/linear/issues/**',
+        teams: '/linear/teams/**'
+      }
+    },
+    // The cloud materializes this repo into the sandbox (ctx.sandbox.cwd) via
+    // relayfile — the agent never clones it.
+    github: { scope: { repo: 'your-org/your-repo' } }
+  },
+
+  inputs: {
+    // Optional: auto-resolved from the `fetch-teams` sync when there's exactly
+    // one Linear team. Only needed to disambiguate when you have several.
+    LINEAR_TEAM_ID: {
+      description: 'Linear team to file prospect issues under (only needed if you have multiple teams).',
+      env: 'LINEAR_TEAM_ID',
+      optional: true,
+      picker: { provider: 'linear', resource: 'teams' }
+    }
+  },
+
+  harness: 'claude',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: 'Turn prospect asks from meeting transcripts into a Linear issue and a small implementing PR.',
+  harnessSettings: {
+    reasoning: 'high',
+    timeoutSeconds: 1800,
+    sandboxMode: 'workspace-write',
+    workspaceWriteNetworkAccess: true
+  },
+
+  onEvent: './agent.ts'
+});

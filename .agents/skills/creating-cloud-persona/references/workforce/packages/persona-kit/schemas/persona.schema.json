@@ -1,0 +1,668 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/definitions/PersonaSpec",
+  "definitions": {
+    "PersonaSpec": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "intent": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "description": "Catalog labels from the closed  {@link  PERSONA_TAGS  }  vocabulary (e.g. `['documentation', 'review']`); they do NOT overlap with  {@link  intent } . The cloud rejects off-vocabulary tags with `400 invalid_persona`, and `definePersona` types `tags` against  {@link  KnownPersonaTag  }  to catch that at compile time. This parsed shape stays `string[]` for runtime leniency. Optional; omitted, `null`, and empty-array values are treated identically."
+        },
+        "description": {
+          "type": "string"
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PersonaSkill"
+          }
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/PersonaInputSpec"
+          },
+          "description": "Prompt-visible runtime inputs. Keys must be env-style names (`OUTPUT_PATH`, `TARGET_DIR`, etc.). Never put secrets here; resolved values are substituted into the persona's system prompt."
+        },
+        "harness": {
+          "$ref": "#/definitions/Harness",
+          "description": "Harness binary used to run this persona (`claude`, `codex`, `opencode`, `grok`). Required for interactive personas. Optional for handler-style personas ( {@link  onEvent }  set): only consumed when the handler calls `ctx.harness.run(...)`; pure orchestrators omit it."
+        },
+        "model": {
+          "type": "string",
+          "description": "Model identifier passed to the harness. Optional for handler-style personas — see  {@link  harness } ."
+        },
+        "systemPrompt": {
+          "type": "string",
+          "description": "System prompt body. `$NAME` / `${NAME}` references to inputs are substituted at spawn time. Optional for handler-style personas — see  {@link  harness } ."
+        },
+        "harnessSettings": {
+          "$ref": "#/definitions/HarnessSettings",
+          "description": "Harness-level knobs (reasoning, timeout, codex sandbox/approval policy, etc.)."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables injected into the harness child process. Values may be literal strings or `$VAR` references resolved from the caller's environment at spawn time."
+        },
+        "mcpServers": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/McpServerSpec"
+          },
+          "description": "MCP servers to attach to the harness session.\n- `claude`: passed via `--mcp-config`\n- `codex`: translated into `--config mcp_servers.<name>...` overrides\n- `opencode` / `grok`: currently warn and skip"
+        },
+        "permissions": {
+          "$ref": "#/definitions/PersonaPermissions",
+          "description": "Permission policy (allow/deny lists, mode) for the harness session. `claude` is wired for allow/deny/mode flags (via `--allowedTools`, `--disallowedTools`, `--permission-mode`). `grok` maps `mode: \"bypassPermissions\"` to `--always-approve`; other fields/harnesses warn and skip."
+        },
+        "sandbox": {
+          "type": "boolean",
+          "description": "Sandbox boot policy for this persona. Controls whether the runtime boots an isolated sandbox (Daytona/process) for harness execution and file ops.\n\n- **`true`** (default) — always boot a sandbox. The persona can use   `ctx.sandbox.exec()` to shell out, `ctx.files.read/write`, and   `ctx.harness.run()`.\n- **`false`** — skip sandbox boot entirely. Handler code reads provider   data via the runtime's VFS helpers (`listJsonFiles` / `readJsonFile`   / `writeJsonFile`) against provider path conventions (e.g.   `/linear/issues`, `/slack/channels`) instead of `ctx.sandbox.exec(find …)`   + `ctx.files.read()` loops. `ctx.harness.run()` still works.   `ctx.sandbox.exec()` rejects with `SandboxNotAvailableError`.\n\nSetting this to `false` dramatically reduces cold-start latency (no sandbox boot ≈ milliseconds vs seconds) and is appropriate for read-mostly handler agents that consume pre-synced VFS data directly rather than shell-globbing JSON files."
+        },
+        "mount": {
+          "$ref": "#/definitions/PersonaMount",
+          "description": "Relayfile mount policy for file visibility and writability. Applied by launchers that run the harness inside `@relayfile/local-mount`."
+        },
+        "claudeMd": {
+          "type": "string",
+          "description": "Author-supplied path to a `CLAUDE.md` sidecar that should be applied when the persona runs under the claude harness. The path is relative to the JSON file that declared the field; the loader resolves it to an already-absolute path on the parsed spec. Built-in personas inline the content into  {@link  PersonaSpec.claudeMdContent }  at build time."
+        },
+        "claudeMdMode": {
+          "$ref": "#/definitions/SidecarMdMode",
+          "description": "Defaults to `overwrite`. See  {@link  SidecarMdMode } ."
+        },
+        "agentsMd": {
+          "type": "string",
+          "description": "Author-supplied path to an `AGENTS.md` sidecar that should be applied when the persona runs under the opencode/codex/grok harnesses. Same resolution rules as  {@link  claudeMd } ."
+        },
+        "agentsMdMode": {
+          "$ref": "#/definitions/SidecarMdMode",
+          "description": "Defaults to `overwrite`. See  {@link  SidecarMdMode } ."
+        },
+        "claudeMdContent": {
+          "type": "string",
+          "description": "Inlined `CLAUDE.md` content for built-in personas. The catalog generator reads the sibling `.md` at build time and emits its body here so the installed package does not need to ship the file separately. Runtime code prefers this over `claudeMd` when both are set."
+        },
+        "agentsMdContent": {
+          "type": "string",
+          "description": "Inlined `AGENTS.md` content for built-in personas."
+        },
+        "cloud": {
+          "type": "boolean",
+          "description": "Opt this persona into the `workforce deploy` cloud-agent surface. When `true`, the deploy CLI considers this persona a deployable agent (validates  {@link  integrations }  /  {@link  schedules  } , prompts for integration connect, bundles  {@link  onEvent } , hands off to the runtime). Local `workforce agent <id>` flows ignore this flag — non-deploy use keeps working unchanged."
+        },
+        "useSubscription": {
+          "type": "boolean",
+          "description": "When `true`, inference for this agent uses the user's connected LLM subscription via `@agent-relay/cloud`'s provider link, rather than workforce-billed tokens. The deploy CLI calls `connectProvider({...})` at deploy time. Only meaningful when  {@link  cloud }  is `true`."
+        },
+        "integrations": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/PersonaIntegrationConfig"
+          },
+          "description": "Per-provider integration **connection** declarations keyed by Relayfile provider slug (`github`, `linear`, `slack`, `notion`, `jira`). At deploy time the CLI runs `RelayfileSetup.connectIntegration({ allowedIntegrations: [key] })` for each provider not yet connected to the active workspace. Event triggers are declared on the agent ( {@link  AgentSpec.triggers } ), not here — every provider an agent triggers on must also appear in this map."
+        },
+        "capabilities": {
+          "$ref": "#/definitions/ProactiveCapabilities",
+          "description": "Portable proactive capability declarations. A capability is enabled when its value is `true` or an object whose `.enabled !== false` (`{}` is enabled; `{ enabled: false }` is disabled). `pullRequest` is the legacy alias of `review`; both map to the review capability."
+        },
+        "memory": {
+          "$ref": "#/definitions/PersonaMemory",
+          "description": "Memory subsystem opt-in. Wires the agent-assistant memory adapter at runtime; the persona spec only declares intent, not implementation details (api keys, adapter type, etc. come from workforce env)."
+        },
+        "relay": {
+          "$ref": "#/definitions/PersonaRelay",
+          "description": "Relay (agent-relay / relaycast) participation. Off unless declared. When enabled, launchers inject the relaycast MCP so the persona can post to channels, DM, and answer replies — see  {@link  PersonaRelayConfig } . Secrets (`RELAY_API_KEY`, `RELAY_BASE_URL`) come from workforce env, not the spec."
+        },
+        "onEvent": {
+          "type": "string",
+          "description": "Relative POSIX path to the TypeScript (or compiled .js / .mjs) file whose default export is the deploy-time event handler. Resolved relative to the persona JSON's directory at deploy time. Required by the JSON Schema whenever  {@link  cloud }  is `true` (any cloud persona needs an entrypoint, regardless of whether triggers are declared); the deploy CLI enforces the same rule. The parser itself keeps the field optional so partially-authored specs still parse."
+        }
+      },
+      "required": [
+        "id",
+        "intent",
+        "description",
+        "skills",
+        "harnessSettings"
+      ],
+      "description": "A persona describes *what an agent is* — its identity, runtime (harness, model, system prompt), skills, MCP servers, inputs, and which providers it\n*connects* to ( {@link  integrations } ). It does **not** describe when the agent fires: event triggers, cron schedules, and relayfile watch rules live on the agent ( {@link  AgentSpec } , authored via `defineAgent` in `agent.ts`).",
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "cloud": {
+                "const": true
+              }
+            },
+            "required": [
+              "cloud"
+            ]
+          },
+          "then": {
+            "required": [
+              "onEvent"
+            ]
+          }
+        }
+      ]
+    },
+    "PersonaSkill": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "description"
+      ],
+      "description": "A skill is a named, reusable capability attached to a persona. `source` points to canonical guidance the persona should apply (e.g. a prpm.dev package URL, an internal runbook, a docs page)."
+    },
+    "PersonaInputSpec": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Human-readable explanation shown in docs/catalog UIs."
+        },
+        "env": {
+          "type": "string",
+          "description": "Environment variable to read when the launcher did not provide an explicit value. Defaults to the input key itself."
+        },
+        "default": {
+          "type": "string",
+          "description": "Literal fallback used when neither an explicit value nor env var exists."
+        },
+        "optional": {
+          "type": "boolean",
+          "description": "When true, the input is allowed to resolve to an empty string. The launcher substitutes `$NAME` with `''` rather than throwing `MissingPersonaInputError`. Use for inputs whose absence is meaningful — e.g. an upstream task description that may or may not be forwarded — and prefer non-optional inputs with a `default` for everything else so misconfigured launches surface loudly."
+        },
+        "picker": {
+          "$ref": "#/definitions/PersonaInputPicker",
+          "description": "Declares that this input's value is an id chosen from a live list backed by an integration connection (e.g. a Slack user id, a Linear team id). When set, the deploy CLI offers the operator a picker right after the provider's OAuth connect — fetching the options through the cloud and writing the chosen id into this input — instead of making them paste a raw id. Purely an onboarding affordance: the runtime still resolves the value the usual way (explicit value → env → default), so a `picker` can coexist with `env`/`default`/`optional`."
+        }
+      },
+      "description": "Prompt-visible runtime input declared by a persona. Inputs are for non-secret run configuration such as output paths, target package names, or mode switches. Launchers resolve each input from explicit values, the process environment, or `default`, then substitute `$NAME` / `${NAME}` in the system prompt before spawning the harness."
+    },
+    "PersonaInputPicker": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Integration provider whose connection backs the option list (e.g. `slack`, `linear`)."
+        },
+        "resource": {
+          "type": "string",
+          "description": "Resource to list from that provider (e.g. `users`, `channels`, `teams`)."
+        }
+      },
+      "required": [
+        "provider",
+        "resource"
+      ],
+      "description": "How the deploy CLI sources a picker's options for a  {@link  PersonaInputSpec } . `provider` must be one the persona declares under `integrations` (so it is connected before the picker runs). `resource` names what to list from that provider — known values today are `users`, `channels` (Slack), and `teams` (Linear); the value is passed through to the cloud, so new resources don't require a persona-kit release."
+    },
+    "Harness": {
+      "type": "string",
+      "enum": [
+        "opencode",
+        "codex",
+        "claude",
+        "grok"
+      ]
+    },
+    "HarnessSettings": {
+      "type": "object",
+      "properties": {
+        "reasoning": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "timeoutSeconds": {
+          "type": "number"
+        },
+        "sandboxMode": {
+          "$ref": "#/definitions/CodexSandboxMode",
+          "description": "Codex CLI sandbox mode for model-generated shell commands. Prefer `workspace-write` with `workspaceWriteNetworkAccess` when network is the only missing capability; `danger-full-access` is the fully unsandboxed fallback."
+        },
+        "approvalPolicy": {
+          "$ref": "#/definitions/CodexApprovalPolicy",
+          "deprecated": true,
+          "description": "`--ask-for-approval` was removed in codex 0.1.77+. Use `dangerouslyBypassApprovalsAndSandbox` or `sandboxMode` instead. Setting this field emits a warning and has no effect."
+        },
+        "workspaceWriteNetworkAccess": {
+          "type": "boolean",
+          "description": "Allow outbound network access inside Codex's workspace-write sandbox (`sandbox_workspace_write.network_access`)."
+        },
+        "webSearch": {
+          "type": "boolean",
+          "description": "Enable the Codex live web-search tool for this runtime."
+        },
+        "dangerouslyBypassApprovalsAndSandbox": {
+          "type": "boolean",
+          "description": "Emit codex's single `--dangerously-bypass-approvals-and-sandbox` flag, which collapses \"no sandbox + never ask for approval\" and also suppresses codex's interactive \"are you sure?\" startup confirmation. Mutually exclusive with `sandboxMode`, `approvalPolicy`, and `workspaceWriteNetworkAccess` — those translate to the two-flag form which still prompts."
+        }
+      },
+      "required": [
+        "reasoning",
+        "timeoutSeconds"
+      ]
+    },
+    "CodexSandboxMode": {
+      "type": "string",
+      "enum": [
+        "read-only",
+        "workspace-write",
+        "danger-full-access"
+      ]
+    },
+    "CodexApprovalPolicy": {
+      "type": "string",
+      "enum": [
+        "untrusted",
+        "on-failure",
+        "on-request",
+        "never"
+      ]
+    },
+    "McpServerSpec": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "http",
+                "sse"
+              ]
+            },
+            "url": {
+              "type": "string"
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "stdio"
+            },
+            "command": {
+              "type": "string"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type",
+            "command"
+          ]
+        }
+      ],
+      "description": "MCP server config, structured to match Claude Code's `--mcp-config` JSON verbatim so the whole object can be passed through untouched. Values inside `headers` / `env` / `args` / `url` / `command` may be literal strings or `$VAR` / `${VAR}` references. Resolution happens in the runner/CLI at spawn time — this package only defines the shape, not the interpolation policy."
+    },
+    "PersonaPermissions": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tool names/patterns to auto-approve."
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tool names/patterns to always block."
+        },
+        "mode": {
+          "$ref": "#/definitions/PermissionMode",
+          "description": "Permission mode for the session."
+        }
+      },
+      "description": "Persona-level permission policy for the harness session. Translates to the harness's native allow/deny/mode flags at spawn time. Tool-pattern syntax is passed through verbatim — `\"mcp__posthog\"` to allow every posthog MCP tool, `\"mcp__posthog__projects-get\"` for a specific one, `\"Bash(git *)\"` for a shell pattern. See the target harness's docs for the exact grammar."
+    },
+    "PermissionMode": {
+      "type": "string",
+      "enum": [
+        "default",
+        "acceptEdits",
+        "bypassPermissions",
+        "plan"
+      ]
+    },
+    "PersonaMount": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether launchers should create a Relayfile mount for this persona. Defaults to true when omitted so existing mount policies keep working."
+        },
+        "ignoredPatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "readonlyPatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Relayfile mount policy for interactive sessions. Patterns use gitignore syntax. `ignoredPatterns` are omitted from the mount entirely; `readonlyPatterns` are copied into the mount but edits do not sync back. Launchers may merge these with project-level `.agentignore` / `.agentreadonly` dotfiles."
+    },
+    "SidecarMdMode": {
+      "type": "string",
+      "enum": [
+        "overwrite",
+        "extend"
+      ]
+    },
+    "PersonaIntegrationConfig": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/IntegrationSource"
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "description": "Per-provider **connection** configuration for a RelayFile provider. The map key is the provider slug (`github`, `linear`, `slack`, `notion`, `jira`). `scope` is provider-specific filter metadata (e.g. `{ repo: \"org/repo\" }` for github, `{ database: \"<id>\" }` for notion).\n\nThis declares only *that the persona connects to the provider* and how the connection resolves — **not** which events fire it. Event triggers live on the agent ( {@link  AgentSpec.triggers } ); the deploy CLI requires every provider in `agent.triggers` to also appear here so the connection is set up.\n\n`source` discriminates the cloud-side resolver between `user_integrations` and `workspace_integrations`; defaults to `{ kind: 'deployer_user' }` when omitted so existing personas keep their pre-discriminator behavior.\n\n`config` is a forward-compatible adapter passthrough. Persona-kit validates only that it is an object; provider adapters own the nested schema (for example GitHub materialization policy)."
+    },
+    "IntegrationSource": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "deployer_user"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "workspace"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "workspace_service_account"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        }
+      ],
+      "description": "Discriminator on how the cloud-side integration resolver should look up the connection backing a persona's declared integration:\n\n- `deployer_user` — resolve via `user_integrations` keyed by the deploying   user (the default; matches today's behavior).\n- `workspace` — resolve via the workspace's default `workspace_integrations`   row for this provider.\n- `workspace_service_account` — resolve via a named workspace service   account (e.g. `release-bot`), letting one workspace expose multiple   provider identities.\n\nThe persona-kit only validates the shape; the cloud resolver enforces which sources are actually permitted at deploy time."
+    },
+    "ProactiveCapabilities": {
+      "type": "object",
+      "properties": {
+        "review": {
+          "$ref": "#/definitions/CapabilityValue",
+          "description": "Review a PR/MR diff and post a review."
+        },
+        "issueClaim": {
+          "$ref": "#/definitions/CapabilityValue",
+          "description": "Claim an issue and open a change request."
+        },
+        "conflictAutofix": {
+          "$ref": "#/definitions/CapabilityValue",
+          "description": "Rebase a dirty PR/MR."
+        },
+        "pullRequest": {
+          "$ref": "#/definitions/CapabilityValue",
+          "description": "Legacy alias of `review`."
+        }
+      },
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/CapabilityValue"
+          },
+          {
+            "not": {}
+          }
+        ],
+        "description": "Consumer-defined capabilities pass through the parser unchanged. persona-kit is platform-agnostic and must not drop capability keys it does not model directly - e.g. the cloud-only `teamSolve` capability that drives `cloud-team-issue` team-launch (workforce#182 / cloud#1732)."
+      },
+      "description": "Portable proactive capability declarations.\n\nA capability is enabled when its value is `true` or an object whose `.enabled !== false` (`{}` is enabled; `{ enabled: false }` is disabled). `pullRequest` is the legacy alias of `review`; both map to the review capability."
+    },
+    "CapabilityValue": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": {}
+        }
+      ]
+    },
+    "PersonaMemory": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/PersonaMemoryConfig"
+        }
+      ]
+    },
+    "PersonaMemoryConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PersonaMemoryScope"
+          }
+        },
+        "ttlDays": {
+          "type": "number"
+        },
+        "autoPromote": {
+          "type": "boolean"
+        },
+        "dedupMs": {
+          "type": "number"
+        },
+        "trajectories": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "$ref": "#/definitions/PersonaTrajectoryConfig"
+            }
+          ],
+          "description": "Opt into decision-trajectory recording (the \"why\"). **Off by default.** When enabled, the runtime auto-records this persona's decisions per run and writes a compacted contract artifact to `<root>/<personaId>/compacted/<runId>.json` (root = `TRAJECTORY_ROOT` env or the cloud workspace default). Object form lets you toggle compaction."
+        },
+        "aiMemory": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "$ref": "#/definitions/PersonaAiMemoryConfig"
+            }
+          ],
+          "description": "Opt into ai-memory recall (the \"how\" + \"why\" retrieval). **Off by default.** When enabled, the persona loads the ai-hist MCP so it can recall its own compacted trajectories (the why) and cross-tool prompt/session history (the how). Object form lets you override the history DB path."
+        }
+      },
+      "description": "Long-form memory configuration. Defaults are applied by the runtime, not the parser — the spec keeps only what the author actually wrote. `enabled` defaults to true when the object form is present."
+    },
+    "PersonaMemoryScope": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user",
+        "global"
+      ],
+      "description": "Memory scope semantics, mirroring the agent-assistant memory adapter: `workspace` memory persists across users in a workspace, `user` memory follows an individual user's invocations, and `global` memory is shared across every invocation of the deployed agent."
+    },
+    "PersonaTrajectoryConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "autoCompact": {
+          "type": "boolean",
+          "description": "Run mechanical+markdown compaction on completion. Defaults to true."
+        }
+      },
+      "description": "Decision-trajectory recording config (the \"why\"). `enabled` defaults to true in object form, so `{ autoCompact: false }` means \"record, don't compact\". The store root is never per-persona — it's resolved once from `TRAJECTORY_ROOT` (or the cloud default) so the recorder's write-root always matches the ai-hist MCP's read-root."
+    },
+    "PersonaAiMemoryConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "dbPath": {
+          "type": "string",
+          "description": "Override the ai-hist history DB path; else `AI_HIST_DB` env / discovery."
+        }
+      },
+      "description": "ai-memory recall config (the \"how\" + \"why\" retrieval via the ai-hist MCP). `enabled` defaults to true in object form."
+    },
+    "PersonaRelay": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/PersonaRelayConfig"
+        }
+      ]
+    },
+    "PersonaRelayConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Master switch. Object form defaults to enabled (`{}` ⇒ on)."
+        },
+        "agentName": {
+          "type": "string",
+          "description": "Agent identity registered on relay (`RELAY_AGENT_NAME`). Defaults to the env value, then the persona id. Must match the broker's routing name."
+        },
+        "channels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Relaycast channels the persona participates in (names may omit the leading `#`). Declarative intent consumed when wiring inbox triggers (Unit C); does not affect MCP injection on its own."
+        },
+        "inbox": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Relaycast inbox selectors the persona subscribes to (e.g. `@self`, `#eng`), mirroring the SDK `AgentDefinition.inbox` contract."
+        },
+        "defaultWorkspace": {
+          "type": "string",
+          "description": "Default relay workspace (`RELAY_DEFAULT_WORKSPACE`); else env."
+        }
+      },
+      "description": "Relay (agent-relay / relaycast) participation config. Like {@link PersonaMemoryConfig}, the persona declares **intent** only — the API key and base URL are secrets that come from workforce env (`RELAY_API_KEY`, `RELAY_BASE_URL`). When enabled, launchers inject the relaycast MCP server (see `buildRelaycastMcpServer`) so the persona is a first-class chat participant: it can post to channels, DM, and answer replies — the human-in-the-loop surface a solo persona otherwise lacks."
+    }
+  },
+  "$id": "https://agentworkforce.dev/schemas/persona.schema.json"
+}

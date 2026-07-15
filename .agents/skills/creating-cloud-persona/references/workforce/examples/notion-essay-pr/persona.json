@@ -1,0 +1,55 @@
+{
+  "id": "notion-essay-pr",
+  "version": "1.0.0",
+  "intent": "documentation",
+  "tags": [
+    "proactive",
+    "notion",
+    "github"
+  ],
+  "description": "Listens for new Notion pages and drafts a GitHub pull request with a markdown essay.",
+  "harness": "claude",
+  "model": "claude-sonnet-4-6",
+  "systemPrompt": "When a new Notion page lands in the configured database, read it, draft a markdown essay that synthesizes its content, write the essay to /workspace/output/<page-id>.md, then open a pull request in the configured GitHub repo titled 'Essay: <page-title>'.",
+  "harnessSettings": {
+    "reasoning": "medium",
+    "timeoutSeconds": 600
+  },
+  "cloud": true,
+  "integrations": {
+    "notion": {
+      "source": {
+        "kind": "deployer_user"
+      },
+      "scope": {
+        "database": "${NOTION_SOURCE_DATABASE}"
+      }
+    },
+    "github": {
+      "source": {
+        "kind": "workspace_service_account",
+        "name": "release-bot"
+      },
+      "scope": {
+        "repo": "${GITHUB_TARGET_REPO}"
+      }
+    }
+  },
+  "inputs": {
+    "NOTION_SOURCE_DATABASE": {
+      "description": "Notion database id to watch.",
+      "env": "NOTION_SOURCE_DATABASE"
+    },
+    "GITHUB_TARGET_REPO": {
+      "description": "GitHub owner/repo for essay pull requests.",
+      "env": "GITHUB_TARGET_REPO"
+    }
+  },
+  "memory": {
+    "enabled": true,
+    "scopes": [
+      "workspace"
+    ]
+  },
+  "onEvent": "./agent.ts"
+}

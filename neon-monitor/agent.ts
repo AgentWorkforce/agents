@@ -102,6 +102,8 @@ interface AlertSignals {
   advisorErrors: NeonAdvisorIssue[];
   advisorWarns: NeonAdvisorIssue[];
   spendingIssues: string[];
+  /** False when NO neon index materialized into the VFS — data-plane gap, not "all clear". */
+  vfsPresent: boolean;
 }
 
 // ── Memory shape ─────────────────────────────────────────────────────────────
@@ -169,6 +171,38 @@ async function handleScan(ctx: WorkforceCtx): Promise<void> {
 
   const root = resolveMountRoot({});
   const signals = await evaluateSignals(ctx, root, failedOpsThreshold, wakingThreshold);
+
+  // Data-plane guard: if NONE of the neon indexes materialized into the VFS, the
+  // agent is scanning an empty `/neon` mount — the Nango→relayfile data never
+  // reached the agent — not a genuine all-clear. Surface it ONCE (deduped via the
+  // existing fingerprint memory) instead of logging `scan-clean` and going silent
+  // for days, which is exactly how this failure hid before. Tracked in cloud#2530.
+  if (!signals.vfsPresent) {
+    const fingerprint = 'neon:vfs-not-materialized';
+    const mem = await loadMemory(ctx);
+    if (mem.lastAlertFingerprint === fingerprint) {
+      ctx.log?.('warn', 'neon-monitor.vfs-empty-unchanged', {
+        reason: 'neon VFS still un-materialized since last scan; staying silent'
+      });
+      return;
+    }
+    const result = await slackClient({ writebackTimeoutMs: 15_000 }).post(
+      channel,
+      ":warning: *Neon monitor* is scanning an empty `/neon` mount — no operations, "
+        + "endpoint, or advisor data has reached the relayfile VFS from Nango "
+        + "(data-plane gap, tracked in cloud#2530). Alerts are paused until sync data lands."
+    );
+    if (!result?.ts) {
+      ctx.log?.('error', 'neon-monitor.post-failed', {
+        reason: 'Slack writeback returned empty ts while reporting empty VFS'
+      });
+      throw new Error('Slack post returned no receipt ts; treating as delivery failure');
+    }
+    await saveMemory(ctx, { lastAlertFingerprint: fingerprint, lastScanAt: new Date().toISOString() });
+    ctx.log?.('warn', 'neon-monitor.vfs-empty', { ts: result.ts });
+    return;
+  }
+
   const hasAlerts = signals.failedOps.length > 0
     || signals.wakingEndpoints.length > 0
     || signals.advisorErrors.length > 0
@@ -378,13 +412,24 @@ async function evaluateSignals(
   failedOpsThreshold: number,
   wakingThreshold: number,
 ): Promise<AlertSignals> {
-  const [operations, endpoints, advisors, consumption, spendingLimits] = await Promise.all([
+  const [ops, eps, advs, cons, spend] = await Promise.all([
     readCollection<NeonOperation>(ctx, mountRoot, 'getOperations', OPERATIONS_INDEX),
     readCollection<NeonEndpoint>(ctx, mountRoot, 'getEndpoints', ENDPOINTS_INDEX),
     readCollection<NeonAdvisorIssue>(ctx, mountRoot, 'getAdvisors', ADVISORS_INDEX),
     readCollection<NeonProjectConsumption>(ctx, mountRoot, 'getConsumption', PROJECT_CONSUMPTION_INDEX),
     readCollection<NeonSpendingLimit>(ctx, mountRoot, 'getSpendingLimits', SPENDING_LIMITS_INDEX),
   ]);
+  const operations = ops.items;
+  const endpoints = eps.items;
+  const advisors = advs.items;
+  const consumption = cons.items;
+  const spendingLimits = spend.items;
+  // The `/neon` mount is "present" if the adapter has materialized at least one
+  // index. All-absent means the Nango→relayfile materialization never landed and
+  // the agent is scanning an empty mount — a data-plane failure, NOT "all clear"
+  // (tracked in cloud#2266). handleScan surfaces this instead of going silent.
+  const vfsPresent = ops.materialized || eps.materialized || advs.materialized
+    || cons.materialized || spend.materialized;
 
   // Failed operations: status === 'failed' OR failures_count > 0 with error.
   const failedOps = operations.filter((op) =>
@@ -438,6 +483,7 @@ async function evaluateSignals(
     advisorErrors,
     advisorWarns,
     spendingIssues,
+    vfsPresent,
   };
 }
 
@@ -550,7 +596,7 @@ async function handleInboxMessage(ctx: WorkforceCtx, event: AgentEvent): Promise
   // Load all data in parallel — the LLM gets the full picture so it can
   // answer cross-cutting questions (e.g. "which projects are consuming the
   // most compute?" requires both projects + consumption).
-  const [operations, endpoints, advisors, projects, consumption, spendingLimits] = await Promise.all([
+  const [opsRes, epsRes, advsRes, projRes, consRes, spendRes] = await Promise.all([
     readCollection<NeonOperation>(ctx, root, 'getOperations', OPERATIONS_INDEX),
     readCollection<NeonEndpoint>(ctx, root, 'getEndpoints', ENDPOINTS_INDEX),
     readCollection<NeonAdvisorIssue>(ctx, root, 'getAdvisors', ADVISORS_INDEX),
@@ -558,6 +604,12 @@ async function handleInboxMessage(ctx: WorkforceCtx, event: AgentEvent): Promise
     readCollection<NeonProjectConsumption>(ctx, root, 'getConsumption', PROJECT_CONSUMPTION_INDEX),
     readCollection<NeonSpendingLimit>(ctx, root, 'getSpendingLimits', SPENDING_LIMITS_INDEX),
   ]);
+  const operations = opsRes.items;
+  const endpoints = epsRes.items;
+  const advisors = advsRes.items;
+  const projects = projRes.items;
+  const consumption = consRes.items;
+  const spendingLimits = spendRes.items;
 
   // Surface the active alert state so the LLM can reference it even if the
   // user's question isn't about alerts.
@@ -618,16 +670,20 @@ async function readCollection<T>(
   mountRoot: string,
   tag: string,
   indexPath: string,
-): Promise<T[]> {
+): Promise<{ items: T[]; materialized: boolean }> {
   try {
     const index = await readJsonFile({ relayfileMountRoot: mountRoot }, 'neon', tag, indexPath) as { items?: T[] } | T[] | null;
-    if (!index) return [];
-    if (Array.isArray(index)) return index;
-    if (Array.isArray((index as { items?: T[] }).items)) return (index as { items: T[] }).items;
-    return [];
+    // `null` = the adapter hasn't materialized this index into the VFS yet.
+    // An empty array = index present but no records; that DOES count as
+    // materialized (real "all clear"), which is why we track it separately.
+    if (index == null) return { items: [], materialized: false };
+    if (Array.isArray(index)) return { items: index, materialized: true };
+    if (Array.isArray((index as { items?: T[] }).items)) return { items: (index as { items: T[] }).items, materialized: true };
+    return { items: [], materialized: true };
   } catch {
-    // VFS path not yet synced — return empty rather than crashing the scan.
-    return [];
+    // VFS path not yet synced / unreadable — treat as un-materialized rather
+    // than crashing the scan.
+    return { items: [], materialized: false };
   }
 }
 

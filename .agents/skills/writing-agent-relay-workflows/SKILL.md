@@ -1,6 +1,6 @@
 ---
 name: writing-agent-relay-workflows
-description: Use when building multi-agent workflows with relay broker-sdk. Covers conversation vs pipeline coordination, WorkflowBuilder/DAG steps, agents, {{steps.X.output}} chaining, repairable verification gates, evidence-based completion, mandatory Claude-then-Codex fresh-eyes review/fix loops with test hardening, channels, chat-native recipes, error handling, event listeners, step sizing, lead+workers teams, and parallel waves.
+description: Use when building multi-agent workflows with relay broker-sdk. Covers conversation vs pipeline coordination, WorkflowBuilder/DAG steps, agents, {{steps.X.output}} chaining, Relayfile-backed human assistance, Slack answer injection, integration subscriptions, waitFor gates, repairable verification, review-depth fresh-eyes review/fix loops with test hardening, channels, chat-native recipes, error handling, event listeners, step sizing, lead+workers teams, and parallel waves.
 ---
 
 ### Overview
@@ -19,6 +19,9 @@ The relay broker-sdk workflow system orchestrates multiple AI agents (Claude, Co
 - Needing verification gates, retries, or step output chaining
 - Designing product-contract workflows where failing checks should route to agents for repair instead of stopping the run
 - Dynamic channel management: agents joining/leaving/muting channels mid-workflow
+- Adding human-in-the-loop Slack questions that block the workflow and inject the answer back into the active agent
+- Subscribing workflows or agents to Relayfile integration events such as GitHub PR reviews, status checks, Linear issue events, or Slack replies
+- Building event-started or event-gated workflows that use SDK surfaces instead of local provider CLIs
 
 ### Non-Negotiable Workflow Checklist
 
@@ -27,11 +30,13 @@ Every generated workflow should satisfy this checklist before it is considered c
 1. Start with a deterministic, resumable preflight for repository state, credentials, and declared write scope.
 2. Pick the coordination shape deliberately: Conversation for non-trivial coordination, Pipeline only for linear one-shot handoffs.
 3. Use repairable validation gates: capture red output with `failOnError: false`, hand it to a repair owner, then rerun the same check.
-4. Run the mandatory fresh-eyes loops in order: Claude review/fix/final review/final fix, then Codex review/fix/final review/final fix.
+4. Run fresh-eyes review at the depth warranted by the spec: deep-tier workflows use Claude review/fix/final review/final fix followed by Codex review/fix/final review/final fix; lighter generated workflows may scale down only when deterministic gates, hard validation, and at least one independent Claude review/fix pass remain on the critical path.
 5. Require review fixers to add or update appropriate tests, fixtures, assertions, or deterministic proofs for testable findings.
-6. Run final deterministic acceptance after the Codex loop and before commit, PR creation, or handoff.
+6. Run final deterministic acceptance after the selected review-depth path and before commit, PR creation, or handoff.
 7. If a real blocker remains, write `BLOCKED_NO_COMMIT` with exact evidence and skip commit/PR creation instead of crashing the workflow.
 8. If the workflow owns shipping, model branch, commit, push, PR creation, and PR URL verification as explicit deterministic steps.
+9. For Slack questions, declare `swarm.humanAssistance.slack.channel` and instruct agents to print exactly one `HUMAN_QUESTION: <question>` line when blocked.
+10. For integration-backed behavior, declare `integrations.relayfile: {}` and use SDK integration steps, subscriptions, or `waitFor` gates; do not require `workspaceId`, tokens, Slack bot tokens, or local provider CLIs in the workflow.
 
 ### Default Principle: Workflows Repair Before They Fail
 
@@ -41,9 +46,92 @@ Every generated workflow should satisfy this checklist before it is considered c
 - Keep final acceptance deterministic, but still put an agent repair step before commit/PR creation. If the repair budget is exhausted or a true external blocker remains, write a blocked artifact and skip commit/PR creation; do not let the workflow end as `FAILED`.
 - Use `.reliable()` or `.repairable()` on SDK versions that support it, especially for product-contract workflows. As of AgentWorkforce/relay#827, retry-mode workflows with agents are repair-aware by default, repair agents run before retrying malformed/failed agent steps, and the SDK covers DAG, pipeline, fan-out, worktree-backed, deterministic-only, and agent-plus-gate shapes.
 
-### Mandatory Fresh-Eyes Review Loops
+### Human Assistance and Relayfile Events
 
-#### Every workflow must include two comprehensive fresh-eyes review/fix loops before final acceptance, commit, PR creation, or handoff: first Claude, then Codex. This applies even to small workflows and even when deterministic tests pass. Tests prove commands passed; the fresh-eyes loops make independent agents read the actual resulting files and artifacts as if they did not author them.
+#### Slack Human Assistance
+
+```yaml
+version: '1.0'
+name: blocked-agent-question
+swarm:
+  pattern: dag
+  humanAssistance:
+    slack:
+      channel: proj-cloud
+      timeoutMs: 3600000
+integrations:
+  relayfile: {}
+agents:
+  - name: implementer
+    cli: codex
+    role: Implementer that can ask the human one concise question when blocked
+workflows:
+  - name: default
+    steps:
+      - name: implement
+        agent: implementer
+        task: |
+          Implement the requested change.
+          If you are blocked by missing product intent or an unsafe decision, print exactly:
+          HUMAN_QUESTION: <your concise question>
+          Then wait for the injected HUMAN_ANSWER before continuing.
+```
+
+#### Relayfile Integration Subscriptions
+
+```yaml
+version: '1.0'
+name: pr-feedback-babysitter
+swarm:
+  pattern: dag
+  humanAssistance:
+    slack:
+      channel: proj-cloud
+integrations:
+  relayfile: {}
+  subscriptions:
+    - name: pr-feedback
+      provider: github
+      path: /github/repos/acme/web/pulls/42/**
+      events: [created, updated]
+      agents: [pr-babysitter]
+agents:
+  - name: pr-babysitter
+    cli: codex
+    role: PR babysitter that fixes review comments until the PR is ready
+    subscriptions:
+      - name: review-events
+        provider: github
+        paths:
+          - /github/repos/acme/web/pulls/42/reviews/**
+          - /github/repos/acme/web/pulls/42/status/**
+        events: [created, updated]
+workflows:
+  - name: default
+    steps:
+      - name: wait-for-first-review
+        type: waitFor
+        waitFor:
+          provider: github
+          path: /github/repos/acme/web/pulls/42/reviews/**
+          event: created
+          timeoutMs: 3600000
+      - name: address-feedback
+        agent: pr-babysitter
+        dependsOn: [wait-for-first-review]
+        task: |
+          Review the first event payload:
+          {{steps.wait-for-first-review.output}}
+
+          Stay subscribed to INTEGRATION_EVENT updates for this PR.
+          Address review comments and failing status checks until no open feedback remains.
+          If you need a decision, print exactly one HUMAN_QUESTION line and wait for HUMAN_ANSWER.
+```
+
+
+### Review-Depth Fresh-Eyes Loops
+
+#### Review depth changes only the number of LLM fresh-eyes passes. It never removes deterministic proof, repairable validation, final hard validation, scoped diff evidence, blocked-state handling, or final signoff.
 
 ```text
 verdict: FINDINGS | NO_ISSUES_FOUND | BLOCKED
@@ -65,7 +153,7 @@ Before writing the workflow, decide *how the agents will coordinate*. The relay 
 | Shape | What it is | Use when |
 |---|---|---|
 | **Conversation** (chat-native) | Interactive agents share a channel; messages, `@-mentions`, and ambient awareness drive coordination. Lead and workers spawn in parallel and self-organize. The relay is the coordination layer, not just transport. | Multi-file work, peer review loops, cross-agent feedback, dynamic re-planning, multi-PR coordination, anything with a human-in-the-loop escape, swarms where workers pick up each other's output. |
-| **Pipeline** (one-shot DAG) | Each step runs as a one-shot subprocess (`claude -p`, `codex exec`); steps hand off via `{{steps.X.output}}` text injection. No agents are alive at the same time; no chat happens. | Linear, well-specified transformations; deterministic data passing; no live agent-to-agent coordination during implementation. The mandatory final Claude-then-Codex review/fix loops still apply. |
+| **Pipeline** (one-shot DAG) | Each step runs as a one-shot subprocess (`claude -p`, `codex exec`); steps hand off via `{{steps.X.output}}` text injection. No agents are alive at the same time; no chat happens. | Linear, well-specified transformations; deterministic data passing; no live agent-to-agent coordination during implementation. The selected review-depth path and deterministic final gates still apply. |
 
 **Default to Conversation for any non-trivial work.** Pipeline DAGs are simpler to reason about but they do not exercise the relay primitive — they are a Unix pipe with extra steps. If you would happily write the same task as a single shell pipeline, pipeline-shape is fine. Otherwise, you almost certainly want a Conversation shape.
 
@@ -437,9 +525,9 @@ runWorkflow().catch((error) => {
 - A fresh self-review agent reads the post-implementation files, recent local conventions, AGENTS.md / CLAUDE.md, and related rules. It should not rely on the implementer's summary.
 - The implementer gets that feedback and performs a repair pass.
 - Deterministic gates run with captured output. Red output goes to a repair owner, then the same gate reruns.
-- Run the mandatory fresh-eyes review loops in sequence: Claude reviews the actual final diff and artifacts, a fixer repairs findings and hardens them with appropriate tests/proofs, Claude reviews the post-fix state again, then Codex repeats the same cycle from scratch over the post-Claude-fix state.
-- Optional extra reviewers can be added for high-stakes work, but they do not replace the sequential Claude-then-Codex loops.
-- Final signoff only happens after post-Codex-fix review and final deterministic gates prove the spec is complete, or a blocker artifact explains why it cannot be completed.
+- Run the selected review-depth fresh-eyes loop exactly: light ends after `fix-loop` and `post-fix-validation`; standard adds `final-review-claude` and `final-fix-claude`; deep adds the full Codex loop after the Claude final fix.
+- Optional extra reviewers can be added for high-stakes work, but they do not replace the selected review-depth loop.
+- Final signoff only happens after the selected post-fix review path and final deterministic gates prove the spec is complete, or a blocker artifact explains why it cannot be completed.
 - Critical TypeScript rules:
 - Check the project's `package.json` for `"type": "module"` — if ESM, use `import`; if CJS, use `require()`. In both cases, wrap execution in an async function instead of raw top-level `await`.
 - `agent-relay run <file.ts>` executes the file as a standalone subprocess — it does NOT inspect exports. The file MUST call `.run()`.
@@ -608,7 +696,7 @@ export function applyCloudRepoSetup<T>(wf: T, opts: CloudRepoSetupOptions): T {
 - **Record residual risks**
 - Call out what was not covered
 - **Ship the result as a PR**
-- Open the pull request from the workflow itself with `createGitHubStep`
+- Open the pull request from the workflow itself with `createGitHubStep` from `@agent-relay/sdk` — **never** `gh pr create`, never `id:` inside the config, never `action: 'createPullRequest'`, never separate `owner`/`repo` fields
 - See [Shipping the Result — Open a PR via `createGitHubStep`](#shipping-the-result--open-a-pr-via-creategithubstep) below
 - A workflow that fixes a bug and stops short of the PR has only done half the loop
 - disposable sandbox / cloud workspace
@@ -640,14 +728,16 @@ async function runWorkflow() {
 
     // Branch off main on the remote.
     .step('create-branch', createGitHubStep({
+      name: 'create-branch',
       dependsOn: ['write-marker'],
       action: 'createBranch',
       repo: REPO,
-      params: { branch: BRANCH, source: 'main' },
+      params: { branch: BRANCH, fromBranch: 'main' },
     }))
 
     // Commit the change to the branch via Contents API.
     .step('commit-change', createGitHubStep({
+      name: 'commit-change',
       dependsOn: ['create-branch'],
       action: 'createFile',
       repo: REPO,
@@ -661,6 +751,7 @@ async function runWorkflow() {
 
     // Open the PR. This is the load-bearing step.
     .step('open-pr', createGitHubStep({
+      name: 'open-pr',
       dependsOn: ['commit-change'],
       action: 'createPR',
       repo: REPO,
@@ -799,7 +890,7 @@ Output:
 
 ### Common Patterns
 
-#### Mandatory Claude-Then-Codex Review/Fix Loops
+#### Deep-Tier Claude-Then-Codex Review/Fix Loops
 
 ```typescript
 .agent('claude-reviewer', {
@@ -1412,6 +1503,13 @@ When you set `.pattern('supervisor')` (or `hub-spoke`, `fan-out`), the runner au
 | `pipeline` but expecting auto-supervisor | Only hub patterns auto-harden. Use `.pattern('supervisor')` |
 | Workers without `preset: 'worker'` in one-shot DAG lead+worker flows | Add preset for clean stdout when chaining `{{steps.X.output}}` (not needed for interactive team patterns) |
 | Using `_` in YAML numbers (`timeoutMs: 1_200_000`) | YAML doesn't support `_` separators |
+| Putting `steps:` at YAML top level | Use `workflows: [{ name: default, steps: [...] }]`; top-level `steps` is not the Relayflows YAML shape |
+| Requiring `workspaceId`, Relayfile token, Slack bot token, or provider token in workflow YAML | With `integrations.relayfile: {}`, the runtime uses the existing Relayfile/Pear connection and mount; credentials belong to the connection, not the workflow |
+| Hardcoding only Slack channel IDs in reusable workflow YAML | Prefer channel names such as `proj-cloud` or `#proj-cloud`; Relayfile resolves them to IDs, while IDs still work for one-off local tests |
+| Agent asks a human in prose and keeps running | Tell the agent to print exactly one `HUMAN_QUESTION: <question>` line. The runner blocks, posts to Slack, and injects `HUMAN_ANSWER: <reply>` back into that agent |
+| Polling provider paths for PR feedback, Linear updates, or Slack replies | Use Relayfile subscriptions and `waitFor` gates. Active agents receive `INTEGRATION_EVENT`; DAG gates wait without polling |
+| `waitFor` step without `path` or `paths` | Add the provider path pattern to block on; the step output is the matching event payload as JSON |
+| Shelling out to `gh`, `linear`, `slack`, or `relayflows` for provider operations | Use SDK primitives, Relayfile integration steps, subscriptions, or Factory SDK dispatch surfaces so local and cloud runs behave the same |
 | Workflow timeout under 30 min for complex workflows | Use `3600000` (1 hour) as default |
 | Using `require()` in ESM projects | Check `package.json` for `"type": "module"` — use `import` if ESM |
 | Raw top-level `await` in workflow files | Executor paths may compile as CJS. Wrap `.run()` in `async function runWorkflow()` for both ESM and CJS files |
@@ -1430,16 +1528,16 @@ When you set `.pattern('supervisor')` (or `hub-spoke`, `fan-out`), the runner au
 | Codex login checked only with `codex login status` | Add a tiny `codex exec --ephemeral --json --sandbox read-only` preflight probe so stale refresh tokens fail before agent steps |
 | Edit gate uses `git diff --quiet` for new files/packages | `git diff` ignores untracked files and can fail a valid implementation with `NO_CHANGES`; use `git status --short -- <paths>` for materialization gates |
 | Hard-stop validation gates in product workflows | A red check stops the agent team at the exact moment it should fix the problem. Capture gate output with `failOnError: false`, add a repair agent step, rerun, and reserve hard failure for exhausted repair budget or external blockers |
-| Final acceptance before repair and dual review | Broken work can stop or commit without giving the team a final chance to fix it. Run repairable gates first, then the Claude-then-Codex review/fix loops, then final deterministic acceptance before commit/PR |
-| Skipping the mandatory dual review loops | Add sequential Claude-then-Codex fresh-eyes review/fix loops after repairable verification and before final acceptance, commit, PR creation, or handoff |
+| Final acceptance before repair and required review | Broken work can stop or commit without giving the team a final chance to fix it. Run repairable gates first, then the selected review-depth review/fix loop, then final deterministic acceptance before commit/PR |
+| Skipping required review-depth loops | Add the review/fix loop required for the selected review depth after repairable verification and before final acceptance, commit, PR creation, or handoff; deep tier requires sequential Claude-then-Codex fresh-eyes loops |
 | Treating optional notification credentials as fatal | Workflow progress gets blocked by a non-core side effect. Prefer primitive/runtime fallbacks such as the Slack primitive's `cloud-relay` or `noop` shape from AgentWorkforce/relay#823 when notification is not the product contract |
 | Manual peer fanout in `handleChannelMessage()` | Use broker-managed channel subscriptions — broker fans out to all subscribers automatically |
 | Client-side `personaNames.has(from)` filtering | Use `relay.subscribe()`/`relay.unsubscribe()` — only subscribed agents receive messages |
 | Agents receiving noisy cross-channel messages during focused work | Use `relay.mute({ agent, channel })` to silence non-primary channels without leaving them |
 | Hardcoding all channels at spawn time | Use `agent.subscribe()` / `agent.unsubscribe()` for dynamic channel membership post-spawn |
 | Using `preset: 'worker'` for Codex in *interactive team* patterns when coordination is needed | Codex interactive mode works fine with PTY channel injection. Drop the preset for interactive team patterns (keep it for one-shot DAG workers where clean stdout matters) |
-| Treating the lead's informal review as final signoff | The lead may review during implementation, but final signoff still requires the mandatory Claude-then-Codex fresh-eyes review/fix loops |
-| Not printing PR URL after `createGitHubStep({ action: 'createPR' })` | Capture `html_url` with `output: { mode: 'data', format: 'json', path: 'html_url' }` and echo or write it in a final deterministic step |
+| Treating the lead's informal review as final signoff | The lead may review during implementation, but final signoff still requires the selected review-depth fresh-eyes loop and final deterministic acceptance |
+| Not printing PR URL after `createGitHubStep({ name: 'open-pr', action: 'createPR' })` | Capture `html_url` with `output: { mode: 'data', format: 'json', path: 'html_url' }` and echo or write it in a final deterministic step |
 | Workflow ending without worktree + PR for cross-repo changes | Add `setup-worktree` at start and `push-and-pr` + `cleanup-worktree` at end |
 
 ### YAML Alternative

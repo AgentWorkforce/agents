@@ -255,3 +255,49 @@ test('handler posts a Slack alert on operation.failed and dedupes a replayed del
     else process.env.SLACK_CHANNEL = oldChannel;
   }
 });
+
+// ── handler: empty-VFS data-plane guard ───────────────────────────────────────
+
+// A full-state scan against a mount where NO neon index has materialized must
+// post a loud "empty /neon mount" diagnostic (cloud#2530) instead of silently
+// logging scan-clean, and must dedupe a second scan while still un-materialized.
+test('cron scan on an un-materialized /neon mount posts the cloud#2530 diagnostic and dedupes', async () => {
+  const oldMountPath = process.env.RELAYFILE_MOUNT_PATH;
+  const oldMountRoot = process.env.RELAYFILE_MOUNT_ROOT;
+  const oldChannel = process.env.SLACK_CHANNEL;
+  const mountRoot = await mkdtemp(path.join(os.tmpdir(), 'neon-monitor-empty-'));
+  const store = new Map();
+
+  try {
+    process.env.RELAYFILE_MOUNT_PATH = mountRoot;
+    process.env.RELAYFILE_MOUNT_ROOT = mountRoot;
+    process.env.SLACK_CHANNEL = 'C-neon-alerts';
+
+    const cron = envelopeToAgentEvent({
+      id: 'c1', workspace: 'ws', type: 'cron.tick',
+      occurredAt: FIXED_OCCURRED, name: 'neon-scan', cron: '0 */2 * * *',
+    });
+
+    // First scan → one diagnostic post naming the empty mount + tracking issue.
+    const firstPost = answerSlackWriteback(mountRoot, 'C-neon-alerts');
+    await agent.handler(eventCtx(store), cron);
+    const payload = await firstPost;
+    assert.match(payload.text, /empty `\/neon` mount/);
+    assert.match(payload.text, /cloud#2530/);
+
+    // Second scan while STILL un-materialized → deduped, no new draft written.
+    const dir = path.join(mountRoot, 'slack/channels/C-neon-alerts/messages');
+    for (const f of await readdir(dir)) await rm(path.join(dir, f));
+    await agent.handler(eventCtx(store), cron);
+    await new Promise((r) => setTimeout(r, 50));
+    const remaining = (await readdir(dir).catch(() => [])).filter((f) => f.endsWith('.json'));
+    assert.equal(remaining.length, 0, 'a still-empty mount must not repost the diagnostic');
+  } finally {
+    if (oldMountPath === undefined) delete process.env.RELAYFILE_MOUNT_PATH;
+    else process.env.RELAYFILE_MOUNT_PATH = oldMountPath;
+    if (oldMountRoot === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+    else process.env.RELAYFILE_MOUNT_ROOT = oldMountRoot;
+    if (oldChannel === undefined) delete process.env.SLACK_CHANNEL;
+    else process.env.SLACK_CHANNEL = oldChannel;
+  }
+});

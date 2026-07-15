@@ -59,6 +59,14 @@ test('local invoke case policy rejects writes: live from a case file', () => {
   );
 });
 
+test('local invoke case policy rejects writes: sandbox from a case file', () => {
+  const unsafeCase = parse('policy:\n  writes: sandbox\n');
+  assert.throws(
+    () => assertInvokeCaseWritePolicy(unsafeCase, 'unsafe.case.yaml'),
+    /cannot request sandbox writes from local invoke/u,
+  );
+});
+
 test('scheduled scan case keeps the reference policy and Slack thread assertion', () => {
   const scan = cases.get('scheduled-scan.case.yaml').value;
   assert.deepEqual(scan.event, { schedule: 'scan' });

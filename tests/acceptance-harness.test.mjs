@@ -2,11 +2,19 @@ import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createSentinelServer } from '../scripts/acceptance/sentinel-server.mjs';
 import { createIntegrationHealthServer } from '../scripts/acceptance/integration-health-server.mjs';
 import { createModelMockServer } from '../scripts/acceptance/model-mock-server.mjs';
 import { writeBlockedFile, removeBlockedFile } from '../scripts/acceptance/blocked-lifecycle.mjs';
+import {
+  acceptancePackageSourceEnv,
+  acceptancePackageSourceModes,
+  resolveAcceptancePackageSourceMode,
+  resolveExpectedPublishedVersions,
+  resolveRequiredWorkforcePackageNames,
+} from '../scripts/acceptance/workforce-package-proof.mjs';
 
 // ── sentinel server ──────────────────────────────────────────────────────────
 
@@ -317,4 +325,70 @@ test('failed-then-green lifecycle: file written on failure, removed on success',
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── local package proof planning ────────────────────────────────────────────
+
+test('acceptance package source mode defaults to local-pack', () => {
+  delete process.env[acceptancePackageSourceEnv];
+  assert.equal(resolveAcceptancePackageSourceMode(), acceptancePackageSourceModes.localPack);
+});
+
+test('acceptance package source mode rejects unknown values', () => {
+  assert.throws(
+    () => resolveAcceptancePackageSourceMode('unknown-mode'),
+    /Unsupported AGENTWORKFORCE_ACCEPTANCE_PACKAGE_SOURCE=unknown-mode/u,
+  );
+});
+
+test('required Workforce package closure covers the installed invoke path', () => {
+  const agentsPkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const workforceRoot = fileURLToPath(new URL('../../workforce/', import.meta.url));
+  const required = resolveRequiredWorkforcePackageNames({
+    workforceRoot,
+    agentsPackage: agentsPkg,
+  });
+
+  for (const name of [
+    'agentworkforce',
+    '@agentworkforce/cli',
+    '@agentworkforce/compose',
+    '@agentworkforce/deploy',
+    '@agentworkforce/delivery',
+    '@agentworkforce/events',
+    '@agentworkforce/local-surface',
+    '@agentworkforce/persona-kit',
+    '@agentworkforce/runtime',
+    '@agentworkforce/workload-router',
+  ]) {
+    assert.ok(required.includes(name), `${name} should be part of the local-package proof closure`);
+  }
+});
+
+test('published package proof derives exact versions from the producer manifests', () => {
+  const agentsPkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const workforceRoot = fileURLToPath(new URL('../../workforce/', import.meta.url));
+  const expected = resolveExpectedPublishedVersions({
+    workforceRoot,
+    agentsPackage: agentsPkg,
+  });
+  const producerVersion = JSON.parse(
+    readFileSync(new URL('../../workforce/packages/runtime/package.json', import.meta.url), 'utf8'),
+  ).version;
+
+  assert.equal(expected.agentworkforce, producerVersion);
+  assert.equal(expected['@agentworkforce/cli'], producerVersion);
+  assert.equal(expected['@agentworkforce/runtime'], producerVersion);
+  assert.ok(Object.values(expected).every((version) => version === producerVersion));
+});
+
+test('closure acceptance keeps twelve gates and folds package proof into CLI evidence', () => {
+  const source = readFileSync(
+    new URL('../scripts/acceptance/composable-runtime-closure.mjs', import.meta.url),
+    'utf8',
+  );
+  assert.equal([...source.matchAll(/await runGate\(/gu)].length, 12);
+  assert.match(source, /'cli-help-snapshot'/u);
+  assert.match(source, /createLocalPackWorkforceProof/u);
+  assert.doesNotMatch(source, /'workforce-installed-package-proof'/u);
 });

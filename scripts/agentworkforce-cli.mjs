@@ -18,8 +18,8 @@ function resolveAgentworkforceExecutable() {
   if (!override) {
     return {
       source: 'installed-package',
-      command: agentworkforceBin,
-      prefixArgs: [],
+      command: process.execPath,
+      prefixArgs: [agentworkforceBin],
       identity: agentworkforceBin,
     };
   }

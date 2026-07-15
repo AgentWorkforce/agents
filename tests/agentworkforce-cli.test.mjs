@@ -13,8 +13,8 @@ test('agentworkforce helper defaults to the installed local binary', () => {
   delete process.env[agentworkforceCliOverrideEnv];
   const invocation = getAgentworkforceInvocation(['invoke', '--help']);
   assert.equal(invocation.source, 'installed-package');
-  assert.equal(invocation.command, agentworkforceBin);
-  assert.deepEqual(invocation.argv, ['invoke', '--help']);
+  assert.equal(invocation.command, process.execPath);
+  assert.deepEqual(invocation.argv, [agentworkforceBin, 'invoke', '--help']);
 });
 
 test('agentworkforce helper accepts an explicit js artifact override', () => {

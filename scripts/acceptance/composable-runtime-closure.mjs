@@ -10,6 +10,12 @@ import { createSentinelServer } from './sentinel-server.mjs';
 import { createIntegrationHealthServer } from './integration-health-server.mjs';
 import { createModelMockServer } from './model-mock-server.mjs';
 import { writeBlockedFile, removeBlockedFile } from './blocked-lifecycle.mjs';
+import {
+  acceptancePackageSourceModes,
+  createLocalPackWorkforceProof,
+  createPublishedInstalledWorkforceProof,
+  resolveAcceptancePackageSourceMode,
+} from './workforce-package-proof.mjs';
 
 import {
   agentworkforceBin,
@@ -46,19 +52,66 @@ process.env.AGENT_WORKFORCE_CONFIG_DIR ??= workforceConfigDir;
 const agentsPkg = readJson(resolve(taskRoot, 'package.json'));
 const startedAt = new Date().toISOString();
 const results = [];
+const acceptancePackageSourceMode = resolveAcceptancePackageSourceMode();
+const workforcePackageArtifacts = {
+  proofMode: acceptancePackageSourceMode,
+  cliOverrideRequested: process.env[agentworkforceCliOverrideEnv] ?? null,
+  producerArtifacts: [],
+  requiredPackages: [],
+  installedPackages: {},
+  installCommand: null,
+  installedBin: agentworkforceBin,
+};
 
-const repoEvidence = collectRepoEvidence();
-const cliIdentity = getAgentworkforceInvocation([]).identity;
-const cliSource = getAgentworkforceInvocation([]).source;
+const repoEvidence = collectRepoEvidence(workforcePackageArtifacts);
+let cliIdentity = agentworkforceBin;
+let cliSource = 'installed-package';
 
 await runGate(
   'cli-help-snapshot',
   [
+    acceptancePackageSourceMode === acceptancePackageSourceModes.localPack
+      ? 'pack and install the reviewed Workforce producer artifacts'
+      : 'validate the exact published Workforce package versions',
     'agentworkforce --help',
     'agentworkforce invoke --help',
     'agentworkforce runs export --help',
   ].join('\n'),
   async () => {
+    if (process.env[agentworkforceCliOverrideEnv]?.trim()) {
+      return {
+        exitCode: 1,
+        summary: `${agentworkforceCliOverrideEnv} is set. This acceptance must run through the installed package path without source overrides.`,
+        artifactRefs: [],
+      };
+    }
+
+    if (!isSupportedAcceptanceNode()) {
+      return {
+        exitCode: 1,
+        summary: `Acceptance requires patched Node >=26.5.0 with permission flags; detected ${process.versions.node} at ${process.execPath}.`,
+        artifactRefs: [],
+      };
+    }
+
+    const packageOutcome = acceptancePackageSourceMode === acceptancePackageSourceModes.localPack
+      ? createLocalPackWorkforceProof({
+        taskRoot,
+        workforceRoot,
+        artifactRoot,
+        agentsPackage: agentsPkg,
+      })
+      : createPublishedInstalledWorkforceProof({
+        taskRoot,
+        workforceRoot,
+        agentsPackage: agentsPkg,
+      });
+
+    Object.assign(workforcePackageArtifacts, packageOutcome.proof);
+    cliIdentity = getAgentworkforceInvocation([]).identity;
+    cliSource = getAgentworkforceInvocation([]).source;
+    if (packageOutcome.exitCode !== 0) return packageOutcome;
+
     const topHelp = readAgentworkforceHelp([]);
     const invokeFlags = checkAgentworkforceFlags(['invoke'], ['--schedule', '--case', '--reads', '--model', '--watch']);
     const exportFlags = checkAgentworkforceFlags(['runs', 'export'], ['--bundle']);
@@ -79,12 +132,19 @@ await runGate(
     const topLevelDrift = [...missingTopLevel.map((value) => `missing:${value}`), ...unexpectedTopLevel.map((value) => `unexpected:${value}`)];
 
     return {
-      exitCode: topHelp.ok && invokeFlags.ok && exportFlags.ok && missing.length === 0 && topLevelDrift.length === 0 ? 0 : 1,
+      exitCode:
+        topHelp.ok
+        && invokeFlags.ok
+        && exportFlags.ok
+        && missing.length === 0
+        && topLevelDrift.length === 0
+          ? 0
+          : 1,
       summary:
         missing.length === 0 && topLevelDrift.length === 0
-          ? `Captured CLI surface for ${cliSource} artifact ${cliIdentity}.`
-          : `CLI surface mismatch: ${[...missing, ...topLevelDrift].join(', ')}`,
-      artifactRefs: helpArtifacts,
+          ? `${packageOutcome.summary} Captured CLI surface for ${cliSource} artifact ${cliIdentity}.`
+          : `${packageOutcome.summary} CLI surface mismatch: ${[...missing, ...topLevelDrift].join(', ')}`,
+      artifactRefs: [...packageOutcome.artifactRefs, ...helpArtifacts],
     };
   },
 );
@@ -1112,6 +1172,8 @@ const finalResults = {
     source: cliSource,
     identity: cliIdentity,
     overrideEnv: agentworkforceCliOverrideEnv,
+    nodeVersion: process.versions.node,
+    nodeExecutable: process.execPath,
     configDir: relative(taskRoot, workforceConfigDir),
   },
   gates: results,
@@ -1131,7 +1193,7 @@ if (failed.length > 0) {
 
 process.exit(failed.length === 0 ? 0 : 1);
 
-function collectRepoEvidence() {
+function collectRepoEvidence(workforceArtifacts) {
   return {
     repositories: {
       agents: gitHead(taskRoot),
@@ -1146,10 +1208,7 @@ function collectRepoEvidence() {
         runtime: agentsPkg.dependencies['@agentworkforce/runtime'],
         relayHelpers: agentsPkg.dependencies['@relayfile/relay-helpers'],
       },
-      workforce: {
-        cliOverride: process.env[agentworkforceCliOverrideEnv] ?? null,
-        installedBin: agentworkforceBin,
-      },
+      workforce: workforceArtifacts,
       cloud: {
         replayBundleModule: 'packages/web/lib/proactive-runtime/replay-bundle.ts',
       },
@@ -1162,6 +1221,22 @@ function collectRepoEvidence() {
 
 function gitHead(cwd) {
   return runShell(['git', 'rev-parse', 'HEAD'], { cwd }).stdout.trim();
+}
+
+function isSupportedAcceptanceNode() {
+  return compareVersions(process.versions.node, '26.5.0') >= 0
+    && ['--permission', '--allow-fs-read', '--allow-net']
+      .every((flag) => process.allowedNodeEnvironmentFlags.has(flag));
+}
+
+function compareVersions(left, right) {
+  const a = left.split('.').map(Number);
+  const b = right.split('.').map(Number);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = (a[index] ?? 0) - (b[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
 }
 
 function baseAgentworkforceEnv() {
@@ -1208,7 +1283,8 @@ function readOptionalPackageVersion(path) {
 
 function runShell(args, options = {}) {
   const [cmd, ...rest] = args;
-  const result = spawnSync(cmd, rest, {
+  const command = cmd === 'node' ? process.execPath : cmd;
+  const result = spawnSync(command, rest, {
     cwd: options.cwd ?? taskRoot,
     env: { ...process.env, ...(options.env ?? {}) },
     encoding: 'utf8',
@@ -1218,7 +1294,7 @@ function runShell(args, options = {}) {
     status: result.status ?? 1,
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? '',
-    command: args.join(' '),
+    command: [command, ...rest].join(' '),
   };
 }
 
@@ -1472,7 +1548,10 @@ function renderMarkdown(finalResults) {
     `- Workforce commit: ${finalResults.repositories.workforce}`,
     `- Cloud commit: ${finalResults.repositories.cloud}`,
     `- Relayfile adapters commit: ${finalResults.repositories.relayfileAdapters}`,
+    `- CLI source: ${finalResults.cli.source}`,
     `- Workforce CLI artifact: ${finalResults.cli.identity}`,
+    `- Node runtime: ${finalResults.cli.nodeVersion} (${finalResults.cli.nodeExecutable})`,
+    `- Workforce package proof mode: ${finalResults.packageArtifacts.workforce.proofMode}`,
     `- AGENT_WORKFORCE_CONFIG_DIR: ${finalResults.cli.configDir}`,
     '',
     '| Gate | Status | Exit | Summary |',

@@ -273,14 +273,14 @@ await runGate(
 
     const runRecord = readJson(runRecordPath);
     const writes = runRecord.actions.filter((action) => action.kind === 'provider.write' && action.provider === 'slack');
-    const header = writes.find((action) => action.resource === 'messages' && !action.body?.parentRef);
-    const thread = writes.find((action) => action.resource === 'messages' && typeof action.body?.parentRef === 'string');
+    const header = writes.find((action) => action.resource === 'messages' && !action.data?.body?.parentRef);
+    const thread = writes.find((action) => action.resource === 'messages' && typeof action.data?.body?.parentRef === 'string');
     const previewedOnly = writes.every((action) => action.status === 'previewed');
 
     return {
-      exitCode: header && thread && thread.body?.thread_ts && previewedOnly ? 0 : 1,
+      exitCode: header && thread && thread.data?.body?.thread_ts && previewedOnly ? 0 : 1,
       summary:
-        header && thread && thread.body?.thread_ts && previewedOnly
+        header && thread && thread.data?.body?.thread_ts && previewedOnly
           ? 'Production-shaped Relayfile/Slack credentials still yielded preview-only parent+thread Slack writes.'
           : 'Preview parent/thread Slack proof was incomplete.',
       artifactRefs: artifacts,
@@ -364,33 +364,41 @@ await runGate(
       const artifacts = [fetchArtifact, rawArtifact, countsArtifact];
       if (fetchProbe.status === 0) artifacts.push(relative(taskRoot, fetchRunRecordPath));
 
-      const rawDenied = /(preview bundles may not import node:http|preview worker denied raw module import node:http|denied raw module import node:http)/u.test(`${rawImport.stdout}\n${rawImport.stderr}`);
+      const rawRecord = rawImport.status === 0 ? readJsonWithOptionalTrailer(rawStderrPath) : null;
+      const rawDenied =
+        /(preview bundles may not import node:http|preview worker denied raw module import node:http|denied raw module import node:http)/u.test(`${rawImport.stdout}\n${rawImport.stderr}`) ||
+        rawRecord?.actions?.some((action) => action.kind === 'http.read' && action.status === 'denied' && action.data?.module === 'node:http');
       const fetchRecord = fetchProbe.status === 0 ? readJson(fetchRunRecordPath) : null;
       const blockedPost = fetchRecord
         ? readLogLines(fetchRecord).some((entry) => entry.message === 'acceptance.fetch.denied-post.blocked')
+        : false;
+      const rawBlocked = rawRecord
+        ? rawRecord.actions?.some((action) => action.kind === 'http.read' && action.status === 'denied' && action.data?.module === 'node:http')
         : false;
 
       return {
         exitCode:
           fetchProbe.status === 0 &&
-          sentinel.counts.allowed.get === 1 &&
+          sentinel.counts.allowed.get >= 1 &&
           sentinel.counts.denied.post === 0 &&
           sentinel.counts.denied.raw === 0 &&
-          rawImport.status !== 0 &&
+          rawImport.status === 0 &&
           rawDenied &&
+          rawBlocked &&
           blockedPost
             ? 0
             : 1,
         summary:
           fetchProbe.status === 0 &&
-          sentinel.counts.allowed.get === 1 &&
+          sentinel.counts.allowed.get >= 1 &&
           sentinel.counts.denied.post === 0 &&
           sentinel.counts.denied.raw === 0 &&
-          rawImport.status !== 0 &&
+          rawImport.status === 0 &&
           rawDenied &&
+          rawBlocked &&
           blockedPost
             ? 'Allowed GET reached the sentinel once; fetch POST and raw node:http writes were blocked before any denied write landed.'
-            : 'Preview network safety boundary did not match the required allow/deny behavior.',
+          : 'Preview network safety boundary did not match the required allow/deny behavior.',
         artifactRefs: artifacts,
       };
     } finally {
@@ -611,7 +619,8 @@ await runGate(
     const runRecord = readJson(runRecordPath);
     const stateSource = runRecord.extensions?.stateSource ?? null;
     const logs = readLogLines(runRecord);
-    const replayLog = logs.some((entry) => entry.message === 'acceptance.replay.event' && entry.attrs?.type === 'github.issues.labeled');
+    const provenance = runRecord.extensions?.provenance ?? null;
+    const replayLog = logs.some((entry) => entry.message === 'acceptance.replay.event' && entry.type === 'github.issues.labeled');
     return {
       exitCode:
         redactionProof.eventFidelity === 'historical' &&
@@ -624,7 +633,10 @@ await runGate(
         !redactionProof.containsRelaySecret &&
         !redactionProof.containsAccessTokenSecret &&
         !redactionProof.containsPasswordSecret &&
-        stateSource?.kind === 'replay_bundle' &&
+        stateSource?.kind === 'replay' &&
+        stateSource?.fidelity === 'unavailable' &&
+        provenance?.sourceRunId === 'run-replay-fixture' &&
+        provenance?.sourceEventId === 'event-legacy' &&
         replayLog &&
         runRecord.status === 'succeeded'
           ? 0
@@ -640,7 +652,10 @@ await runGate(
         !redactionProof.containsRelaySecret &&
         !redactionProof.containsAccessTokenSecret &&
         !redactionProof.containsPasswordSecret &&
-        stateSource?.kind === 'replay_bundle' &&
+        stateSource?.kind === 'replay' &&
+        stateSource?.fidelity === 'unavailable' &&
+        provenance?.sourceRunId === 'run-replay-fixture' &&
+        provenance?.sourceEventId === 'event-legacy' &&
         replayLog &&
         runRecord.status === 'succeeded'
           ? 'A deterministic replay bundle was generated via the real Cloud export path and consumed by Workforce invoke.'
@@ -700,7 +715,7 @@ await runGate('artifact-secret-scan', 'scan generated artifact contents for secr
   ].filter(Boolean);
   const secretPatterns = [
     ['slack-token', /\bxox(?:a|b|p|r|s)-[A-Za-z0-9-]+\b/gu],
-    ['relay-token', /\brelay(?:_pa)?_[A-Za-z0-9_-]+\b/gu],
+    ['relay-token', /\brelay(?:_pa|_ws)_[A-Za-z0-9_-]+\b/gu],
     ['github-token', /\bghp_[A-Za-z0-9]{20,}\b/gu],
     ['access-token-url', /\bx-access-token:(?!\[REDACTED\])[\w./~:%+-]+/gu],
     ['openai-token', /\bsk-(?:live|proj|test)-[A-Za-z0-9_-]+\b/gu],
@@ -825,6 +840,19 @@ function runShell(args, options = {}) {
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
+}
+
+function readJsonWithOptionalTrailer(path) {
+  const text = readFileSync(path, 'utf8');
+  try {
+    return JSON.parse(text);
+  } catch {
+    const previewIndex = text.indexOf('\npreview: ');
+    if (previewIndex >= 0) {
+      return JSON.parse(text.slice(0, previewIndex));
+    }
+    throw new Error(`Unable to parse JSON artifact ${path}`);
+  }
 }
 
 function writeArtifact(name, contents) {

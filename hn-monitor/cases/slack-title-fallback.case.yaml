@@ -1,0 +1,43 @@
+schemaVersion: 1
+id: hn-monitor.slack-title-fallback
+agent: ../agent.ts
+kind: chat
+event:
+  type: slack.app_mention
+  resource:
+    channel: C123
+    ts: "300.2"
+    thread_ts: "300.1"
+    text: <@UBOT> European Parliament MCP Server – Political Intelligence for AI Agents -> give me more info on this
+    user: U1
+inputs:
+  SLACK_CHANNEL: C123
+policy:
+  reads: fixtures
+  writes: preview
+  model: stub
+  shell: simulate
+  compose: preview
+http:
+  - method: GET
+    match: restrictSearchableAttributes=title
+    file: ../fixtures/hn-european-title-search.json
+  - method: GET
+    match: /api/v1/items/4242
+    file: ../fixtures/hn-item-4242.json
+expect:
+  status: succeeded
+  eventSource: slack
+  logsContain:
+    - hn-monitor.qa.recalled
+    - hn-monitor.qa.selected
+    - hn-monitor.qa.hydrated
+    - hn-monitor.qa.slack-replied
+  effectsContain:
+    - model.complete
+    - provider.write
+  providerActions:
+    - provider: slack
+      resource: messages
+      channel: C123
+      threaded: true

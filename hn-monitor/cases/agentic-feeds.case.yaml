@@ -1,0 +1,45 @@
+schemaVersion: 1
+id: hn-monitor.agentic-feeds
+agent: ../agent.ts
+kind: scheduled
+event:
+  schedule: scan
+inputs:
+  SLACK_CHANNEL: C123
+  TOPICS: agents,ai,typescript,developer tools
+  LOOKBACK_HOURS: "24"
+  MAX_STORIES: "8"
+policy:
+  reads: fixtures
+  writes: preview
+  model: stub
+  shell: simulate
+  compose: preview
+http:
+  - method: GET
+    match: tags=front_page
+    file: ../fixtures/hn-front-page.json
+  - method: GET
+    match: tags=show_hn
+    file: ../fixtures/hn-show-hn.json
+  - method: GET
+    match: tags=story
+    file: ../fixtures/hn-new.json
+expect:
+  status: succeeded
+  eventSource: cron
+  logsContain:
+    - hn-monitor.feed-scan front_page=1 show_hn=1 new=2
+    - hn-monitor.matched-agentic matched=3
+    - hn-monitor.posted
+  effectsContain:
+    - memory.save
+    - model.complete
+    - provider.write
+  providerActions:
+    - provider: slack
+      resource: messages
+      channel: C123
+      threaded: true
+      textContains:
+        - Agent

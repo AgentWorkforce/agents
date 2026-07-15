@@ -1,0 +1,36 @@
+schemaVersion: 1
+id: hn-monitor.scheduled-scan
+agent: ../agent.ts
+kind: scheduled
+event:
+  schedule: scan
+inputs:
+  SLACK_CHANNEL: C123
+  TOPICS: agents,ai,typescript
+  LOOKBACK_HOURS: "24"
+  MAX_STORIES: "8"
+policy:
+  reads: fixtures
+  writes: preview
+  model: stub
+  shell: simulate
+  compose: preview
+http:
+  - method: GET
+    match: tags=front_page
+    file: ../fixtures/hn-front-page.json
+expect:
+  status: succeeded
+  eventSource: cron
+  logsContain:
+    - hn-monitor.feed-scan
+  effectsContain:
+    - model.complete
+    - provider.write
+  providerActions:
+    - provider: slack
+      resource: messages
+      channel: C123
+      threaded: true
+      textContains:
+        - Agent

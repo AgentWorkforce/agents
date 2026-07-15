@@ -1,0 +1,41 @@
+{
+  "id": "linear-shipper",
+  "intent": "implement-frontend",
+  "tags": [
+    "implementation"
+  ],
+  "description": "Turns a new Linear issue into an implementation attempt and links the resulting GitHub work back to Linear.",
+  "cloud": true,
+  "integrations": {
+    "linear": {},
+    "github": {
+      "scope": {
+        "repo": "AgentWorkforce/workforce"
+      }
+    }
+  },
+  "inputs": {
+    "GITHUB_OWNER": {
+      "description": "GitHub owner containing the target repository.",
+      "default": "AgentWorkforce"
+    },
+    "GITHUB_REPO": {
+      "description": "Target repository name.",
+      "default": "workforce"
+    },
+    "REPO_URL": {
+      "description": "Clone URL for the target repository.",
+      "default": "https://github.com/AgentWorkforce/workforce.git"
+    }
+  },
+  "onEvent": "./agent.ts",
+  "harness": "codex",
+  "model": "gpt-5.4",
+  "systemPrompt": "Implement Linear issues with small, reviewable changes and clear handoff notes.",
+  "harnessSettings": {
+    "reasoning": "medium",
+    "timeoutSeconds": 1200,
+    "sandboxMode": "workspace-write",
+    "workspaceWriteNetworkAccess": true
+  }
+}

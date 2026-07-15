@@ -1,0 +1,35 @@
+{
+  "id": "proactive-issue-resolver",
+  "intent": "relay-orchestrator",
+  "tags": [
+    "proactive",
+    "issue-triage",
+    "ricky",
+    "local"
+  ],
+  "description": "Local proactive agent that watches a GitHub repo for newly opened issues, investigates each one against the repo to produce a concrete spec, hands the spec to the Ricky SDK to generate + run a workflow that opens a PR (via @agent-relay/github-primitive), and DMs the result to Slack.",
+  "cloud": true,
+  "useSubscription": true,
+  "integrations": {
+    "github": {},
+    "slack": {}
+  },
+  "memory": {
+    "enabled": true,
+    "scopes": [
+      "workspace"
+    ],
+    "trajectories": true,
+    "aiMemory": true
+  },
+  "onEvent": "./agent.ts",
+  "harness": "claude",
+  "model": "claude-opus-4-7",
+  "systemPrompt": "You investigate a GitHub issue against the current repository checkout and produce a concrete, implementable spec for Ricky to ship as a PR. You do not implement the fix yourself.",
+  "harnessSettings": {
+    "reasoning": "high",
+    "timeoutSeconds": 1800,
+    "sandboxMode": "workspace-write",
+    "workspaceWriteNetworkAccess": true
+  }
+}

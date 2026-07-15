@@ -56,14 +56,16 @@ const THREAD_LOAD_LIMIT = 200;
 
 export default defineAgent({
   triggers: {
-    // Both webhook-driven: the message rides in the event PAYLOAD
-    // (event.expand('full').data), independent of the relayfile mount. We
-    // deliberately do NOT use `message.created`/relayfile watches — those fire
-    // only on *ingested* message records, so a stalled sync (the relayfile
-    // migration) silently kills them. Same shape the in-production review-agent
-    // (pr-reviewer) uses to reply to Slack mentions. Each transport's trigger is
-    // pruned at deploy when its id input is empty (persona enabledByInput).
-    slack: [{ on: 'app_mention' }],
+    // `on: 'app_mention'` never actually routes: the cloud's integration-watch
+    // matcher hard-excludes app_mention from generic resource matching
+    // (relayfileTriggerMatchesEvent short-circuits false for it), and Slack
+    // mentions inside an existing thread arrive to the webhook as a plain
+    // `message.created` event, not a literal `app_mention` eventType. Match on
+    // the Relayfile trigger + `@mention` text gate instead — the same pattern
+    // review-agent (pr-reviewer) and joke-bot actually use in production. Each
+    // transport's trigger is pruned at deploy when its id input is empty
+    // (persona enabledByInput).
+    slack: [{ on: 'message.created', paths: ['/slack/channels/${SLACK_CHANNEL}/**'], match: '@mention' }],
     telegram: [{ on: 'message' }]
   },
   handler: async (ctx, event) => {

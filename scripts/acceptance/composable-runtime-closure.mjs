@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createSentinelServer } from './sentinel-server.mjs';
 import { createIntegrationHealthServer } from './integration-health-server.mjs';
-import { createHnMockServer } from './hn-mock-server.mjs';
 import { createModelMockServer } from './model-mock-server.mjs';
 import { writeBlockedFile, removeBlockedFile } from './blocked-lifecycle.mjs';
 
@@ -174,9 +173,7 @@ await runGate(
   },
 );
 
-await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs  +live-read/live-model with local mock servers', async () => {
-  // ── 1. Start local mock servers so live cases never reach the external network ──
-  const hnMock = await createHnMockServer();
+await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs + live-read once + live-model once with local Codex SSE mock', async () => {
   const modelMock = await createModelMockServer();
 
   let deterministicResult = null;
@@ -186,19 +183,11 @@ await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs  +live-re
   let liveModelRecord = null;
 
   try {
-    // ── 2. Deterministic fixture-based cases (scheduled-scan, agentic-feeds, etc.) ──
     deterministicResult = runShell(['node', 'scripts/run-hn-platform-cases.mjs'], {
       cwd: taskRoot,
-      env: {
-        ...baseAgentworkforceEnv(),
-        // Also inject mock URLs so any live case that runs still hits the local mock only.
-        HN_API_BASE_URL: hnMock.baseUrl,
-        CODEX_BACKEND_BASE_URL: modelMock.codexBase,
-        CODEX_OAUTH_CREDENTIAL: modelMock.mockCredential,
-      },
+      env: baseAgentworkforceEnv(),
     });
 
-    // ── 3. live-read case: GETs must reach only the declared local mock endpoint ──
     const liveReadRunRecordPath = resolve(artifactFilesRoot, 'live-read.run-record.json');
     liveReadResult = runAgentworkforce(
       [
@@ -210,21 +199,13 @@ await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs  +live-re
         liveReadRunRecordPath,
       ],
       {
-        env: {
-          ...baseAgentworkforceEnv(),
-          HN_API_BASE_URL: hnMock.baseUrl,
-          CODEX_BACKEND_BASE_URL: modelMock.codexBase,
-          CODEX_OAUTH_CREDENTIAL: modelMock.mockCredential,
-        },
+        env: baseAgentworkforceEnv(),
         timeoutMs: invokeTimeoutMs,
       },
     );
 
-    // ── 4. live-model case: model calls must reach only the mock Codex adapter ──
-    //    CODEX_BACKEND_BASE_URL overrides the parent-side Workforce LLM adapter so
-    //    no paid or external credential is touched.
     const liveModelRunRecordPath = resolve(artifactFilesRoot, 'live-model.run-record.json');
-    liveModelResult = runAgentworkforce(
+    liveModelResult = await runAgentworkforceExactEnvAsync(
       [
         'invoke',
         './hn-monitor/agent.ts',
@@ -234,12 +215,10 @@ await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs  +live-re
         liveModelRunRecordPath,
       ],
       {
-        env: {
-          ...baseAgentworkforceEnv(),
-          HN_API_BASE_URL: hnMock.baseUrl,
+        env: buildSanitizedAgentworkforceEnv({
           CODEX_BACKEND_BASE_URL: modelMock.codexBase,
           CODEX_OAUTH_CREDENTIAL: modelMock.mockCredential,
-        },
+        }),
         timeoutMs: invokeTimeoutMs,
       },
     );
@@ -247,86 +226,99 @@ await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs  +live-re
     if (liveReadResult.status === 0) liveReadRecord = readJson(liveReadRunRecordPath);
     if (liveModelResult.status === 0) liveModelRecord = readJson(liveModelRunRecordPath);
   } finally {
-    hnMock.close();
     modelMock.close();
   }
 
-  // ── 5. Persist artifacts ──
   const artifact = writeArtifact('hn-case-suite.txt', `${deterministicResult.stdout}\n${deterministicResult.stderr}`.trim() + '\n');
   const liveReadArtifact = writeArtifact('live-read.stdout.txt', `${liveReadResult.stdout}\n${liveReadResult.stderr}`.trim() + '\n');
   const liveModelArtifact = writeArtifact('live-model.stdout.txt', `${liveModelResult.stdout}\n${liveModelResult.stderr}`.trim() + '\n');
-  const hnCountsArtifact = writeArtifact('hn-mock-server.counts.json', JSON.stringify(hnMock.counts, null, 2) + '\n');
   const modelCountsArtifact = writeArtifact('model-mock-server.counts.json', JSON.stringify(modelMock.counts, null, 2) + '\n');
   const parity = assertLegacyHnParity();
   const parityArtifact = writeArtifact('hn-case-parity.json', JSON.stringify(parity, null, 2) + '\n');
 
-  const artifacts = [artifact, liveReadArtifact, liveModelArtifact, hnCountsArtifact, modelCountsArtifact, parityArtifact];
+  const artifacts = [artifact, liveReadArtifact, liveModelArtifact, modelCountsArtifact, parityArtifact];
   if (liveReadResult?.status === 0) artifacts.push(relative(taskRoot, resolve(artifactFilesRoot, 'live-read.run-record.json')));
   if (liveModelResult?.status === 0) artifacts.push(relative(taskRoot, resolve(artifactFilesRoot, 'live-model.run-record.json')));
 
-  // ── 6. Assert concrete fidelity evidence ──
-
-  // http.read: mock server must have received exactly 3 feed GETs (front_page + show_hn + new)
-  // per live invocation (2 invocations = 6 total feed GETs minimum).
-  const hnFeedGetsLiveRead = hnMock.counts.frontPage + hnMock.counts.showHn + hnMock.counts.newStories;
-  // Each live run fetches 3 feed URLs; 2 live runs → at least 6 feed GETs.
-  const hnHttpFidelity = hnFeedGetsLiveRead >= 6;
-
-  // model.complete: mock model server must have received calls from the live-model run.
-  const modelCallsTotal = modelMock.counts.total;
-  // live-model run calls ctx.llm.complete at least once (for digest summarization).
-  const modelFidelity = modelCallsTotal >= 1;
-
-  // preview provider writes: both live runs must have Slack preview writes in their records.
-  const liveReadSlackWrites = (liveReadRecord?.actions ?? []).filter(
-    (a) => a.kind === 'provider.write' && a.provider === 'slack' && a.status === 'previewed',
-  );
-  const liveModelSlackWrites = (liveModelRecord?.actions ?? []).filter(
-    (a) => a.kind === 'provider.write' && a.provider === 'slack' && a.status === 'previewed',
-  );
-  const liveReadPreviewWrites = liveReadSlackWrites.length >= 1;
-  const liveModelPreviewWrites = liveModelSlackWrites.length >= 1;
-
-  // zero forbidden writes: no provider.write with status === 'live' in either run.
+  const liveReadHttpReads = (liveReadRecord?.actions ?? []).filter((action) => action.kind === 'http.read');
+  const liveReadHttpSourceFidelities = collectSourceFidelities(liveReadRecord ?? {}, 'http.read');
+  const liveReadFeedKinds = [...new Set(liveReadHttpReads.map((action) => classifyHnFeedRead(action.data?.url)).filter(Boolean))];
+  const liveReadCurrentHn =
+    liveReadHttpReads.length === 3 &&
+    liveReadHttpReads.every(
+      (action) =>
+        action.status === 'previewed' &&
+        action.extensions?.sourceFidelity === 'current' &&
+        isCurrentHnGet(action.data?.url, action.data?.method),
+    ) &&
+    liveReadHttpSourceFidelities.length === 1 &&
+    liveReadHttpSourceFidelities[0] === 'current' &&
+    liveReadFeedKinds.length === 3;
   const liveReadNoForbiddenWrites = !(liveReadRecord?.actions ?? []).some(
-    (a) => a.kind === 'provider.write' && a.status === 'live',
-  );
-  const liveModelNoForbiddenWrites = !(liveModelRecord?.actions ?? []).some(
-    (a) => a.kind === 'provider.write' && a.status === 'live',
+    (action) => action.kind === 'provider.write' && action.status === 'live',
   );
 
-  // expected HN content: live-read run record must log the expected feed scan counts.
-  const liveReadLogs = readLogLines(liveReadRecord ?? {});
-  const liveReadFeedScan = liveReadLogs.some(
-    (e) => typeof e.message === 'string' && e.message.includes('hn-monitor.feed-scan front_page=2 show_hn=2 new=4'),
+  const liveModelHttpReads = (liveModelRecord?.actions ?? []).filter((action) => action.kind === 'http.read');
+  const liveModelHttpSourceFidelities = collectSourceFidelities(liveModelRecord ?? {}, 'http.read');
+  const liveModelModelSourceFidelities = collectSourceFidelities(liveModelRecord ?? {}, 'model.complete');
+  const liveModelModelActions = (liveModelRecord?.actions ?? []).filter((action) => action.kind === 'model.complete');
+  const liveModelSlackWrites = (liveModelRecord?.actions ?? []).filter(
+    (action) => action.kind === 'provider.write' && action.provider === 'slack',
   );
-  const liveModelLogs = readLogLines(liveModelRecord ?? {});
-  const liveModelFeedScan = liveModelLogs.some(
-    (e) => typeof e.message === 'string' && e.message.includes('hn-monitor.feed-scan front_page=2 show_hn=2 new=4'),
-  );
+  const liveModelFixtureReads =
+    liveModelHttpReads.length === 3 &&
+    liveModelHttpReads.every((action) => action.status === 'previewed' && isFixtureHnSource(action.data?.source)) &&
+    ['front_page', 'show_hn', 'new'].every((feed) => liveModelHttpReads.some((action) => classifyHnFeedRead(action.data?.url) === feed));
+  const liveModelPreviewOnlyWrites =
+    liveModelSlackWrites.length >= 1 && liveModelSlackWrites.every((action) => action.status === 'previewed');
+  const liveModelNoForbiddenWrites = liveModelSlackWrites.every((action) => action.status !== 'live');
+  const liveModelHttpFidelityFixture = liveModelHttpSourceFidelities.includes('fixture');
+  const liveModelModelFidelityCurrent = liveModelModelSourceFidelities.includes('current');
+  const modelCallsTotal = modelMock.counts.total;
+  const modelCallsExact = modelCallsTotal > 0 && modelCallsTotal === liveModelModelActions.length;
+  const modelCallsExpectedOnly =
+    modelMock.counts.unexpected.length === 0 &&
+    modelMock.counts.requests.length > 0 &&
+    modelMock.counts.requests.every((request) =>
+      request.method === 'POST' &&
+      request.path === '/backend-api/codex/responses' &&
+      request.authMatchedExpected === true &&
+      request.accountMatchedExpected === true,
+    );
 
   const evidentSummary = [
-    `hn-mock GETs: ${hnFeedGetsLiveRead} (≥6 required)`,
-    `model-mock calls: ${modelCallsTotal} (≥1 required)`,
-    `live-read Slack preview writes: ${liveReadSlackWrites.length}`,
-    `live-model Slack preview writes: ${liveModelSlackWrites.length}`,
+    `live-read HN GETs: ${liveReadHttpReads.length} (${liveReadFeedKinds.join(', ') || 'none'})`,
+    `live-read http fidelity: ${liveReadHttpSourceFidelities.join(', ') || 'missing'}`,
     `live-read forbidden writes: ${!liveReadNoForbiddenWrites}`,
-    `live-model forbidden writes: ${!liveModelNoForbiddenWrites}`,
-    `live-read feed-scan log present: ${liveReadFeedScan}`,
-    `live-model feed-scan log present: ${liveModelFeedScan}`,
+    `live-model fixture HN GETs: ${liveModelHttpReads.length}`,
+    `live-model http fidelity: ${liveModelHttpSourceFidelities.join(', ') || 'missing'}`,
+    `live-model model fidelity: ${liveModelModelSourceFidelities.join(', ') || 'missing'}`,
+    `live-model mock calls: ${modelCallsTotal}`,
+    `live-model preview writes: ${liveModelSlackWrites.length}`,
   ].join('; ');
 
   writeArtifact('hn-live-evidence.json', JSON.stringify({
-    hnMockCounts: hnMock.counts,
+    liveRead: {
+      httpReadCount: liveReadHttpReads.length,
+      feeds: liveReadFeedKinds,
+      urls: liveReadHttpReads.map((action) => action.data?.url ?? null),
+      httpSourceFidelities: liveReadHttpSourceFidelities,
+      noForbiddenWrites: liveReadNoForbiddenWrites,
+    },
+    liveModel: {
+      httpReadCount: liveModelHttpReads.length,
+      httpUrls: liveModelHttpReads.map((action) => action.data?.url ?? null),
+      httpSources: liveModelHttpReads.map((action) => action.data?.source ?? null),
+      httpSourceFidelities: liveModelHttpSourceFidelities,
+      modelSourceFidelities: liveModelModelSourceFidelities,
+      modelActionCount: liveModelModelActions.length,
+      previewWriteCount: liveModelSlackWrites.length,
+      previewOnlyWrites: liveModelPreviewOnlyWrites,
+      noForbiddenWrites: liveModelNoForbiddenWrites,
+    },
     modelMockCounts: modelMock.counts,
-    hnFeedGetsTotal: hnFeedGetsLiveRead,
-    modelCallsTotal,
-    liveReadPreviewWrites: liveReadSlackWrites.length,
-    liveModelPreviewWrites: liveModelSlackWrites.length,
-    liveReadNoForbiddenWrites,
-    liveModelNoForbiddenWrites,
-    liveReadFeedScan,
-    liveModelFeedScan,
+    modelCallsExact,
+    modelCallsExpectedOnly,
     parity,
   }, null, 2) + '\n');
 
@@ -335,20 +327,36 @@ await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs  +live-re
     parity.ok &&
     liveReadResult.status === 0 &&
     liveModelResult.status === 0 &&
-    hnHttpFidelity &&
-    modelFidelity &&
-    liveReadPreviewWrites &&
-    liveModelPreviewWrites &&
+    liveReadCurrentHn &&
     liveReadNoForbiddenWrites &&
+    liveModelFixtureReads &&
+    liveModelHttpFidelityFixture &&
+    liveModelModelFidelityCurrent &&
+    modelCallsExact &&
+    modelCallsExpectedOnly &&
+    liveModelPreviewOnlyWrites &&
     liveModelNoForbiddenWrites &&
-    liveReadFeedScan &&
-    liveModelFeedScan;
+    !artifactContainsAny(
+      artifactFilesRoot,
+      [
+        modelMock.mockCredential,
+        modelMock.mockAccessToken,
+        modelMock.mockRefreshToken,
+        process.env.CODEX_OAUTH_CREDENTIAL,
+        process.env.CODEX_OAUTH_TOKEN,
+        process.env.CODEX_ACCOUNT_ID,
+        process.env.OPENAI_API_KEY,
+        process.env.ANTHROPIC_API_KEY,
+        process.env.CLAUDE_CODE_OAUTH_TOKEN,
+        process.env.OPENCODE_API_KEY,
+      ].filter(Boolean),
+    );
 
   return {
     exitCode: allOk ? 0 : 1,
     summary: allOk
-      ? `All HN cases passed; live-read and live-model ran against local mock servers only. ${evidentSummary}.`
-      : `HN case coverage or live mock evidence failed. ${evidentSummary}.`,
+      ? `All HN cases passed; live-read hit the real HN GET allowlist once and live-model stayed on fixture HN reads plus the local Codex SSE mock only. ${evidentSummary}.`
+      : `HN case coverage or live evidence failed. ${evidentSummary}.`,
     artifactRefs: artifacts,
   };
 });
@@ -364,63 +372,61 @@ await runGate(
     '<run-record>',
   ])}`,
   async () => {
-    const runRecordPath = resolve(artifactFilesRoot, 'slack-follow-up.run-record.json');
-    const result = runAgentworkforce(
+    const hnRunRecordPath = resolve(artifactFilesRoot, 'slack-follow-up.run-record.json');
+    const hnResult = runAgentworkforce(
       [
         'invoke',
         './hn-monitor/agent.ts',
         '--case',
         './hn-monitor/cases/slack-follow-up.case.yaml',
         '--output',
-        runRecordPath,
+        hnRunRecordPath,
       ],
       { env: baseAgentworkforceEnv(), timeoutMs: invokeTimeoutMs },
     );
-    const stdoutArtifact = writeArtifact('slack-follow-up.stdout.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
-    const artifacts = [stdoutArtifact];
-    if (result.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
-    if (result.status !== 0) {
-      return { exitCode: result.status, summary: 'Multi-turn HN follow-up case failed.', artifactRefs: artifacts };
+    const linkRunRecordPath = resolve(artifactFilesRoot, 'preview-thread-link.run-record.json');
+    const linkResult = runAgentworkforce(
+      [
+        'invoke',
+        './scripts/acceptance/fixtures/preview-thread-link-persona.ts',
+        '--case',
+        './scripts/acceptance/fixtures/preview-thread-link.case.yaml',
+        '--output',
+        linkRunRecordPath,
+      ],
+      { env: baseAgentworkforceEnv(), timeoutMs: invokeTimeoutMs },
+    );
+
+    const hnStdoutArtifact = writeArtifact('slack-follow-up.stdout.txt', `${hnResult.stdout}\n${hnResult.stderr}`.trim() + '\n');
+    const linkStdoutArtifact = writeArtifact('preview-thread-link.stdout.txt', `${linkResult.stdout}\n${linkResult.stderr}`.trim() + '\n');
+    const artifacts = [hnStdoutArtifact, linkStdoutArtifact];
+    if (hnResult.status === 0) artifacts.push(relative(taskRoot, hnRunRecordPath));
+    if (linkResult.status === 0) artifacts.push(relative(taskRoot, linkRunRecordPath));
+    if (hnResult.status !== 0 || linkResult.status !== 0) {
+      return {
+        exitCode: hnResult.status || linkResult.status,
+        summary: 'Multi-turn closure evidence failed before validation completed.',
+        artifactRefs: artifacts,
+      };
     }
 
-    const runRecord = readJson(runRecordPath);
-    const turns = runRecord.extensions?.turns ?? [];
-    const logs = readLogLines(runRecord);
+    const hnRunRecord = readJson(hnRunRecordPath);
+    const linkRunRecord = readJson(linkRunRecordPath);
+    const turns = hnRunRecord.extensions?.turns ?? [];
+    const logs = readLogLines(hnRunRecord);
     const hasHydrated = logs.some((entry) => entry.message === 'hn-monitor.qa.hydrated');
     const hasReply = logs.some((entry) => entry.message === 'hn-monitor.qa.slack-replied');
 
     // Memory recall continuity: turn 2 must recall >= 1 item saved in turn 1.
-    const recalled = runRecord.actions.some((action) => action.kind === 'memory.recall' && action.data?.items >= 1);
+    const recalled = hnRunRecord.actions.some((action) => action.kind === 'memory.recall' && action.data?.items >= 1);
 
     // Turn 1 must have saved the HN post (memory.save tagged hn-monitor:post).
-    const turn1PostSaved = runRecord.actions.some(
+    const turn1PostSaved = hnRunRecord.actions.some(
       (action) => action.kind === 'memory.save' && (action.data?.tags ?? []).includes('hn-monitor:post'),
     );
-
-    // Cross-worker simulated receipt/reference continuity (from action chain, not extensions.turns):
-    // Turn 1's Slack write records a provider.write action with a simulated draftRef/path.
-    // Turn 2's threaded Slack reply shows as a later provider.write action with
-    //   data.body.parentRef == <turn1 draft ref/path>
-    //   data.body.thread_ts == <turn1 simulated receipt id> (= "200.1" in the case)
-    // Additionally, the hn-monitor.qa.slack-replied log carries { channel, threadTs }
-    // from the slackClient.reply() call, confirming the simulated receipt resolved correctly.
-    const slackWrites = runRecord.actions.filter(
-      (a) => a.kind === 'provider.write' && a.provider === 'slack',
-    );
-    // Turn 2's threaded write: has parentRef (relay path) or thread_ts "200.1" on the body.
-    const turn2ThreadedWrite = slackWrites.find(
-      (a) => a.data?.body?.parentRef || a.data?.body?.thread_ts === '200.1',
-    );
-    const crossTurnActionRef = Boolean(turn2ThreadedWrite);
-
-    // Corroborate via the qa.slack-replied log entry (carries threadTs from slackClient.reply).
-    const slackRepliedLog = logs.find((entry) => entry.message === 'hn-monitor.qa.slack-replied');
-    const repliedThreadTs = slackRepliedLog?.threadTs ?? slackRepliedLog?.data?.threadTs ?? slackRepliedLog?.thread_ts;
-    const crossTurnLogRef = repliedThreadTs === '200.1';
-
-    // Accept if either the action chain or the log confirms the reference.
-    // Both being present is the strongest form; either alone satisfies the minimum.
-    const crossTurnReferenceOk = crossTurnActionRef || crossTurnLogRef;
+    const filesPersisted =
+      hnRunRecord.actions.some((action) => action.kind === 'files.write' && (action.data?.path ?? '').includes('/hn-monitor/digests/by-thread/')) &&
+      hnRunRecord.actions.some((action) => action.kind === 'files.write' && (action.data?.path ?? '').endsWith('/hn-monitor/recent-digests.json'));
 
     // Turn 2 grounding: qa.selected log must show source === exact_state or memory (not algolia),
     // proving the cross-turn state (not a live fallback) resolved the story.
@@ -428,30 +434,54 @@ await runGate(
     const qaSource = qaSelectedLog?.source ?? qaSelectedLog?.data?.source;
     const groundedFromRecall = qaSource === 'exact_state' || qaSource === 'memory';
 
-    const multiTurnOk = turns.length === 2 && hasHydrated && hasReply && recalled && crossTurnReferenceOk && turn1PostSaved && groundedFromRecall;
+    const linkTurns = linkRunRecord.extensions?.turns ?? [];
+    const linkWrites = linkRunRecord.actions.filter((action) => action.kind === 'provider.write' && action.provider === 'slack');
+    const linkParentWrite = linkWrites.find((action) => !action.data?.body?.parentRef);
+    const linkReplyWrite = linkWrites.find((action) => typeof action.data?.body?.parentRef === 'string');
+    const exactThreadLink =
+      Boolean(linkParentWrite) &&
+      Boolean(linkReplyWrite) &&
+      linkReplyWrite.data.body.parentRef === linkParentWrite.data.path &&
+      linkReplyWrite.data.body.thread_ts === linkParentWrite.data.simulatedReceipt?.id;
+
+    const multiTurnOk =
+      turns.length === 2 &&
+      hasHydrated &&
+      hasReply &&
+      recalled &&
+      turn1PostSaved &&
+      filesPersisted &&
+      groundedFromRecall &&
+      linkTurns.length === 2 &&
+      exactThreadLink;
 
     const multiTurnEvidence = {
-      turns: turns.length,
-      hasHydrated,
-      hasReply,
-      recalled,
-      turn1PostSaved,
-      crossTurnActionRef,
-      crossTurnLogRef,
-      crossTurnReferenceOk,
-      repliedThreadTs: repliedThreadTs ?? null,
-      turn2ThreadedWriteParentRef: turn2ThreadedWrite?.data?.body?.parentRef ?? null,
-      turn2ThreadedWriteThreadTs: turn2ThreadedWrite?.data?.body?.thread_ts ?? null,
-      qaSource: qaSource ?? null,
-      groundedFromRecall,
+      hnFollowUp: {
+        turns: turns.length,
+        hasHydrated,
+        hasReply,
+        recalled,
+        turn1PostSaved,
+        filesPersisted,
+        qaSource: qaSource ?? null,
+        groundedFromRecall,
+      },
+      previewThreadLink: {
+        turns: linkTurns.length,
+        parentPath: linkParentWrite?.data?.path ?? null,
+        parentReceiptId: linkParentWrite?.data?.simulatedReceipt?.id ?? null,
+        replyParentRef: linkReplyWrite?.data?.body?.parentRef ?? null,
+        replyThreadTs: linkReplyWrite?.data?.body?.thread_ts ?? null,
+        exactThreadLink,
+      },
     };
     writeArtifact('multi-turn-evidence.json', JSON.stringify(multiTurnEvidence, null, 2) + '\n');
 
     return {
       exitCode: multiTurnOk ? 0 : 1,
       summary: multiTurnOk
-        ? `Two-turn HN follow-up proved cross-worker simulated receipt continuity: turn2 threaded write (parentRef=${turn2ThreadedWrite?.data?.body?.parentRef ?? 'via-log'}, thread_ts=${repliedThreadTs}) grounded from ${qaSource}.`
-        : `Multi-turn HN follow-up failed cross-worker reference continuity. ${JSON.stringify(multiTurnEvidence)}.`,
+        ? `Two-turn HN follow-up preserved memory/files grounding, and the acceptance thread-link case proved exact preview threading continuity (parentRef=${linkReplyWrite?.data?.body?.parentRef}, thread_ts=${linkReplyWrite?.data?.body?.thread_ts}).`
+        : `Multi-turn HN follow-up or preview thread-link evidence failed. ${JSON.stringify(multiTurnEvidence)}.`,
       artifactRefs: [...artifacts, '.workflow-artifacts/composable-runtime-closure/artifacts/multi-turn-evidence.json'],
     };
   },
@@ -1018,9 +1048,18 @@ await runGate('artifact-secret-scan', 'scan generated artifact contents for secr
     process.env.SLACK_BOT_TOKEN,
     process.env.RELAYFILE_TOKEN,
     process.env.WORKFORCE_TOKEN,
+    process.env.ANTHROPIC_API_KEY,
+    process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    process.env.OPENCODE_API_KEY,
+    process.env.CODEX_OAUTH_TOKEN,
+    process.env.CODEX_ACCOUNT_ID,
+    process.env.CODEX_OAUTH_CREDENTIAL,
     'relay_pa_acceptance_preview_secret',
     'xoxb-acceptance-preview-token',
     'acceptance-integ-health-token',
+    'dummy-mock-access-token',
+    'dummy-mock-refresh-token',
+    'acct-live-model-mock',
   ].filter(Boolean);
   const secretPatterns = [
     ['slack-token', /\bxox(?:a|b|p|r|s)-[A-Za-z0-9-]+\b/gu],
@@ -1131,6 +1170,34 @@ function baseAgentworkforceEnv() {
   };
 }
 
+function buildSanitizedAgentworkforceEnv(overrides = {}) {
+  const env = { ...baseAgentworkforceEnv() };
+  for (const key of [
+    'PATH',
+    'HOME',
+    'TMPDIR',
+    'TMP',
+    'TEMP',
+    'LANG',
+    'LC_ALL',
+    'LC_CTYPE',
+    'TZ',
+    'USER',
+    'LOGNAME',
+    'SHELL',
+    'TERM',
+    'CI',
+    'NO_COLOR',
+    'FORCE_COLOR',
+  ]) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  return {
+    ...env,
+    ...overrides,
+  };
+}
+
 function readOptionalPackageVersion(path) {
   try {
     return readJson(path).version ?? null;
@@ -1153,6 +1220,80 @@ function runShell(args, options = {}) {
     stderr: result.stderr ?? '',
     command: args.join(' '),
   };
+}
+
+function runAgentworkforceExactEnvAsync(args, options = {}) {
+  const {
+    cwd = taskRoot,
+    env = {},
+    input,
+    timeoutMs,
+  } = options;
+  const invocation = getAgentworkforceInvocation(args);
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(invocation.command, invocation.argv, {
+      cwd,
+      env,
+      stdio: 'pipe',
+      detached: process.platform !== 'win32',
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    let timeoutId;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      resolvePromise(result);
+    };
+    const killChild = () => {
+      if (child.pid === undefined) return;
+      try {
+        if (process.platform === 'win32') child.kill('SIGTERM');
+        else process.kill(-child.pid, 'SIGTERM');
+      } catch {}
+      setTimeout(() => {
+        try {
+          if (process.platform === 'win32') child.kill('SIGKILL');
+          else process.kill(-child.pid, 'SIGKILL');
+        } catch {}
+      }, 500).unref();
+    };
+
+    if (input !== undefined) child.stdin.end(input);
+    else child.stdin.end();
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', rejectPromise);
+    child.on('close', (status) => {
+      if (timedOut) return;
+      finish({
+        ok: status === 0,
+        status: status ?? 1,
+        stdout,
+        stderr,
+        command: formatCommand(args),
+      });
+    });
+
+    if (timeoutMs !== undefined) {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        stderr = `${stderr}${stderr ? '\n' : ''}Timed out after ${timeoutMs}ms`;
+        killChild();
+        finish({
+          ok: false,
+          status: 124,
+          stdout,
+          stderr,
+          command: formatCommand(args),
+        });
+      }, timeoutMs);
+    }
+  });
 }
 
 function readJson(path) {
@@ -1195,6 +1336,63 @@ function assertLegacyHnParity() {
     yaml: yamlMatch,
     jsonl: jsonlMatch,
   };
+}
+
+function artifactContainsAny(root, secrets) {
+  for (const file of listFiles(root)) {
+    const text = readFileSync(file, 'utf8');
+    if (secrets.some((secret) => secret && text.includes(secret))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function classifyHnFeedRead(urlText) {
+  if (typeof urlText !== 'string') return null;
+  try {
+    const url = new URL(urlText);
+    const tags = url.searchParams.get('tags');
+    if (tags === 'front_page') return 'front_page';
+    if (tags === 'show_hn') return 'show_hn';
+    if (tags === 'story') return 'new';
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isCurrentHnGet(urlText, method) {
+  if (method !== 'GET' || typeof urlText !== 'string') return false;
+  try {
+    const url = new URL(urlText);
+    return url.hostname === 'hn.algolia.com' && classifyHnFeedRead(urlText) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function isFixtureHnSource(source) {
+  return source === 'fixture' ||
+    (typeof source === 'string' && /\/hn-monitor\/fixtures\/hn-(front-page|show-hn|new)\.json$/u.test(source));
+}
+
+function collectSourceFidelities(runRecord, kind) {
+  const values = [];
+  for (const entry of [...(runRecord.trace ?? []), ...(runRecord.actions ?? [])]) {
+    if (entry.kind !== kind) continue;
+    for (const candidate of [
+      entry.sourceFidelity,
+      entry.data?.sourceFidelity,
+      entry.data?.fidelity,
+      entry.extensions?.sourceFidelity,
+      kind === 'http.read' ? runRecord.extensions?.sourceFidelity?.http : undefined,
+      kind === 'model.complete' ? runRecord.extensions?.sourceFidelity?.model : undefined,
+    ]) {
+      if (typeof candidate === 'string' && !values.includes(candidate)) values.push(candidate);
+    }
+  }
+  return values;
 }
 
 function listFiles(root) {

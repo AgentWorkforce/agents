@@ -61,14 +61,19 @@ function writeSSE(res, data) {
 }
 
 export async function createModelMockServer() {
+  const mockAccessToken = 'dummy-mock-access-token';
+  const mockRefreshToken = 'dummy-mock-refresh-token';
+  const mockAccountId = 'acct-live-model-mock';
   const counts = {
     total: 0,
+    unexpected: [],
     requests: [],
   };
 
   const server = http.createServer((req, res) => {
     // Only handle POST /backend-api/codex/responses
     if (req.method !== 'POST' || req.url !== '/backend-api/codex/responses') {
+      counts.unexpected.push({ method: req.method ?? null, path: req.url ?? null });
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: `No mock route for ${req.method} ${req.url}` }));
       return;
@@ -78,8 +83,15 @@ export async function createModelMockServer() {
     req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
       const rawBody = Buffer.concat(chunks).toString('utf8');
+      const authHeader = req.headers.authorization;
       counts.total += 1;
-      counts.requests.push({ method: req.method, path: req.url, bodyLength: rawBody.length });
+      counts.requests.push({
+        method: req.method,
+        path: req.url,
+        bodyLength: rawBody.length,
+        authMatchedExpected: authHeader === `Bearer ${mockAccessToken}`,
+        accountMatchedExpected: req.headers['chatgpt-account-id'] === mockAccountId,
+      });
 
       const promptText = extractPromptText(rawBody);
       const delta = makeDeterministicDelta(promptText);
@@ -109,12 +121,24 @@ export async function createModelMockServer() {
   }
 
   const baseUrl = `http://127.0.0.1:${address.port}`;
+  const mockCredential = JSON.stringify({
+    tokens: {
+      access_token: mockAccessToken,
+      refresh_token: mockRefreshToken,
+      account_id: mockAccountId,
+    },
+    last_refresh: '2026-07-15T09:00:00.000Z',
+    base_url: `${baseUrl}/backend-api/codex`,
+  });
 
   return {
     // CODEX_BACKEND_BASE_URL should be set to `${codexBase}` so the adapter
     // calls `${codexBase}/responses`.
     codexBase: `${baseUrl}/backend-api/codex`,
-    mockCredential: 'dummy-mock-oauth-credential',
+    mockCredential,
+    mockAccessToken,
+    mockRefreshToken,
+    mockAccountId,
     counts,
     close: () => server.close(),
   };

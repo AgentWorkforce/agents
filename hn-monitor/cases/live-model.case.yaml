@@ -9,15 +9,22 @@ inputs:
   TOPICS: agents,ai,typescript
   LOOKBACK_HOURS: "24"
   MAX_STORIES: "8"
-# HN_API_BASE_URL routes live HN GETs to the local mock server.
-# CODEX_BACKEND_BASE_URL + CODEX_OAUTH_CREDENTIAL route model calls to the
-# local Codex-backend mock adapter so no paid or external credential is used.
 policy:
-  reads: live
+  reads: fixtures
   writes: preview
   model: live
   shell: simulate
   compose: preview
+http:
+  - method: GET
+    match: tags=front_page
+    file: ../fixtures/hn-front-page.json
+  - method: GET
+    match: tags=show_hn
+    file: ../fixtures/hn-show-hn.json
+  - method: GET
+    match: tags=story
+    file: ../fixtures/hn-new.json
 expect:
   status: succeeded
   eventSource: cron
@@ -35,4 +42,4 @@ expect:
       channel: C123
       threaded: true
       textContains:
-        - Agent
+        - HN discussion

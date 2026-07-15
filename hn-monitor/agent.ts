@@ -211,31 +211,19 @@ export default defineAgent({
     telegram: [{ on: 'message' }]
   },
   handler: async (ctx, event) => {
-    // Resolve injectable HN API base URL (CI mock injection point).
-    const apiBaseUrl = input(ctx, 'HN_API_BASE_URL') ?? null;
-
     // Q&A path: relay inbox DM
     if (isRelaycastMessageEvent(event as unknown as AgentEvent)) {
-      await handleQaMessage(ctx, event as unknown as AgentEvent, 'relay', {
-        fetchDetails: (id) => fetchStoryDetails(id, apiBaseUrl),
-        searchByTitle: (q) => findStoryByExactTitle(q, apiBaseUrl),
-      });
+      await handleQaMessage(ctx, event as unknown as AgentEvent, 'relay');
       return;
     }
     // Q&A path: telegram message
     if (typeof event.type === 'string' && event.type.startsWith('telegram.')) {
-      await handleQaMessage(ctx, event as unknown as AgentEvent, 'telegram', {
-        fetchDetails: (id) => fetchStoryDetails(id, apiBaseUrl),
-        searchByTitle: (q) => findStoryByExactTitle(q, apiBaseUrl),
-      });
+      await handleQaMessage(ctx, event as unknown as AgentEvent, 'telegram');
       return;
     }
     // Q&A path: a Slack @mention, usually in a digest thread.
     if (typeof event.type === 'string' && event.type.startsWith('slack.')) {
-      await handleQaMessage(ctx, event as unknown as AgentEvent, 'slack', {
-        fetchDetails: (id) => fetchStoryDetails(id, apiBaseUrl),
-        searchByTitle: (q) => findStoryByExactTitle(q, apiBaseUrl),
-      });
+      await handleQaMessage(ctx, event as unknown as AgentEvent, 'slack');
       return;
     }
     // Cron path
@@ -255,7 +243,7 @@ export default defineAgent({
     const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
     const maxStories = boundedPositiveInt(input(ctx, 'MAX_STORIES') ?? '8', 'MAX_STORIES', 20);
 
-    const stories = await fetchHackerNewsFeeds(lookbackHours, apiBaseUrl);
+    const stories = await fetchHackerNewsFeeds(lookbackHours);
     const feedCounts = countFeeds(stories);
     ctx.log(
       'info',
@@ -760,34 +748,20 @@ const TECH_CONTEXT_RE = /\b(?:AI|LLM|model|code|coding|developer|software|workfl
 const FALSE_POSITIVE_RE = /\b(?:travel|insurance|real estate|estate|sports|talent|literary|booking|border patrol) agents?\b/iu;
 const WEAK_CUSTOM_TOPICS = new Set(['ai', 'agent', 'agents', 'agentic', 'typescript', 'developer tools', 'devtools', 'software']);
 
-const HN_DEFAULT_BASE = 'https://hn.algolia.com';
-
-/**
- * Returns the effective HN Algolia base URL.  In CI, HN_API_BASE_URL overrides
- * the default so live-read cases reach a local mock server instead of the
- * external network — the only supported injection point for CI determinism.
- */
-function hnBaseUrl(override?: string | null): string {
-  const env = typeof process !== 'undefined' ? process.env.HN_API_BASE_URL : undefined;
-  const raw = override?.trim() || env?.trim() || HN_DEFAULT_BASE;
-  return raw.replace(/\/+$/u, '');
-}
-
-export async function fetchHackerNewsFeeds(lookbackHours = 24, apiBaseUrl?: string | null): Promise<Story[]> {
-  const base = hnBaseUrl(apiBaseUrl);
+export async function fetchHackerNewsFeeds(lookbackHours = 24): Promise<Story[]> {
   const cutoff = Math.floor((Date.now() - lookbackHours * 60 * 60 * 1000) / 1000);
   const urls: Array<{ feed: HnFeed; url: string }> = [
     {
       feed: 'front_page',
-      url: `${base}/api/v1/search?tags=front_page&hitsPerPage=100`
+      url: 'https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=100'
     },
     {
       feed: 'show_hn',
-      url: `${base}/api/v1/search_by_date?tags=show_hn&hitsPerPage=250&numericFilters=created_at_i%3E${cutoff}`
+      url: `https://hn.algolia.com/api/v1/search_by_date?tags=show_hn&hitsPerPage=250&numericFilters=created_at_i%3E${cutoff}`
     },
     {
       feed: 'new',
-      url: `${base}/api/v1/search_by_date?tags=story&hitsPerPage=1000&numericFilters=created_at_i%3E${cutoff}`
+      url: `https://hn.algolia.com/api/v1/search_by_date?tags=story&hitsPerPage=1000&numericFilters=created_at_i%3E${cutoff}`
     }
   ];
 
@@ -1057,9 +1031,8 @@ interface HnItemPayload {
   children?: HnItemPayload[];
 }
 
-export async function fetchStoryDetails(storyId: number, apiBaseUrl?: string | null): Promise<HnStoryDetails | null> {
-  const base = hnBaseUrl(apiBaseUrl);
-  const res = await fetchWithTimeout(`${base}/api/v1/items/${storyId}`, {}, 8_000);
+export async function fetchStoryDetails(storyId: number): Promise<HnStoryDetails | null> {
+  const res = await fetchWithTimeout(`https://hn.algolia.com/api/v1/items/${storyId}`, {}, 8_000);
   if (!res?.ok) return null;
   try {
     const item = (await res.json()) as HnItemPayload;
@@ -1088,12 +1061,12 @@ export async function fetchStoryDetails(storyId: number, apiBaseUrl?: string | n
  * complete) HN story title. This is deliberately conservative: a loose
  * keyword hit is not enough to ground an answer.
  */
-export async function findStoryByExactTitle(question: string, apiBaseUrl?: string | null): Promise<PostedStory | null> {
+export async function findStoryByExactTitle(question: string): Promise<PostedStory | null> {
   const searchTitle = titleCandidateFromQuestion(question);
   const normalizedCandidate = normalizeTitle(searchTitle);
   if (normalizedCandidate.length < 16 || meaningfulTokens(searchTitle).size < 3) return null;
 
-  const url = new URL(`${hnBaseUrl(apiBaseUrl)}/api/v1/search`);
+  const url = new URL('https://hn.algolia.com/api/v1/search');
   url.searchParams.set('query', searchTitle);
   url.searchParams.set('tags', 'story');
   url.searchParams.set('hitsPerPage', '20');

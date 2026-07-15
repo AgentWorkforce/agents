@@ -11,6 +11,7 @@ import {
 const casesDir = resolve('hn-monitor/cases');
 const caseFiles = readdirSync(casesDir)
   .filter((name) => name.endsWith('.case.yaml'))
+  .filter((name) => !['live-read.case.yaml', 'live-model.case.yaml'].includes(name))
   .sort();
 
 try {

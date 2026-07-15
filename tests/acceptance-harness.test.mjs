@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { createSentinelServer } from '../scripts/acceptance/sentinel-server.mjs';
 import { createIntegrationHealthServer } from '../scripts/acceptance/integration-health-server.mjs';
+import { createHnMockServer } from '../scripts/acceptance/hn-mock-server.mjs';
+import { createModelMockServer } from '../scripts/acceptance/model-mock-server.mjs';
 import { writeBlockedFile, removeBlockedFile } from '../scripts/acceptance/blocked-lifecycle.mjs';
 
 // ── sentinel server ──────────────────────────────────────────────────────────
@@ -106,6 +108,181 @@ test('integration health server never retains raw auth credential', async () => 
     }
   } finally {
     server.close();
+  }
+});
+
+// ── HN mock server ────────────────────────────────────────────────────────────
+
+test('HN mock server routes front_page feed and tracks count', async () => {
+  const hnMock = await createHnMockServer();
+  try {
+    const res = await fetch(`${hnMock.baseUrl}/api/v1/search?tags=front_page&hitsPerPage=100`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(Array.isArray(body.hits), 'response must have hits array');
+    assert.ok(body.hits.length >= 1, 'front-page fixture must have at least 1 hit');
+    assert.equal(hnMock.counts.frontPage, 1);
+    assert.equal(hnMock.counts.total, 1);
+  } finally {
+    hnMock.close();
+  }
+});
+
+test('HN mock server routes show_hn feed and tracks count', async () => {
+  const hnMock = await createHnMockServer();
+  try {
+    const res = await fetch(`${hnMock.baseUrl}/api/v1/search_by_date?tags=show_hn&hitsPerPage=250`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(Array.isArray(body.hits));
+    assert.equal(hnMock.counts.showHn, 1);
+  } finally {
+    hnMock.close();
+  }
+});
+
+test('HN mock server routes new-stories feed and tracks count', async () => {
+  const hnMock = await createHnMockServer();
+  try {
+    const res = await fetch(`${hnMock.baseUrl}/api/v1/search_by_date?tags=story&hitsPerPage=1000`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(Array.isArray(body.hits));
+    assert.equal(hnMock.counts.newStories, 1);
+  } finally {
+    hnMock.close();
+  }
+});
+
+test('HN mock server routes item detail and tracks count by id', async () => {
+  const hnMock = await createHnMockServer();
+  try {
+    const res = await fetch(`${hnMock.baseUrl}/api/v1/items/1001`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.id, 1001);
+    assert.ok(typeof body.title === 'string');
+    assert.equal(hnMock.counts.items['1001'], 1);
+  } finally {
+    hnMock.close();
+  }
+});
+
+test('HN mock server returns 404 for unknown item id', async () => {
+  const hnMock = await createHnMockServer();
+  try {
+    const res = await fetch(`${hnMock.baseUrl}/api/v1/items/9999`);
+    assert.equal(res.status, 404);
+  } finally {
+    hnMock.close();
+  }
+});
+
+test('HN mock server routes title search and tracks count', async () => {
+  const hnMock = await createHnMockServer();
+  try {
+    const res = await fetch(`${hnMock.baseUrl}/api/v1/search?query=test&tags=story&restrictSearchableAttributes=title`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(Array.isArray(body.hits));
+    assert.equal(hnMock.counts.titleSearch, 1);
+  } finally {
+    hnMock.close();
+  }
+});
+
+// ── model mock server ─────────────────────────────────────────────────────────
+
+// Codex-backend SSE format: POST /backend-api/codex/responses → text/event-stream
+
+test('model mock server responds to POST /backend-api/codex/responses with SSE stream', async () => {
+  const modelMock = await createModelMockServer();
+  try {
+    const res = await fetch(`${modelMock.codexBase}/responses`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${modelMock.mockCredential}`,
+      },
+      body: JSON.stringify({
+        model: 'codex-mini-latest',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Say hello' }] }],
+        stream: true,
+        max_output_tokens: 100,
+        tools: [],
+        instructions: '',
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.ok(res.headers.get('content-type')?.includes('text/event-stream'));
+    const text = await res.text();
+    // Must contain at least response.output_text.delta and response.completed.
+    assert.ok(text.includes('"type":"response.output_text.delta"'), 'SSE stream must include delta event');
+    assert.ok(text.includes('"type":"response.completed"'), 'SSE stream must include completed event');
+    assert.equal(modelMock.counts.total, 1);
+  } finally {
+    modelMock.close();
+  }
+});
+
+test('model mock server emits parseable SSE events for summarization prompts', async () => {
+  const modelMock = await createModelMockServer();
+  try {
+    const promptText = JSON.stringify([{ id: 1001, title: 'Test agent story', why: '...' }]);
+    const res = await fetch(`${modelMock.codexBase}/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${modelMock.mockCredential}` },
+      body: JSON.stringify({
+        model: 'codex-mini-latest',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: `${promptText}\nReturn JSON with "theme" and "stories"` }] }],
+        stream: true,
+        max_output_tokens: 900,
+        tools: [],
+        instructions: '',
+      }),
+    });
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    // Parse SSE data lines.
+    const events = text.split('\n')
+      .filter((line) => line.startsWith('data: ') && !line.startsWith('data: [DONE]'))
+      .map((line) => JSON.parse(line.slice('data: '.length)));
+    const delta = events.find((e) => e.type === 'response.output_text.delta');
+    assert.ok(delta, 'must have at least one delta event');
+    // Digest path delta text must be parseable JSON.
+    const parsed = JSON.parse(delta.delta);
+    assert.ok(typeof parsed.theme === 'string');
+    assert.ok(Array.isArray(parsed.stories));
+  } finally {
+    modelMock.close();
+  }
+});
+
+test('model mock server returns 404 for unknown routes', async () => {
+  const modelMock = await createModelMockServer();
+  try {
+    const res = await fetch(`${modelMock.codexBase}/unknown`);
+    assert.equal(res.status, 404);
+  } finally {
+    modelMock.close();
+  }
+});
+
+test('model mock server tracks call counts across multiple requests', async () => {
+  const modelMock = await createModelMockServer();
+  try {
+    const makeCall = () => fetch(`${modelMock.codexBase}/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${modelMock.mockCredential}` },
+      body: JSON.stringify({ model: 'codex-mini-latest', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }], stream: true, max_output_tokens: 50, tools: [], instructions: '' }),
+    });
+    await makeCall();
+    await makeCall();
+    await makeCall();
+    assert.equal(modelMock.counts.total, 3);
+    assert.equal(modelMock.counts.requests.length, 3);
+  } finally {
+    modelMock.close();
   }
 });
 

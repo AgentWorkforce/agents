@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 
 import { createSentinelServer } from './sentinel-server.mjs';
 import { createIntegrationHealthServer } from './integration-health-server.mjs';
+import { createHnMockServer } from './hn-mock-server.mjs';
+import { createModelMockServer } from './model-mock-server.mjs';
 import { writeBlockedFile, removeBlockedFile } from './blocked-lifecycle.mjs';
 
 import {
@@ -172,21 +174,182 @@ await runGate(
   },
 );
 
-await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs', async () => {
-  const result = runShell(['node', 'scripts/run-hn-platform-cases.mjs'], {
-    cwd: taskRoot,
-    env: baseAgentworkforceEnv(),
-  });
-  const artifact = writeArtifact('hn-case-suite.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
+await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs  +live-read/live-model with local mock servers', async () => {
+  // ── 1. Start local mock servers so live cases never reach the external network ──
+  const hnMock = await createHnMockServer();
+  const modelMock = await createModelMockServer();
+
+  let deterministicResult = null;
+  let liveReadResult = null;
+  let liveModelResult = null;
+  let liveReadRecord = null;
+  let liveModelRecord = null;
+
+  try {
+    // ── 2. Deterministic fixture-based cases (scheduled-scan, agentic-feeds, etc.) ──
+    deterministicResult = runShell(['node', 'scripts/run-hn-platform-cases.mjs'], {
+      cwd: taskRoot,
+      env: {
+        ...baseAgentworkforceEnv(),
+        // Also inject mock URLs so any live case that runs still hits the local mock only.
+        HN_API_BASE_URL: hnMock.baseUrl,
+        CODEX_BACKEND_BASE_URL: modelMock.codexBase,
+        CODEX_OAUTH_CREDENTIAL: modelMock.mockCredential,
+      },
+    });
+
+    // ── 3. live-read case: GETs must reach only the declared local mock endpoint ──
+    const liveReadRunRecordPath = resolve(artifactFilesRoot, 'live-read.run-record.json');
+    liveReadResult = runAgentworkforce(
+      [
+        'invoke',
+        './hn-monitor/agent.ts',
+        '--case',
+        './hn-monitor/cases/live-read.case.yaml',
+        '--output',
+        liveReadRunRecordPath,
+      ],
+      {
+        env: {
+          ...baseAgentworkforceEnv(),
+          HN_API_BASE_URL: hnMock.baseUrl,
+          CODEX_BACKEND_BASE_URL: modelMock.codexBase,
+          CODEX_OAUTH_CREDENTIAL: modelMock.mockCredential,
+        },
+        timeoutMs: invokeTimeoutMs,
+      },
+    );
+
+    // ── 4. live-model case: model calls must reach only the mock Codex adapter ──
+    //    CODEX_BACKEND_BASE_URL overrides the parent-side Workforce LLM adapter so
+    //    no paid or external credential is touched.
+    const liveModelRunRecordPath = resolve(artifactFilesRoot, 'live-model.run-record.json');
+    liveModelResult = runAgentworkforce(
+      [
+        'invoke',
+        './hn-monitor/agent.ts',
+        '--case',
+        './hn-monitor/cases/live-model.case.yaml',
+        '--output',
+        liveModelRunRecordPath,
+      ],
+      {
+        env: {
+          ...baseAgentworkforceEnv(),
+          HN_API_BASE_URL: hnMock.baseUrl,
+          CODEX_BACKEND_BASE_URL: modelMock.codexBase,
+          CODEX_OAUTH_CREDENTIAL: modelMock.mockCredential,
+        },
+        timeoutMs: invokeTimeoutMs,
+      },
+    );
+
+    if (liveReadResult.status === 0) liveReadRecord = readJson(liveReadRunRecordPath);
+    if (liveModelResult.status === 0) liveModelRecord = readJson(liveModelRunRecordPath);
+  } finally {
+    hnMock.close();
+    modelMock.close();
+  }
+
+  // ── 5. Persist artifacts ──
+  const artifact = writeArtifact('hn-case-suite.txt', `${deterministicResult.stdout}\n${deterministicResult.stderr}`.trim() + '\n');
+  const liveReadArtifact = writeArtifact('live-read.stdout.txt', `${liveReadResult.stdout}\n${liveReadResult.stderr}`.trim() + '\n');
+  const liveModelArtifact = writeArtifact('live-model.stdout.txt', `${liveModelResult.stdout}\n${liveModelResult.stderr}`.trim() + '\n');
+  const hnCountsArtifact = writeArtifact('hn-mock-server.counts.json', JSON.stringify(hnMock.counts, null, 2) + '\n');
+  const modelCountsArtifact = writeArtifact('model-mock-server.counts.json', JSON.stringify(modelMock.counts, null, 2) + '\n');
   const parity = assertLegacyHnParity();
   const parityArtifact = writeArtifact('hn-case-parity.json', JSON.stringify(parity, null, 2) + '\n');
+
+  const artifacts = [artifact, liveReadArtifact, liveModelArtifact, hnCountsArtifact, modelCountsArtifact, parityArtifact];
+  if (liveReadResult?.status === 0) artifacts.push(relative(taskRoot, resolve(artifactFilesRoot, 'live-read.run-record.json')));
+  if (liveModelResult?.status === 0) artifacts.push(relative(taskRoot, resolve(artifactFilesRoot, 'live-model.run-record.json')));
+
+  // ── 6. Assert concrete fidelity evidence ──
+
+  // http.read: mock server must have received exactly 3 feed GETs (front_page + show_hn + new)
+  // per live invocation (2 invocations = 6 total feed GETs minimum).
+  const hnFeedGetsLiveRead = hnMock.counts.frontPage + hnMock.counts.showHn + hnMock.counts.newStories;
+  // Each live run fetches 3 feed URLs; 2 live runs → at least 6 feed GETs.
+  const hnHttpFidelity = hnFeedGetsLiveRead >= 6;
+
+  // model.complete: mock model server must have received calls from the live-model run.
+  const modelCallsTotal = modelMock.counts.total;
+  // live-model run calls ctx.llm.complete at least once (for digest summarization).
+  const modelFidelity = modelCallsTotal >= 1;
+
+  // preview provider writes: both live runs must have Slack preview writes in their records.
+  const liveReadSlackWrites = (liveReadRecord?.actions ?? []).filter(
+    (a) => a.kind === 'provider.write' && a.provider === 'slack' && a.status === 'previewed',
+  );
+  const liveModelSlackWrites = (liveModelRecord?.actions ?? []).filter(
+    (a) => a.kind === 'provider.write' && a.provider === 'slack' && a.status === 'previewed',
+  );
+  const liveReadPreviewWrites = liveReadSlackWrites.length >= 1;
+  const liveModelPreviewWrites = liveModelSlackWrites.length >= 1;
+
+  // zero forbidden writes: no provider.write with status === 'live' in either run.
+  const liveReadNoForbiddenWrites = !(liveReadRecord?.actions ?? []).some(
+    (a) => a.kind === 'provider.write' && a.status === 'live',
+  );
+  const liveModelNoForbiddenWrites = !(liveModelRecord?.actions ?? []).some(
+    (a) => a.kind === 'provider.write' && a.status === 'live',
+  );
+
+  // expected HN content: live-read run record must log the expected feed scan counts.
+  const liveReadLogs = readLogLines(liveReadRecord ?? {});
+  const liveReadFeedScan = liveReadLogs.some(
+    (e) => typeof e.message === 'string' && e.message.includes('hn-monitor.feed-scan front_page=2 show_hn=2 new=4'),
+  );
+  const liveModelLogs = readLogLines(liveModelRecord ?? {});
+  const liveModelFeedScan = liveModelLogs.some(
+    (e) => typeof e.message === 'string' && e.message.includes('hn-monitor.feed-scan front_page=2 show_hn=2 new=4'),
+  );
+
+  const evidentSummary = [
+    `hn-mock GETs: ${hnFeedGetsLiveRead} (≥6 required)`,
+    `model-mock calls: ${modelCallsTotal} (≥1 required)`,
+    `live-read Slack preview writes: ${liveReadSlackWrites.length}`,
+    `live-model Slack preview writes: ${liveModelSlackWrites.length}`,
+    `live-read forbidden writes: ${!liveReadNoForbiddenWrites}`,
+    `live-model forbidden writes: ${!liveModelNoForbiddenWrites}`,
+    `live-read feed-scan log present: ${liveReadFeedScan}`,
+    `live-model feed-scan log present: ${liveModelFeedScan}`,
+  ].join('; ');
+
+  writeArtifact('hn-live-evidence.json', JSON.stringify({
+    hnMockCounts: hnMock.counts,
+    modelMockCounts: modelMock.counts,
+    hnFeedGetsTotal: hnFeedGetsLiveRead,
+    modelCallsTotal,
+    liveReadPreviewWrites: liveReadSlackWrites.length,
+    liveModelPreviewWrites: liveModelSlackWrites.length,
+    liveReadNoForbiddenWrites,
+    liveModelNoForbiddenWrites,
+    liveReadFeedScan,
+    liveModelFeedScan,
+    parity,
+  }, null, 2) + '\n');
+
+  const allOk =
+    deterministicResult.status === 0 &&
+    parity.ok &&
+    liveReadResult.status === 0 &&
+    liveModelResult.status === 0 &&
+    hnHttpFidelity &&
+    modelFidelity &&
+    liveReadPreviewWrites &&
+    liveModelPreviewWrites &&
+    liveReadNoForbiddenWrites &&
+    liveModelNoForbiddenWrites &&
+    liveReadFeedScan &&
+    liveModelFeedScan;
+
   return {
-    exitCode: result.status === 0 && parity.ok ? 0 : 1,
-    summary:
-      result.status === 0 && parity.ok
-        ? 'All checked-in HN case files passed through invoke --case and the legacy JSONL parity contract matches the YAML cases.'
-        : `HN case coverage failed${parity.ok ? '.' : '; legacy parity drift detected.'}`,
-    artifactRefs: [artifact, parityArtifact],
+    exitCode: allOk ? 0 : 1,
+    summary: allOk
+      ? `All HN cases passed; live-read and live-model ran against local mock servers only. ${evidentSummary}.`
+      : `HN case coverage or live mock evidence failed. ${evidentSummary}.`,
+    artifactRefs: artifacts,
   };
 });
 
@@ -225,14 +388,71 @@ await runGate(
     const logs = readLogLines(runRecord);
     const hasHydrated = logs.some((entry) => entry.message === 'hn-monitor.qa.hydrated');
     const hasReply = logs.some((entry) => entry.message === 'hn-monitor.qa.slack-replied');
+
+    // Memory recall continuity: turn 2 must recall >= 1 item saved in turn 1.
     const recalled = runRecord.actions.some((action) => action.kind === 'memory.recall' && action.data?.items >= 1);
+
+    // Turn 1 must have saved the HN post (memory.save tagged hn-monitor:post).
+    const turn1PostSaved = runRecord.actions.some(
+      (action) => action.kind === 'memory.save' && (action.data?.tags ?? []).includes('hn-monitor:post'),
+    );
+
+    // Cross-worker simulated receipt/reference continuity (from action chain, not extensions.turns):
+    // Turn 1's Slack write records a provider.write action with a simulated draftRef/path.
+    // Turn 2's threaded Slack reply shows as a later provider.write action with
+    //   data.body.parentRef == <turn1 draft ref/path>
+    //   data.body.thread_ts == <turn1 simulated receipt id> (= "200.1" in the case)
+    // Additionally, the hn-monitor.qa.slack-replied log carries { channel, threadTs }
+    // from the slackClient.reply() call, confirming the simulated receipt resolved correctly.
+    const slackWrites = runRecord.actions.filter(
+      (a) => a.kind === 'provider.write' && a.provider === 'slack',
+    );
+    // Turn 2's threaded write: has parentRef (relay path) or thread_ts "200.1" on the body.
+    const turn2ThreadedWrite = slackWrites.find(
+      (a) => a.data?.body?.parentRef || a.data?.body?.thread_ts === '200.1',
+    );
+    const crossTurnActionRef = Boolean(turn2ThreadedWrite);
+
+    // Corroborate via the qa.slack-replied log entry (carries threadTs from slackClient.reply).
+    const slackRepliedLog = logs.find((entry) => entry.message === 'hn-monitor.qa.slack-replied');
+    const repliedThreadTs = slackRepliedLog?.threadTs ?? slackRepliedLog?.data?.threadTs ?? slackRepliedLog?.thread_ts;
+    const crossTurnLogRef = repliedThreadTs === '200.1';
+
+    // Accept if either the action chain or the log confirms the reference.
+    // Both being present is the strongest form; either alone satisfies the minimum.
+    const crossTurnReferenceOk = crossTurnActionRef || crossTurnLogRef;
+
+    // Turn 2 grounding: qa.selected log must show source === exact_state or memory (not algolia),
+    // proving the cross-turn state (not a live fallback) resolved the story.
+    const qaSelectedLog = logs.find((entry) => entry.message === 'hn-monitor.qa.selected');
+    const qaSource = qaSelectedLog?.source ?? qaSelectedLog?.data?.source;
+    const groundedFromRecall = qaSource === 'exact_state' || qaSource === 'memory';
+
+    const multiTurnOk = turns.length === 2 && hasHydrated && hasReply && recalled && crossTurnReferenceOk && turn1PostSaved && groundedFromRecall;
+
+    const multiTurnEvidence = {
+      turns: turns.length,
+      hasHydrated,
+      hasReply,
+      recalled,
+      turn1PostSaved,
+      crossTurnActionRef,
+      crossTurnLogRef,
+      crossTurnReferenceOk,
+      repliedThreadTs: repliedThreadTs ?? null,
+      turn2ThreadedWriteParentRef: turn2ThreadedWrite?.data?.body?.parentRef ?? null,
+      turn2ThreadedWriteThreadTs: turn2ThreadedWrite?.data?.body?.thread_ts ?? null,
+      qaSource: qaSource ?? null,
+      groundedFromRecall,
+    };
+    writeArtifact('multi-turn-evidence.json', JSON.stringify(multiTurnEvidence, null, 2) + '\n');
+
     return {
-      exitCode: turns.length === 2 && hasHydrated && hasReply && recalled ? 0 : 1,
-      summary:
-        turns.length === 2 && hasHydrated && hasReply && recalled
-          ? 'Two-turn HN follow-up preserved preview state across turns.'
-          : 'Multi-turn HN follow-up did not preserve the expected state/action sequence.',
-      artifactRefs: artifacts,
+      exitCode: multiTurnOk ? 0 : 1,
+      summary: multiTurnOk
+        ? `Two-turn HN follow-up proved cross-worker simulated receipt continuity: turn2 threaded write (parentRef=${turn2ThreadedWrite?.data?.body?.parentRef ?? 'via-log'}, thread_ts=${repliedThreadTs}) grounded from ${qaSource}.`
+        : `Multi-turn HN follow-up failed cross-worker reference continuity. ${JSON.stringify(multiTurnEvidence)}.`,
+      artifactRefs: [...artifacts, '.workflow-artifacts/composable-runtime-closure/artifacts/multi-turn-evidence.json'],
     };
   },
 );

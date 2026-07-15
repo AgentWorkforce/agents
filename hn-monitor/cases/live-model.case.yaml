@@ -4,9 +4,35 @@ agent: ../agent.ts
 kind: scheduled
 event:
   schedule: scan
+inputs:
+  SLACK_CHANNEL: C123
+  TOPICS: agents,ai,typescript
+  LOOKBACK_HOURS: "24"
+  MAX_STORIES: "8"
+# HN_API_BASE_URL routes live HN GETs to the local mock server.
+# CODEX_BACKEND_BASE_URL + CODEX_OAUTH_CREDENTIAL route model calls to the
+# local Codex-backend mock adapter so no paid or external credential is used.
 policy:
   reads: live
   writes: preview
   model: live
+  shell: simulate
+  compose: preview
 expect:
   status: succeeded
+  eventSource: cron
+  logsContain:
+    - hn-monitor.feed-scan front_page=2 show_hn=2 new=4
+    - hn-monitor.matched-agentic matched=3
+    - hn-monitor.posted
+  effectsContain:
+    - http.read
+    - model.complete
+    - provider.write
+  providerActions:
+    - provider: slack
+      resource: messages
+      channel: C123
+      threaded: true
+      textContains:
+        - Agent

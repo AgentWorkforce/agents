@@ -33,7 +33,7 @@ function assertInvokeCaseWritePolicy(caseSpec, label) {
 }
 
 test('HN platform cases are one case per file with unique ids and safe writes', () => {
-  assert.ok(caseFiles.length >= 6, 'expected the reference, parity, and provider-trigger cases');
+  assert.ok(caseFiles.length >= 6, 'expected the reference, parity, live, and provider-trigger cases');
   const ids = new Set();
 
   for (const [name, { path, value: caseSpec }] of cases) {
@@ -149,6 +149,61 @@ test('agent-local HTTP fixtures preserve the legacy eval inputs byte-for-byte', 
       `${name} drifted from the retained eval fixture`,
     );
   }
+});
+
+test('live-read case is non-vacuous: has inputs, log assertions, http.read and provider.write effects', () => {
+  const liveRead = cases.get('live-read.case.yaml').value;
+  assert.equal(liveRead.policy?.reads, 'live', 'live-read must use reads: live');
+  assert.equal(liveRead.policy?.model, 'stub', 'live-read must use model: stub');
+  assert.ok(liveRead.inputs?.SLACK_CHANNEL, 'live-read must have SLACK_CHANNEL input (agent exits early otherwise)');
+  assert.ok(liveRead.expect?.logsContain?.some((l) => l.includes('hn-monitor.feed-scan')),
+    'live-read must assert feed-scan log with concrete counts');
+  assert.ok(liveRead.expect?.effectsContain?.includes('http.read'),
+    'live-read must assert http.read effect (proves live GETs occurred)');
+  assert.ok(liveRead.expect?.effectsContain?.includes('provider.write'),
+    'live-read must assert provider.write effect');
+  assert.ok(Array.isArray(liveRead.expect?.providerActions) && liveRead.expect.providerActions.length >= 1,
+    'live-read must assert at least one Slack preview write');
+});
+
+test('live-model case is non-vacuous: has inputs, log assertions, model.complete and http.read effects', () => {
+  const liveModel = cases.get('live-model.case.yaml').value;
+  assert.equal(liveModel.policy?.reads, 'live', 'live-model must use reads: live');
+  assert.equal(liveModel.policy?.model, 'live', 'live-model must use model: live');
+  assert.ok(liveModel.inputs?.SLACK_CHANNEL, 'live-model must have SLACK_CHANNEL input (agent exits early otherwise)');
+  assert.ok(liveModel.expect?.logsContain?.some((l) => l.includes('hn-monitor.feed-scan')),
+    'live-model must assert feed-scan log with concrete counts');
+  assert.ok(liveModel.expect?.effectsContain?.includes('http.read'),
+    'live-model must assert http.read effect');
+  assert.ok(liveModel.expect?.effectsContain?.includes('model.complete'),
+    'live-model must assert model.complete effect (proves real model path was exercised)');
+  assert.ok(liveModel.expect?.effectsContain?.includes('provider.write'),
+    'live-model must assert provider.write effect');
+  assert.ok(Array.isArray(liveModel.expect?.providerActions) && liveModel.expect.providerActions.length >= 1,
+    'live-model must assert at least one Slack preview write');
+});
+
+test('live-read and live-model cases share the same feed-scan log assertion (mock data parity)', () => {
+  const liveRead = cases.get('live-read.case.yaml').value;
+  const liveModel = cases.get('live-model.case.yaml').value;
+  const lrFeedScan = liveRead.expect?.logsContain?.find((l) => l.includes('hn-monitor.feed-scan'));
+  const lmFeedScan = liveModel.expect?.logsContain?.find((l) => l.includes('hn-monitor.feed-scan'));
+  assert.equal(lrFeedScan, lmFeedScan, 'live-read and live-model must assert the same feed-scan counts (same mock data)');
+});
+
+test('slack-follow-up case has multi-turn cross-reference assertions in acceptance coverage', () => {
+  const followUp = cases.get('slack-follow-up.case.yaml').value;
+  // The case must carry the expected logsContain entries that the acceptance
+  // script asserts cross-turn reference continuity against.
+  assert.ok(followUp.expect?.logsContain?.includes('hn-monitor.qa.hydrated'),
+    'follow-up case must assert qa.hydrated (confirms item fetch from turn 1 state)');
+  assert.ok(followUp.expect?.logsContain?.includes('hn-monitor.qa.slack-replied'),
+    'follow-up case must assert qa.slack-replied (carries threadTs for cross-turn ref proof)');
+  assert.ok(followUp.expect?.effectsContain?.includes('memory.save'),
+    'follow-up case must assert memory.save (turn 1 must persist post data for turn 2)');
+  // Turn 2 uses thread_ts "200.1" — the simulated receipt from turn 1's Slack post.
+  assert.equal(followUp.turns?.[1]?.thread_ts, '200.1',
+    'turn 2 thread_ts must reference the simulated Slack parent receipt from turn 1');
 });
 
 test('HN eval and preview scripts are thin platform-invoke wrappers', () => {

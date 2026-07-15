@@ -82,6 +82,19 @@ interface RecentDigestState {
   posts: PostRecord[];
 }
 
+interface ExactPostSaveResult {
+  saved: boolean;
+  threadShardSaved: boolean;
+  indexSaved: boolean;
+}
+
+class ExactPostPersistenceError extends Error {
+  constructor() {
+    super('Slack digest posted, but deterministic HN grounding state could not be persisted');
+    this.name = 'ExactPostPersistenceError';
+  }
+}
+
 type QaGroundingSource = 'exact_state' | 'memory' | 'thread_context' | 'algolia' | 'none';
 
 interface PendingThreadBody {
@@ -251,7 +264,7 @@ export async function handleQaMessage(
     complete?: (prompt: string) => Promise<string>;
     fetchDetails?: (storyId: number) => Promise<HnStoryDetails | null>;
     searchByTitle?: (question: string) => Promise<PostedStory | null>;
-    loadExactPosts?: () => Promise<PostRecord[]>;
+    loadExactPosts?: (threadTs?: string) => Promise<PostRecord[]>;
     loadThreadContext?: (expanded: unknown) => Promise<string>;
     slackReply?: (channel: string, threadTs: string, text: string) => Promise<unknown>;
     /** Inject a delivery client for testing (avoids real writeback). */
@@ -296,7 +309,9 @@ export async function handleQaMessage(
   if (!question) return;
 
   const [exactPosts, memoryPosts, threadContext] = await Promise.all([
-    (deps.loadExactPosts ?? (() => loadExactPosts(ctx)))().catch(() => []),
+    (deps.loadExactPosts ?? ((threadTs?: string) => loadExactPosts(ctx, threadTs)))(
+      provider === 'slack' ? slackMessage?.threadTs ?? slackMessage?.ts : undefined
+    ).catch(() => []),
     loadPosts(ctx).catch(() => []),
     (deps.loadThreadContext ?? ((value: unknown) => loadSlackThreadContext(ctx, value)))(expanded).catch(() => '')
   ]);
@@ -408,10 +423,7 @@ export async function handleQaMessage(
     answer = await withTimeout(complete(prompt), 45_000, 'ctx.llm.complete');
   } catch (error) {
     ctx.log('warn', 'hn-monitor.qa.llm-fallback', { error: String(error) });
-    const fallbackStories = selectedStories.length > 0
-      ? selectedStories
-      : groundingPosts.flatMap((post) => post.stories ?? []);
-    const titles = dedupePostedStories(fallbackStories)
+    const titles = dedupePostedStories(selectedStories)
       .slice(0, 15)
       .map((story) => [
         `- ${story.title ?? 'Untitled'}`,
@@ -421,7 +433,7 @@ export async function handleQaMessage(
       .join('\n');
     answer = titles
       ? `I found the grounded HN story, but couldn't generate the full answer right now:\n${titles}`
-      : "I couldn't generate an answer right now, and I don't have any recent posts to show.";
+      : "I couldn't generate an answer right now, and I couldn't resolve a single grounded HN story from that question. Please specify the story number or exact title.";
   }
 
   const reply = answer.trim() || 'No answer available.';
@@ -540,12 +552,13 @@ export async function postFreshStories(
     ctx.log('info', 'hn-monitor.posted', { targets: delivery.targets.join(',') });
 
     // Retain the digest for Q&A recall (~30 day rolling window via memory ttl).
-    await savePost(ctx, {
+    const exactStateSaved = await savePost(ctx, {
       postedAt: new Date().toISOString(),
       digest: `${header}\n${body}`,
       stories,
       threadRefs: saveHeaderRefs(heads)
     });
+    if (!exactStateSaved) throw new ExactPostPersistenceError();
   } catch (err) {
     if (!headerPosted) {
       // Nothing landed yet — release the provisional claim so the next tick
@@ -556,6 +569,10 @@ export async function postFreshStories(
     if (pending) {
       await savePendingThreadBody(ctx, pending)
         .catch((error) => ctx.log('error', 'hn-monitor.pending-save-failed', { error: String(error) }));
+    }
+    if (err instanceof ExactPostPersistenceError) {
+      ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { error: err.message });
+      throw err;
     }
     // The header already posted; releasing + rethrowing would duplicate it on
     // the runtime's retry. Keep the claim and let the next scan retry the body.
@@ -616,12 +633,16 @@ export async function retryPendingThreadBody(
     return true;
   }
 
-  await savePost(ctx, {
+  const exactStateSaved = await savePost(ctx, {
     postedAt: new Date().toISOString(),
     digest: `${pending.header}\n${pending.body}`,
     stories: pending.stories,
     threadRefs: pending.headerRefs
   });
+  if (!exactStateSaved) {
+    ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true });
+    throw new ExactPostPersistenceError();
+  }
   await clearPendingThreadBody(ctx);
   ctx.log('info', 'hn-monitor.pending-body-posted', { targets: configuredTargets });
   return true;
@@ -1099,7 +1120,7 @@ function normalizeTitle(value: string): string {
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/gu, '')
     .toLowerCase()
-    .replace(/\bshow\s+hn\s*:\s*/gu, '')
+    .replace(/\b(?:show|ask|tell|launch)\s+hn\s*:\s*/gu, '')
     .replace(/[^a-z0-9+]+/gu, ' ')
     .replace(/\s+/gu, ' ')
     .trim();
@@ -1279,34 +1300,82 @@ function exactDigestStatePath(ctx: WorkforceCtx): string | null {
   return `/slack/channels/${encodeURIComponent(channel)}/hn-monitor/recent-digests.json`;
 }
 
-async function loadExactPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
-  const path = exactDigestStatePath(ctx);
-  if (!path) return [];
-  const files = (ctx as WorkforceCtx & { files?: WorkforceCtx['files'] }).files;
-  if (!files) return [];
+function exactDigestThreadPath(ctx: WorkforceCtx, threadTs: string): string | null {
+  const channel = input(ctx, 'SLACK_CHANNEL')?.trim();
+  if (!channel || !threadTs.trim()) return null;
+  return `/slack/channels/${encodeURIComponent(channel)}/hn-monitor/digests/by-thread/${encodeURIComponent(threadTs)}.json`;
+}
+
+async function readExactPost(ctx: WorkforceCtx, path: string): Promise<PostRecord | null> {
   try {
-    const state = JSON.parse(await files.read(path)) as Partial<RecentDigestState>;
-    if (state.kind !== 'hn-monitor exact recent digests' || state.version !== 1 || !Array.isArray(state.posts)) return [];
-    return state.posts.filter(isPostRecord).sort((a, b) => b.postedAt.localeCompare(a.postedAt)).slice(0, 12);
+    const parsed = JSON.parse(await ctx.files.read(path)) as unknown;
+    return isPostRecord(parsed) ? parsed : null;
   } catch {
-    return [];
+    return null;
   }
 }
 
-async function saveExactPost(ctx: WorkforceCtx, record: PostRecord): Promise<boolean> {
+async function loadExactPosts(ctx: WorkforceCtx, threadTs?: string): Promise<PostRecord[]> {
   const path = exactDigestStatePath(ctx);
-  if (!path) return false;
-  const files = (ctx as WorkforceCtx & { files?: WorkforceCtx['files'] }).files;
-  if (!files) return false;
-  const posts = mergePosts([record], await loadExactPosts(ctx)).slice(0, 12);
-  const state: RecentDigestState = {
-    kind: 'hn-monitor exact recent digests',
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    posts
+  if (!path) return [];
+  const files = ctx.files;
+  if (!files) return [];
+  const threadPath = threadTs ? exactDigestThreadPath(ctx, threadTs) : null;
+  const threadPost = threadPath ? await readExactPost(ctx, threadPath) : null;
+  try {
+    const state = JSON.parse(await files.read(path)) as Partial<RecentDigestState>;
+    const indexed = state.kind === 'hn-monitor exact recent digests' && state.version === 1 && Array.isArray(state.posts)
+      ? state.posts.filter(isPostRecord)
+      : [];
+    return mergePosts(threadPost ? [threadPost] : [], indexed).slice(0, 12);
+  } catch {
+    return threadPost ? [threadPost] : [];
+  }
+}
+
+async function saveExactPost(ctx: WorkforceCtx, record: PostRecord): Promise<ExactPostSaveResult> {
+  const path = exactDigestStatePath(ctx);
+  if (!path || !ctx.files) return { saved: false, threadShardSaved: false, indexSaved: false };
+
+  // The per-thread shard is authoritative for Slack follow-ups. Concurrent
+  // digests have distinct delivered thread timestamps, so they write distinct
+  // paths and cannot erase one another. The rolling file below is only a
+  // convenience index for generic/non-thread questions.
+  const slackThreadRefs = (record.threadRefs ?? []).filter((ref) =>
+    ref.provider === 'slack' && Boolean(ref.threadTs) && (!ref.channel || ref.channel === input(ctx, 'SLACK_CHANNEL')?.trim())
+  );
+  let threadShardSaved = slackThreadRefs.length === 0;
+  for (const ref of slackThreadRefs) {
+    const threadPath = exactDigestThreadPath(ctx, ref.threadTs ?? '');
+    if (!threadPath) continue;
+    try {
+      await ctx.files.write(threadPath, `${JSON.stringify(record, null, 2)}\n`);
+      threadShardSaved = true;
+    } catch (error) {
+      ctx.log('warn', 'hn-monitor.post-state-shard-unavailable', { error: String(error) });
+    }
+  }
+
+  let indexSaved = false;
+  try {
+    const posts = mergePosts([record], await loadExactPosts(ctx)).slice(0, 12);
+    const state: RecentDigestState = {
+      kind: 'hn-monitor exact recent digests',
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      posts
+    };
+    await ctx.files.write(path, `${JSON.stringify(state, null, 2)}\n`);
+    indexSaved = true;
+  } catch (error) {
+    ctx.log('warn', 'hn-monitor.post-state-index-unavailable', { error: String(error) });
+  }
+
+  return {
+    saved: slackThreadRefs.length > 0 ? threadShardSaved : indexSaved,
+    threadShardSaved,
+    indexSaved
   };
-  await files.write(path, `${JSON.stringify(state, null, 2)}\n`);
-  return true;
 }
 
 function isPostRecord(value: unknown): value is PostRecord {
@@ -1476,15 +1545,22 @@ async function saveSeen(ctx: WorkforceCtx, ids: number[]): Promise<void> {
     scope: 'workspace'
   });
 }
-async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<void> {
+async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<boolean> {
+  let exactStateSaved = false;
   try {
-    if (await saveExactPost(ctx, record)) {
-      ctx.log('info', 'hn-monitor.post-state-saved', { stories: record.stories.length });
+    const result = await saveExactPost(ctx, record);
+    exactStateSaved = result.saved;
+    if (result.saved) {
+      ctx.log('info', 'hn-monitor.post-state-saved', {
+        stories: record.stories.length,
+        threadShardSaved: result.threadShardSaved,
+        indexSaved: result.indexSaved
+      });
     } else {
-      ctx.log('warn', 'hn-monitor.post-state-unavailable', { reason: 'Slack exact-state path unavailable' });
+      ctx.log('error', 'hn-monitor.post-state-unavailable', { reason: 'Slack exact-state path unavailable' });
     }
   } catch (error) {
-    ctx.log('warn', 'hn-monitor.post-state-unavailable', { error: String(error) });
+    ctx.log('error', 'hn-monitor.post-state-unavailable', { error: String(error) });
   }
 
   try {
@@ -1500,6 +1576,7 @@ async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<void> {
   } catch (error) {
     ctx.log('warn', 'hn-monitor.post-memory-unavailable', { error: String(error) });
   }
+  return exactStateSaved;
 }
 async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
   const items = await ctx.memory.recall('hn-monitor posted digest', {

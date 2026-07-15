@@ -195,6 +195,25 @@ test('selectQuestionStories resolves story numbers, HN ids, and title fragments 
   assert.equal(selectQuestionStories('details on https://news.ycombinator.com/item?id=502', posts)[0].id, 502);
 });
 
+test('selectQuestionStories normalizes common HN prefixes when the question omits them', () => {
+  const prefixes = ['Show HN', 'Ask HN', 'Tell HN', 'Launch HN'];
+  for (const [index, prefix] of prefixes.entries()) {
+    const story = {
+      id: 600 + index,
+      rank: 1,
+      title: `${prefix}: Best practices for agent runtime memory`,
+      url: `https://ex.com/${600 + index}`,
+      why: 'agent runtime',
+    };
+    const posts = [{ postedAt: '2026-07-14T10:00:00Z', digest: 'digest', stories: [story] }];
+    assert.equal(
+      selectQuestionStories('tell me about Best practices for agent runtime memory', posts)[0]?.id,
+      story.id,
+      `${prefix} should be optional in the question`,
+    );
+  }
+});
+
 // ── posting tests ─────────────────────────────────────────────────────────
 
 test('postFreshStories claims fresh ids before summarizing, then threads the digest under a header', async () => {
@@ -275,6 +294,61 @@ test('postFreshStories persists exact digest state and warns when semantic memor
   assert.ok(logs.some((entry) => entry.message === 'hn-monitor.post-state-saved'));
   assert.ok(logs.some((entry) => entry.level === 'warn' && entry.message === 'hn-monitor.post-memory-unavailable'));
   assert.equal(posts.length, 2, 'memory unavailability must not break Slack posting');
+});
+
+test('concurrent digest posts preserve authoritative per-thread state for both Slack threads', async () => {
+  const { ctx, files } = fakeCtx();
+  const first = { ...STORY, id: 6101, title: 'First concurrent agent runtime digest' };
+  const second = { ...STORY, id: 6102, title: 'Second concurrent agent runtime digest' };
+  const deliveryFor = (threadTs) => ({
+    targets: ['slack'],
+    async publish() { throw new Error('not simulated'); },
+    async send(_text, opts) {
+      return {
+        ok: true,
+        refs: [{ provider: 'slack', channel: 'C123', ts: opts?.replyTo ? '' : threadTs, draftRef: `ref-${threadTs}` }],
+      };
+    },
+  });
+
+  await Promise.all([
+    postFreshStories(ctx, deliveryFor('10.1'), [], [first]),
+    postFreshStories(ctx, deliveryFor('20.1'), [], [second]),
+  ]);
+
+  assert.ok(files.has('/slack/channels/C123/hn-monitor/digests/by-thread/10.1.json'));
+  assert.ok(files.has('/slack/channels/C123/hn-monitor/digests/by-thread/20.1.json'));
+
+  let selectedId;
+  const event = envelopeToAgentEvent({
+    id: 'evt-hn-concurrent-thread', workspace: 'ws-test', type: 'slack.app_mention', occurredAt: '2026-07-14T12:00:00Z',
+    resource: { channel: 'C123', ts: '10.2', thread_ts: '10.1', user: 'U1', text: '<@UBOT> tell me more about story 1' },
+  });
+  await handleQaMessage(ctx, event, 'slack', {
+    searchByTitle: async () => null,
+    fetchDetails: async (id) => {
+      selectedId = id;
+      return { id, title: first.title, url: first.url, hnUrl: `https://news.ycombinator.com/item?id=${id}`, points: 1, commentsCount: 0, topComments: [] };
+    },
+    complete: async () => 'Grounded concurrent-thread answer.',
+    slackReply: async () => {},
+  });
+  assert.equal(selectedId, first.id);
+});
+
+test('exact-state failure after Slack delivery rejects with an observable persistence error', async () => {
+  const { ctx, logs } = fakeCtx();
+  ctx.files.write = async () => { throw new Error('relayfile unavailable'); };
+  const posts = [];
+
+  await assert.rejects(
+    () => postFreshStories(ctx, fakeDelivery(posts), [], [STORY]),
+    /deterministic HN grounding state could not be persisted/,
+  );
+
+  assert.equal(posts.length, 2, 'the already-delivered Slack digest must not be posted again in-process');
+  assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.post-state-unavailable'));
+  assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.post-grounding-persistence-failed'));
 });
 
 test('postFreshStories releases claim when header publish fails', async () => {
@@ -749,6 +823,33 @@ test('handleQaMessage preserves exact-title grounding and both links when answer
   assert.doesNotMatch(replies[0], /don't have any recent posts/i);
 });
 
+test('handleQaMessage model fallback does not claim unrelated recalled stories are grounded', async () => {
+  const { ctx } = fakeCtx({ llm: { async complete() { throw new Error('model unavailable'); } } });
+  ctx.memory.recall = async () => [{
+    id: 'unrelated-post',
+    createdAt: '2026-07-14T10:00:00Z',
+    content: JSON.stringify({
+      postedAt: '2026-07-14T10:00:00Z',
+      digest: 'Memory digest',
+      stories: [{ id: 7001, rank: 1, title: 'Memory for coding agents', url: 'https://ex.com/7001', why: 'memory' }],
+    }),
+  }];
+  const event = envelopeToAgentEvent({
+    id: 'evt-hn-unresolved-model-fallback', workspace: 'ws-test', type: 'slack.app_mention', occurredAt: '2026-07-14T12:00:00Z',
+    resource: { channel: 'C123', ts: '30.2', thread_ts: '30.1', user: 'U1', text: '<@UBOT> tell me about the garden weather story' },
+  });
+  const replies = [];
+
+  await handleQaMessage(ctx, event, 'slack', {
+    searchByTitle: async () => null,
+    slackReply: async (_channel, _threadTs, text) => { replies.push(text); },
+  });
+
+  assert.match(replies[0], /couldn't resolve a single grounded HN story/i);
+  assert.doesNotMatch(replies[0], /Memory for coding agents/);
+  assert.doesNotMatch(replies[0], /I found the grounded HN story/i);
+});
+
 test('handleQaMessage does not let incomplete semantic memory resolve an exact-state ambiguity', async () => {
   const exactPosts = [{
     postedAt: '2026-07-14T10:00:00Z',
@@ -932,6 +1033,7 @@ test('handleQaMessage with no text logs and returns without answering', async ()
 
 test('retryPendingThreadBody retries threaded body using saved headerRefs', async () => {
   const saved = [];
+  const files = new Map();
   const ctx = {
     log() {},
     persona: {
@@ -964,6 +1066,13 @@ test('retryPendingThreadBody retries threaded body using saved headerRefs', asyn
         }
         return [];
       },
+    },
+    files: {
+      async read(path) {
+        if (!files.has(path)) throw new Error(`ENOENT: ${path}`);
+        return files.get(path);
+      },
+      async write(path, contents) { files.set(path, contents); },
     },
   };
 

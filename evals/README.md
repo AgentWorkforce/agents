@@ -103,8 +103,10 @@ team member (`competitor/market-competitor`), both work. `expect` keys:
 `status` (`succeeded` | `failed`), `errorIncludes` (substring of the thrown
 error, for guard cases), `eventSource`, `sideEffectsAll` (all must appear),
 `sideEffectsAny` (≥1), `logsAny` (≥1 listed log message), `logsAll` (every
-listed log message), and `replyContains` (machine-checked substrings in live
-replies; skipped in simulate mode where no model reply is produced).
+listed log message), `structuredLogsAll` (every `{message, attrs}` subset must
+match a captured structured log), and `replyContains` (machine-checked
+substrings in live replies; skipped in simulate mode where no model reply is
+produced).
 
 Artifacts land in `.evals/runs/<stamp>/{result.json,summary.md}` (gitignored).
 

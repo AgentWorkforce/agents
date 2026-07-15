@@ -1,0 +1,54 @@
+schemaVersion: 1
+id: hn-monitor.slack-follow-up
+agent: ../agent.ts
+kind: chat
+turns:
+  - type: cron.tick
+    name: scan
+    cron: 0 9,17 * * *
+  - type: slack.app_mention
+    channel: C123
+    ts: "200.2"
+    thread_ts: "200.1"
+    text: <@UBOT> tell me more about story 1 and what HN commenters think
+    user: U1
+inputs:
+  SLACK_CHANNEL: C123
+  LOOKBACK_HOURS: "24"
+  MAX_STORIES: "8"
+policy:
+  reads: fixtures
+  writes: preview
+  model: stub
+  shell: simulate
+  compose: preview
+http:
+  - method: GET
+    match: tags=front_page
+    file: ../fixtures/hn-front-page.json
+  - method: GET
+    match: tags=show_hn
+    file: ../fixtures/hn-show-hn.json
+  - method: GET
+    match: tags=story
+    file: ../fixtures/hn-new.json
+  - method: GET
+    match: /api/v1/items/1001
+    file: ../fixtures/hn-item-1001.json
+expect:
+  status: succeeded
+  eventSource: slack
+  logsContain:
+    - hn-monitor.qa.hydrated
+    - hn-monitor.qa.slack-replied
+  effectsContain:
+    - memory.save
+    - model.complete
+    - provider.write
+  providerActions:
+    - provider: slack
+      resource: messages
+      channel: C123
+      threaded: true
+      textContains:
+        - Agent

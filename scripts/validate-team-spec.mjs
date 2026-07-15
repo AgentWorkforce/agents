@@ -17,6 +17,12 @@
  * Returns an array of human-readable error strings; empty means valid.
  */
 
+// TODO: replace with import from '@agentworkforce/compose' once WS-F publishes.
+// Migration: import { TeamSpec } from '@agentworkforce/compose';
+//            import { validateTeamSpec } from '@agentworkforce/compose';
+// Then delete this mirrored implementation and keep the existing tests as the
+// checked-in team-spec consumer contract.
+
 const POSTGRES_INTEGER_MAX = 2_147_483_647;
 
 function isRecord(value) {

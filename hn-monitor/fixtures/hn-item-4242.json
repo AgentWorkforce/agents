@@ -1,0 +1,16 @@
+{
+  "id": 4242,
+  "title": "European Parliament MCP Server – Political Intelligence for AI Agents",
+  "url": "https://example.com/eu-parliament-mcp",
+  "points": 55,
+  "author": "eubuilder",
+  "children": [
+    {
+      "id": 5001,
+      "author": "hn-reader",
+      "points": 8,
+      "text": "The provenance model matters more than the chat interface.",
+      "children": []
+    }
+  ]
+}

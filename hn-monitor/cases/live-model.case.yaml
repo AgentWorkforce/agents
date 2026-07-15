@@ -1,0 +1,12 @@
+schemaVersion: 1
+id: hn-monitor.live-model
+agent: ../agent.ts
+kind: scheduled
+event:
+  schedule: scan
+policy:
+  reads: live
+  writes: preview
+  model: live
+expect:
+  status: succeeded

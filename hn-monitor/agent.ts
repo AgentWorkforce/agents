@@ -66,7 +66,37 @@ export interface PostRecord {
   postedAt: string;
   digest: string;
   stories: PostedStory[];
+  threadRefs?: Array<{
+    provider: 'slack' | 'telegram';
+    draftRef: string;
+    channel?: string;
+    chatId?: string;
+    threadTs?: string;
+  }>;
 }
+
+interface RecentDigestState {
+  kind: 'hn-monitor exact recent digests';
+  version: 1;
+  updatedAt: string;
+  posts: PostRecord[];
+}
+
+interface ExactPostSaveResult {
+  applicable: boolean;
+  saved: boolean;
+  threadShardSaved: boolean;
+  indexSaved: boolean;
+}
+
+class ExactPostPersistenceError extends Error {
+  constructor() {
+    super('Slack digest posted, but deterministic HN grounding state could not be persisted');
+    this.name = 'ExactPostPersistenceError';
+  }
+}
+
+type QaGroundingSource = 'exact_state' | 'memory' | 'thread_context' | 'algolia' | 'none';
 
 interface PendingThreadBody {
   kind?: 'hn-monitor pending thread body';
@@ -80,7 +110,7 @@ interface PendingThreadBody {
   /** Serialized DeliveryResult.refs from the header publish, for recovery.
    *  The `draftRef` field holds the relay path for Slack refs and the messageId
    *  for Telegram refs — see saveHeaderRefs() / rebuildHeaderRefs(). */
-  headerRefs: Array<{ provider: 'slack' | 'telegram'; draftRef: string; channel?: string; chatId?: string }>;
+  headerRefs: Array<{ provider: 'slack' | 'telegram'; draftRef: string; channel?: string; chatId?: string; threadTs?: string }>;
 }
 
 // ── message parsing ──────────────────────────────────────────────────────
@@ -234,6 +264,9 @@ export async function handleQaMessage(
   deps: {
     complete?: (prompt: string) => Promise<string>;
     fetchDetails?: (storyId: number) => Promise<HnStoryDetails | null>;
+    searchByTitle?: (question: string) => Promise<PostedStory | null>;
+    loadExactPosts?: (threadTs?: string) => Promise<PostRecord[]>;
+    loadThreadContext?: (expanded: unknown) => Promise<string>;
     slackReply?: (channel: string, threadTs: string, text: string) => Promise<unknown>;
     /** Inject a delivery client for testing (avoids real writeback). */
     delivery?: DeliveryClient;
@@ -276,18 +309,84 @@ export async function handleQaMessage(
 
   if (!question) return;
 
-  const posts = await loadPosts(ctx);
-  ctx.log('info', 'hn-monitor.qa.recalled', { posts: posts.length });
+  const [exactPosts, memoryPosts, threadContext] = await Promise.all([
+    (deps.loadExactPosts ?? ((threadTs?: string) => loadExactPosts(ctx, threadTs)))(
+      provider === 'slack' ? slackMessage?.threadTs ?? slackMessage?.ts : undefined
+    ).catch(() => []),
+    loadPosts(ctx).catch(() => []),
+    (deps.loadThreadContext ?? ((value: unknown) => loadSlackThreadContext(ctx, value)))(expanded).catch(() => '')
+  ]);
+  const posts = mergePosts(exactPosts, memoryPosts);
+  ctx.log('info', 'hn-monitor.qa.recalled', {
+    posts: posts.length,
+    exactPosts: exactPosts.length,
+    memoryPosts: memoryPosts.length,
+    threadContext: Boolean(threadContext)
+  });
 
-  const selectedStories = selectQuestionStories(question, posts).slice(0, 2);
+  let source: QaGroundingSource = 'none';
+  const ordinal = ordinalFromQuestion(question);
+  const threadPost = findThreadPost(posts, expanded, threadContext);
+  let selectedStories: PostedStory[] = [];
+  if (ordinal !== undefined) {
+    const safeOrdinalPost = threadPost ?? (posts.length === 1 ? posts[0] : undefined);
+    if (safeOrdinalPost) {
+      selectedStories = selectQuestionStories(question, [safeOrdinalPost]).slice(0, 2);
+      if (selectedStories.length > 0) {
+        source = postGroupContains(exactPosts, safeOrdinalPost) ? 'exact_state' : 'memory';
+      }
+    }
+  } else {
+    if (threadPost) {
+      selectedStories = selectQuestionStories(`${question}\n${threadContext}`, [threadPost]).slice(0, 2);
+      if (selectedStories.length > 0) {
+        source = 'thread_context';
+      }
+    }
+    if (selectedStories.length === 0) selectedStories = selectQuestionStories(question, exactPosts).slice(0, 2);
+    if (selectedStories.length > 0) {
+      if (source === 'none') source = 'exact_state';
+    } else if (exactPosts.length === 0) {
+      selectedStories = selectQuestionStories(question, memoryPosts).slice(0, 2);
+      if (selectedStories.length > 0) source = 'memory';
+    }
+  }
+  if (selectedStories.length === 0 && threadContext && ordinal === undefined) {
+    selectedStories = selectQuestionStories(`${question}\n${threadContext}`, posts).slice(0, 2);
+    if (selectedStories.length > 0) source = 'thread_context';
+  }
+  if (selectedStories.length === 0) {
+    const lookup = await (deps.searchByTitle ?? findStoryByExactTitle)(question).catch(() => null);
+    if (lookup) {
+      selectedStories = [lookup];
+      source = 'algolia';
+    }
+  }
+  ctx.log('info', 'hn-monitor.qa.selected', {
+    source,
+    selected: selectedStories.map((story) => ({ id: story.id, title: story.title }))
+  });
+
   const detailsLoader = deps.fetchDetails ?? fetchStoryDetails;
   const details = (
     await Promise.all(selectedStories.map((story) => detailsLoader(story.id).catch(() => null)))
   ).filter((item): item is HnStoryDetails => item !== null);
-  ctx.log('info', 'hn-monitor.qa.hydrated', { selected: selectedStories.map((story) => story.id), hydrated: details.length });
+  ctx.log('info', 'hn-monitor.qa.hydrated', {
+    source,
+    selected: selectedStories.map((story) => story.id),
+    hydrated: details.length
+  });
 
-  const context = posts.length
-    ? posts.slice(0, 12).map((p) => `### Posted ${p.postedAt ?? 'Unknown'}\n${p.digest ?? ''}`).join('\n\n')
+  const lookupPost: PostRecord[] = source === 'algolia' && selectedStories[0]
+    ? [{
+        postedAt: new Date().toISOString(),
+        digest: `Live exact-title HN lookup: ${selectedStories[0].title}\nArticle: ${selectedStories[0].url}\nHN discussion: ${selectedStories[0].hnUrl}`,
+        stories: selectedStories
+      }]
+    : [];
+  const groundingPosts = mergePosts(lookupPost, posts);
+  const context = groundingPosts.length
+    ? groundingPosts.slice(0, 12).map((p) => `### Posted ${p.postedAt ?? 'Unknown'}\n${p.digest ?? ''}`).join('\n\n')
     : 'No Hacker News digests have been posted yet.';
 
   const liveContext = details.length
@@ -297,6 +396,10 @@ export async function handleQaMessage(
   const prompt = [
     "You are the conversational Hacker News radar for an engineering team building agent infrastructure.",
     'Answer using ONLY the recently posted digests and live HN details below.',
+    `The selected story grounding source is ${source}.`,
+    source === 'algolia'
+      ? 'Say briefly that you matched the supplied title with a live HN title lookup; do not imply it came from recalled digest memory.'
+      : '',
     'When live comments are provided, describe them as HN community reactions, not as verified facts.',
     'If the evidence does not cover the question or the referenced story is ambiguous, say so and ask for the story number/title.',
     'Be concise, specific, and include the article and HN discussion links when they help.',
@@ -308,6 +411,9 @@ export async function handleQaMessage(
     '## Live HN story details and top comments',
     liveContext,
     '',
+    '## Slack thread parent context (may be empty)',
+    threadContext || '(No thread parent text was available.)',
+    '',
     '## User question',
     question
   ].join('\n');
@@ -318,13 +424,17 @@ export async function handleQaMessage(
     answer = await withTimeout(complete(prompt), 45_000, 'ctx.llm.complete');
   } catch (error) {
     ctx.log('warn', 'hn-monitor.qa.llm-fallback', { error: String(error) });
-    const titles = posts
-      .flatMap((p) => (p.stories ?? []).map((s) => `- ${s.title ?? 'Untitled'} ${s.url ?? ''}`))
+    const titles = dedupePostedStories(selectedStories)
       .slice(0, 15)
+      .map((story) => [
+        `- ${story.title ?? 'Untitled'}`,
+        `  Article: ${story.url ?? story.hnUrl ?? ''}`,
+        `  HN discussion: ${story.hnUrl ?? `https://news.ycombinator.com/item?id=${story.id}`}`
+      ].join('\n'))
       .join('\n');
     answer = titles
-      ? `I couldn't generate an answer right now; here are the recent post titles:\n${titles}`
-      : "I couldn't generate an answer right now, and I don't have any recent posts to show.";
+      ? `I found the grounded HN story, but couldn't generate the full answer right now:\n${titles}`
+      : "I couldn't generate an answer right now, and I couldn't resolve a single grounded HN story from that question. Please specify the story number or exact title.";
   }
 
   const reply = answer.trim() || 'No answer available.';
@@ -404,14 +514,19 @@ export async function postFreshStories(
     const { header, body, stories } = await summarize(ctx, fresh);
     ctx.log('info', 'hn-monitor.posting', { targets: delivery.targets });
 
-    // Publish the header non-blocking: returns draft refs immediately
-    // (zero receipt round-trips). The cloud orders threaded messages under
-    // the header server-side via parentRef — the x-reply-radar pattern.
-    const heads = await delivery.publish(header);
-    if (heads.refs.length === 0 || heads.refs.length < delivery.targets.length) {
+    // Wait for the header receipt so its delivered Slack thread timestamp can
+    // be persisted for deterministic ordinal Q&A in older digest threads. The
+    // much larger body remains non-blocking and uses the returned draft ref.
+    const heads = ctx.sandbox?.cwd === '/simulated'
+      ? await delivery.publish(header)
+      : await delivery.send(header);
+    if (heads.refs.length === 0) {
       throw new Error(`Header publish failed across all targets`);
     }
     headerPosted = true;
+    if (heads.refs.length < delivery.targets.length) {
+      throw new Error(`Header published on only ${heads.refs.length}/${delivery.targets.length} targets`);
+    }
     ctx.log('info', 'hn-monitor.header-published', { refs: heads.refs.length });
 
     // Build pending state BEFORE sending the body, so even if delivery.send()
@@ -438,11 +553,13 @@ export async function postFreshStories(
     ctx.log('info', 'hn-monitor.posted', { targets: delivery.targets.join(',') });
 
     // Retain the digest for Q&A recall (~30 day rolling window via memory ttl).
-    await savePost(ctx, {
+    const exactStateSaved = await savePost(ctx, {
       postedAt: new Date().toISOString(),
       digest: `${header}\n${body}`,
-      stories
+      stories,
+      threadRefs: saveHeaderRefs(heads)
     });
+    if (!exactStateSaved) throw new ExactPostPersistenceError();
   } catch (err) {
     if (!headerPosted) {
       // Nothing landed yet — release the provisional claim so the next tick
@@ -453,6 +570,10 @@ export async function postFreshStories(
     if (pending) {
       await savePendingThreadBody(ctx, pending)
         .catch((error) => ctx.log('error', 'hn-monitor.pending-save-failed', { error: String(error) }));
+    }
+    if (err instanceof ExactPostPersistenceError) {
+      ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { error: err.message });
+      throw err;
     }
     // The header already posted; releasing + rethrowing would duplicate it on
     // the runtime's retry. Keep the claim and let the next scan retry the body.
@@ -473,7 +594,8 @@ function saveHeaderRefs(result: DeliveryResult): PendingThreadBody['headerRefs']
       // store the messageId in draftRef so recovery can reconstruct threading.
       draftRef: 'draftRef' in r ? r.draftRef : r.messageId,
       channel: r.provider === 'slack' ? r.channel : undefined,
-      chatId: r.provider === 'telegram' ? r.chatId : undefined
+      chatId: r.provider === 'telegram' ? r.chatId : undefined,
+      threadTs: r.provider === 'slack' ? r.ts : undefined
     }));
 }
 
@@ -512,11 +634,16 @@ export async function retryPendingThreadBody(
     return true;
   }
 
-  await savePost(ctx, {
+  const exactStateSaved = await savePost(ctx, {
     postedAt: new Date().toISOString(),
     digest: `${pending.header}\n${pending.body}`,
-    stories: pending.stories
+    stories: pending.stories,
+    threadRefs: pending.headerRefs
   });
+  if (!exactStateSaved) {
+    ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true });
+    throw new ExactPostPersistenceError();
+  }
   await clearPendingThreadBody(ctx);
   ctx.log('info', 'hn-monitor.pending-body-posted', { targets: configuredTargets });
   return true;
@@ -539,7 +666,7 @@ function rebuildHeaderRefs(
     return {
       provider: 'slack' as const,
       channel: r.channel ?? '',
-      ts: '',
+      ts: r.threadTs ?? '',
       draftRef: r.draftRef
     };
   });
@@ -919,6 +1046,107 @@ export async function fetchStoryDetails(storyId: number): Promise<HnStoryDetails
   }
 }
 
+/**
+ * Strict live fallback for questions that contain a complete (or nearly
+ * complete) HN story title. This is deliberately conservative: a loose
+ * keyword hit is not enough to ground an answer.
+ */
+export async function findStoryByExactTitle(question: string): Promise<PostedStory | null> {
+  const searchTitle = titleCandidateFromQuestion(question);
+  const normalizedCandidate = normalizeTitle(searchTitle);
+  if (normalizedCandidate.length < 16 || meaningfulTokens(searchTitle).size < 3) return null;
+
+  const url = new URL('https://hn.algolia.com/api/v1/search');
+  url.searchParams.set('query', searchTitle);
+  url.searchParams.set('tags', 'story');
+  url.searchParams.set('hitsPerPage', '20');
+  url.searchParams.set('restrictSearchableAttributes', 'title');
+  const res = await fetchWithTimeout(url.toString(), {}, 8_000);
+  if (!res?.ok) return null;
+
+  let hits: HnHit[];
+  try {
+    const body = (await res.json()) as { hits?: unknown };
+    hits = Array.isArray(body.hits) ? body.hits as HnHit[] : [];
+  } catch {
+    return null;
+  }
+
+  const ranked = hits.flatMap((hit) => {
+    const id = Number(hit.objectID);
+    const title = hit.title?.trim();
+    if (!Number.isSafeInteger(id) || id <= 0 || !title) return [];
+    const score = exactTitleMatchScore(normalizedCandidate, normalizeTitle(title));
+    return score > 0 ? [{ hit, id, title, score }] : [];
+  }).sort((a, b) => b.score - a.score || (b.hit.points ?? 0) - (a.hit.points ?? 0));
+
+  const best = ranked[0];
+  if (!best || best.score < 0.9) return null;
+  const runnerUp = ranked[1];
+  if (runnerUp && (
+    (best.score === 1 && runnerUp.score === 1) ||
+    (best.score < 1 && best.score - runnerUp.score < 0.08)
+  )) return null;
+
+  const hnUrl = `https://news.ycombinator.com/item?id=${best.id}`;
+  const articleUrl = best.hit.url?.trim() || hnUrl;
+  return {
+    id: best.id,
+    rank: 1,
+    title: best.title,
+    url: articleUrl,
+    hnUrl,
+    points: nonNegativeInt(best.hit.points),
+    comments: nonNegativeInt(best.hit.num_comments),
+    author: best.hit.author?.trim() || undefined,
+    createdAt: best.hit.created_at?.trim() || undefined,
+    domain: safeDomain(articleUrl),
+    category: 'Live HN title lookup',
+    why: 'Matched conservatively from the complete story title supplied in the question.'
+  };
+}
+
+function titleCandidateFromQuestion(question: string): string {
+  const withoutMentions = question.replace(/<@[A-Z0-9]+(?:\|[^>]+)?>/giu, ' ');
+  const segments = withoutMentions
+    .split(/\s*(?:->|→|\n)\s*/gu)
+    .map((part) => oneLine(part).replace(/^["'“”]+|["'“”]+$/gu, '').trim())
+    .filter(Boolean);
+  const nonRequest = segments.filter((part) => !/^(?:give|tell|show|explain|summari[sz]e|what|why|how|can|could|please)\b/iu.test(part));
+  return (nonRequest.sort((a, b) => b.length - a.length)[0] ?? segments[0] ?? oneLine(withoutMentions)).slice(0, 300);
+}
+
+function normalizeTitle(value: string): string {
+  return value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/gu, '')
+    .toLowerCase()
+    .replace(/\b(?:show|ask|tell|launch)\s+hn\s*:\s*/gu, '')
+    .replace(/[^a-z0-9+]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+function exactTitleMatchScore(candidate: string, title: string): number {
+  if (!candidate || !title) return 0;
+  if (candidate === title) return 1;
+  if (
+    candidate.startsWith(`${title} `) ||
+    candidate.endsWith(` ${title}`) ||
+    candidate.includes(` ${title} `)
+  ) {
+    const containmentRatio = title.length / candidate.length;
+    if (containmentRatio >= 0.9) return 0.95 + containmentRatio * 0.04;
+  }
+  const candidateTokens = new Set(candidate.split(' ').filter(Boolean));
+  const titleTokens = title.split(' ').filter(Boolean);
+  if (titleTokens.length < 3) return 0;
+  const overlap = titleTokens.filter((token) => candidateTokens.has(token)).length;
+  const coverage = overlap / titleTokens.length;
+  const lengthRatio = Math.min(candidate.length, title.length) / Math.max(candidate.length, title.length);
+  return coverage >= 0.9 && lengthRatio >= 0.72 ? coverage * 0.8 + lengthRatio * 0.2 : 0;
+}
+
 export function selectQuestionStories(question: string, posts: PostRecord[]): PostedStory[] {
   const recent = dedupePostedStories(posts.flatMap((post) => post.stories ?? [])).slice(0, 60);
   if (recent.length === 0) return [];
@@ -932,15 +1160,27 @@ export function selectQuestionStories(question: string, posts: PostRecord[]): Po
   const ordinal = ordinalFromQuestion(question);
   if (ordinal !== undefined && latest[ordinal - 1]) return [latest[ordinal - 1]];
 
+  const normalizedQuestion = normalizeTitle(question);
+  const embedded = recent.filter((story) => normalizedQuestion.includes(normalizeTitle(story.title)));
+  if (embedded.length === 1) return embedded;
+
   const queryTokens = meaningfulTokens(question);
   const scored = recent
-    .map((story) => ({ story, score: [...meaningfulTokens(story.title)].filter((token) => queryTokens.has(token)).length }))
+    .map((story) => {
+      const shared = [...meaningfulTokens(story.title)].filter((token) => queryTokens.has(token));
+      return { story, score: shared.length, distinctive: shared.some((token) => token.length >= 5) };
+    })
     .filter(({ score }) => score > 0)
     .sort((a, b) => b.score - a.score || a.story.rank - b.story.rank);
-  if (scored.length > 0) return scored.slice(0, 2).map(({ story }) => story);
+  if (scored.length > 0) {
+    const top = scored[0]!;
+    const tied = scored.filter((item) => item.score === top.score);
+    if (tied.length > 1) return [];
+    if (top.score >= 2 || top.distinctive) return [top.story];
+  }
 
   if (/\b(?:first|top|#1)\b/iu.test(question) && latest[0]) return [latest[0]];
-  if (/\b(?:more|detail|comments?|discussion|reaction)\b/iu.test(question) && latest.length === 1) return [latest[0]];
+  if (/\b(?:more|detail|comments?|discussion|reaction)\b/iu.test(question) && recent.length === 1) return [recent[0]];
   return [];
 }
 
@@ -1055,6 +1295,236 @@ function slackLink(url: string, label: string): string {
 
 // ── memory helpers ───────────────────────────────────────────────────────
 
+function exactDigestStatePath(ctx: WorkforceCtx): string | null {
+  const channel = input(ctx, 'SLACK_CHANNEL')?.trim();
+  if (!channel) return null;
+  return `/slack/channels/${encodeURIComponent(channel)}/hn-monitor/recent-digests.json`;
+}
+
+function exactDigestThreadPath(ctx: WorkforceCtx, threadTs: string): string | null {
+  const channel = input(ctx, 'SLACK_CHANNEL')?.trim();
+  if (!channel || !threadTs.trim()) return null;
+  return `/slack/channels/${encodeURIComponent(channel)}/hn-monitor/digests/by-thread/${encodeURIComponent(threadTs)}.json`;
+}
+
+async function readExactPost(ctx: WorkforceCtx, path: string): Promise<PostRecord | null> {
+  try {
+    const parsed = JSON.parse(await ctx.files.read(path)) as unknown;
+    return isPostRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadExactPosts(ctx: WorkforceCtx, threadTs?: string): Promise<PostRecord[]> {
+  const path = exactDigestStatePath(ctx);
+  if (!path) return [];
+  const files = ctx.files;
+  if (!files) return [];
+  const threadPath = threadTs ? exactDigestThreadPath(ctx, threadTs) : null;
+  const threadPost = threadPath ? await readExactPost(ctx, threadPath) : null;
+  try {
+    const state = JSON.parse(await files.read(path)) as Partial<RecentDigestState>;
+    const indexed = state.kind === 'hn-monitor exact recent digests' && state.version === 1 && Array.isArray(state.posts)
+      ? state.posts.filter(isPostRecord)
+      : [];
+    return mergePosts(threadPost ? [threadPost] : [], indexed).slice(0, 12);
+  } catch {
+    return threadPost ? [threadPost] : [];
+  }
+}
+
+async function saveExactPost(ctx: WorkforceCtx, record: PostRecord): Promise<ExactPostSaveResult> {
+  const path = exactDigestStatePath(ctx);
+  if (!path) return { applicable: false, saved: true, threadShardSaved: false, indexSaved: false };
+  if (!ctx.files) return { applicable: true, saved: false, threadShardSaved: false, indexSaved: false };
+
+  // The per-thread shard is authoritative for Slack follow-ups. Concurrent
+  // digests have distinct delivered thread timestamps, so they write distinct
+  // paths and cannot erase one another. The rolling file below is only a
+  // convenience index for generic/non-thread questions.
+  const slackThreadRefs = (record.threadRefs ?? []).filter((ref) =>
+    ref.provider === 'slack' && Boolean(ref.threadTs) && (!ref.channel || ref.channel === input(ctx, 'SLACK_CHANNEL')?.trim())
+  );
+  let threadShardSaved = slackThreadRefs.length === 0;
+  for (const ref of slackThreadRefs) {
+    const threadPath = exactDigestThreadPath(ctx, ref.threadTs ?? '');
+    if (!threadPath) continue;
+    try {
+      await ctx.files.write(threadPath, `${JSON.stringify(record, null, 2)}\n`);
+      threadShardSaved = true;
+    } catch (error) {
+      ctx.log('warn', 'hn-monitor.post-state-shard-unavailable', { error: String(error) });
+    }
+  }
+
+  let indexSaved = false;
+  try {
+    const posts = mergePosts([record], await loadExactPosts(ctx)).slice(0, 12);
+    const state: RecentDigestState = {
+      kind: 'hn-monitor exact recent digests',
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      posts
+    };
+    await ctx.files.write(path, `${JSON.stringify(state, null, 2)}\n`);
+    indexSaved = true;
+  } catch (error) {
+    ctx.log('warn', 'hn-monitor.post-state-index-unavailable', { error: String(error) });
+  }
+
+  return {
+    applicable: true,
+    saved: slackThreadRefs.length > 0 ? threadShardSaved : indexSaved,
+    threadShardSaved,
+    indexSaved
+  };
+}
+
+function isPostRecord(value: unknown): value is PostRecord {
+  const record = asRecord(value);
+  return Boolean(
+    record &&
+    typeof record.postedAt === 'string' &&
+    typeof record.digest === 'string' &&
+    Array.isArray(record.stories)
+  );
+}
+
+function mergePosts(...groups: PostRecord[][]): PostRecord[] {
+  const seen = new Set<string>();
+  return groups
+    .flat()
+    .filter(isPostRecord)
+    .sort((a, b) => b.postedAt.localeCompare(a.postedAt))
+    .filter((post) => {
+      const key = postKey(post);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function postKey(post: PostRecord): string {
+  return `${post.postedAt}|${post.stories.map((story) => story.id).join(',')}`;
+}
+
+function postGroupContains(posts: PostRecord[], candidate: PostRecord): boolean {
+  const key = postKey(candidate);
+  return posts.some((post) => postKey(post) === key);
+}
+
+function findThreadPost(posts: PostRecord[], expanded: unknown, threadContext: string): PostRecord | undefined {
+  const root = asRecord(expanded);
+  const data = asRecord(root?.data) ?? root;
+  const message = asRecord(data?.message) ?? asRecord(data?.event);
+  const referenceValues = [
+    data?.parentRef,
+    data?.parent_ref,
+    data?.threadRef,
+    data?.thread_ref,
+    message?.parentRef,
+    message?.parent_ref,
+    message?.threadRef,
+    message?.thread_ref
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  const byRef = posts.filter((post) => post.threadRefs?.some((ref) => referenceValues.includes(ref.draftRef)));
+  if (byRef.length === 1) return byRef[0];
+
+  const inboundChannel = str(data?.channel) ?? str(message?.channel);
+  const inboundThreadTs = str(data?.thread_ts) ?? str(data?.threadTs) ?? str(message?.thread_ts) ?? str(message?.threadTs);
+  const byTimestamp = posts.filter((post) => post.threadRefs?.some((ref) =>
+    ref.provider === 'slack' &&
+    Boolean(ref.threadTs) &&
+    ref.threadTs === inboundThreadTs &&
+    (!ref.channel || !inboundChannel || ref.channel === inboundChannel)
+  ));
+  if (byTimestamp.length === 1) return byTimestamp[0];
+
+  const normalizedContext = normalizeTitle(threadContext);
+  if (!normalizedContext) return undefined;
+  const byTitle = posts.filter((post) => post.stories.some((story) => {
+    const title = normalizeTitle(story.title);
+    return title.length >= 12 && normalizedContext.includes(title);
+  }));
+  return byTitle.length === 1 ? byTitle[0] : undefined;
+}
+
+async function loadSlackThreadContext(ctx: WorkforceCtx, expanded: unknown): Promise<string> {
+  const inline = inlineSlackThreadParentText(expanded);
+  if (inline) {
+    ctx.log('info', 'hn-monitor.qa.thread-context', { source: 'event', available: true });
+    return truncate(inline, 8_000);
+  }
+
+  const root = asRecord(expanded);
+  const path = str(root?.path);
+  const match = path?.match(/^(\/slack\/channels\/[^/]+\/threads\/[^/]+)\/replies\/[^/]+\/meta\.json$/u);
+  const channelRoot = path?.match(/^(\/slack\/channels\/[^/]+)\/(?:messages|threads)\//u)?.[1];
+  const files = (ctx as WorkforceCtx & { files?: WorkforceCtx['files'] }).files;
+  const data = asRecord(root?.data);
+  const channel = str(data?.channel);
+  const threadTs = str(data?.thread_ts) ?? str(data?.threadTs);
+  const mountedParentPath = channelRoot && threadTs
+    ? `${channelRoot}/messages/${slackTimestampPathToken(threadTs)}/meta.json`
+    : null;
+  const bareParentPath = channel && threadTs
+    ? `/slack/channels/${encodeURIComponent(channel)}/messages/${slackTimestampPathToken(threadTs)}/meta.json`
+    : null;
+  const parentPaths = [match?.[1] ? `${match[1]}/meta.json` : null, mountedParentPath, bareParentPath]
+    .filter((candidate): candidate is string => Boolean(candidate));
+  if (files) {
+    for (const parentPath of parentPaths) {
+      try {
+        const parent = JSON.parse(await files.read(parentPath)) as unknown;
+        const text = textFromSlackRecord(parent);
+        if (text) {
+          ctx.log('info', 'hn-monitor.qa.thread-context', { source: 'relayfile', available: true });
+          return truncate(text, 8_000);
+        }
+      } catch {
+        // Try the next compatible Slack layout.
+      }
+    }
+  }
+  ctx.log('info', 'hn-monitor.qa.thread-context', { source: 'none', available: false });
+  return '';
+}
+
+function slackTimestampPathToken(value: string): string {
+  return value.replace(/\./gu, '_').replace(/[^A-Za-z0-9_-]/gu, '');
+}
+
+function inlineSlackThreadParentText(expanded: unknown): string {
+  const root = asRecord(expanded);
+  const data = asRecord(root?.data) ?? root;
+  const message = asRecord(data?.message) ?? asRecord(data?.event);
+  const candidates = [
+    data?.thread_parent,
+    data?.threadParent,
+    data?.parent_message,
+    data?.parentMessage,
+    data?.parent,
+    message?.thread_parent,
+    message?.threadParent,
+    message?.parent_message,
+    message?.parentMessage,
+    message?.parent
+  ];
+  for (const candidate of candidates) {
+    const text = textFromSlackRecord(candidate);
+    if (text) return text;
+  }
+  return str(data?.thread_parent_text) ?? str(data?.parent_text) ?? '';
+}
+
+function textFromSlackRecord(value: unknown): string {
+  if (typeof value === 'string') return oneLine(value);
+  const record = asRecord(value);
+  if (!record) return '';
+  return oneLine(str(record.text) ?? str(record.body) ?? str(record.digest) ?? '');
+}
+
 async function loadSeen(ctx: WorkforceCtx): Promise<number[]> {
   const items = await ctx.memory.recall('hn-monitor seen story ids already posted', {
     tags: ['hn-monitor:seen'],
@@ -1078,11 +1548,40 @@ async function saveSeen(ctx: WorkforceCtx, ids: number[]): Promise<void> {
     scope: 'workspace'
   });
 }
-async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<void> {
-  await ctx.memory.save(JSON.stringify({ kind: 'hn-monitor posted digest', ...record }), {
-    tags: ['hn-monitor:post'],
-    scope: 'workspace'
-  });
+async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<boolean> {
+  let exactStateSaved = false;
+  try {
+    const result = await saveExactPost(ctx, record);
+    exactStateSaved = result.saved;
+    if (!result.applicable) {
+      ctx.log('info', 'hn-monitor.post-state-not-applicable', { reason: 'Slack is not configured' });
+    } else if (result.saved) {
+      ctx.log('info', 'hn-monitor.post-state-saved', {
+        stories: record.stories.length,
+        threadShardSaved: result.threadShardSaved,
+        indexSaved: result.indexSaved
+      });
+    } else {
+      ctx.log('error', 'hn-monitor.post-state-unavailable', { reason: 'Slack exact-state path unavailable' });
+    }
+  } catch (error) {
+    ctx.log('error', 'hn-monitor.post-state-unavailable', { error: String(error) });
+  }
+
+  try {
+    const receipt = await ctx.memory.save(JSON.stringify({ kind: 'hn-monitor posted digest', ...record }), {
+      tags: ['hn-monitor:post'],
+      scope: 'workspace'
+    });
+    if (receipt?.id) {
+      ctx.log('info', 'hn-monitor.post-memory-saved', { memoryId: receipt.id });
+    } else {
+      ctx.log('warn', 'hn-monitor.post-memory-unavailable', { reason: 'memory save returned no receipt' });
+    }
+  } catch (error) {
+    ctx.log('warn', 'hn-monitor.post-memory-unavailable', { error: String(error) });
+  }
+  return exactStateSaved;
 }
 async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
   const items = await ctx.memory.recall('hn-monitor posted digest', {
@@ -1093,7 +1592,8 @@ async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
   const posts: PostRecord[] = [];
   for (const item of items) {
     try {
-      posts.push(JSON.parse(item.content) as PostRecord);
+      const parsed = JSON.parse(item.content) as unknown;
+      if (isPostRecord(parsed)) posts.push(parsed);
     } catch {
       // skip malformed records
     }

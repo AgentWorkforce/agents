@@ -184,7 +184,7 @@ function withCaseEnv(persona, inputs, extraEnv, fn) {
 }
 
 // ── deterministic checks shared by both executors ─────────────────────────────
-function checkExpectations(testCase, { status, eventSource, sideEffectKinds, logs, error, reply }) {
+function checkExpectations(testCase, { status, eventSource, sideEffectKinds, logs, logEvents = [], error, reply }, { live = false } = {}) {
   const e = testCase.expect ?? {};
   const checks = [];
   const add = (name, pass, detail) => checks.push({ name, pass, detail });
@@ -197,6 +197,23 @@ function checkExpectations(testCase, { status, eventSource, sideEffectKinds, log
   // `inbox-buddy.context channel=… threadsLoaded=…`), so match a prefix/substring
   // rather than the whole line. Exact messages still match.
   if (e.logsAny) add(`log any [${e.logsAny}]`, e.logsAny.some((m) => logs.some((l) => l.includes(m))), logs.join(','));
+  if (e.logsAll) {
+    const missing = e.logsAll.filter((m) => !logs.some((l) => l.includes(m)));
+    add(`logs all [${e.logsAll}]`, missing.length === 0, missing.length ? `missing: ${missing.join(',')}` : 'ok');
+  }
+  if (e.structuredLogsAll) {
+    const missing = e.structuredLogsAll.filter((expected) => !logEvents.some((actual) => {
+      if (actual.message !== expected.message) return false;
+      return Object.entries(expected.attrs ?? {}).every(([key, value]) =>
+        JSON.stringify(actual.attrs?.[key]) === JSON.stringify(value)
+      );
+    }));
+    add(
+      `structured logs all [${e.structuredLogsAll.map((entry) => entry.message)}]`,
+      missing.length === 0,
+      missing.length ? `missing: ${JSON.stringify(missing)}` : 'ok'
+    );
+  }
   // Machine-checked grounding: assert the reply text actually contains the
   // required facts (case-insensitive substrings), so a hallucinated reply fails
   // without needing the LLM judge. Only enforced when a real reply was produced
@@ -206,6 +223,8 @@ function checkExpectations(testCase, { status, eventSource, sideEffectKinds, log
     if (have) {
       const missing = e.replyContains.filter((s) => !have.toLowerCase().includes(String(s).toLowerCase()));
       add(`reply ⊇ [${e.replyContains}]`, missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : 'ok');
+    } else if (live) {
+      add(`reply ⊇ [${e.replyContains}]`, false, 'live run produced no reply');
     }
   }
   return checks;
@@ -253,6 +272,7 @@ async function runSimulate(testCase) {
       eventSource: last.trigger?.eventSource ?? runs[0]?.trigger?.eventSource ?? null,
       sideEffectKinds: sims.flatMap((s) => s.sideEffects.map((e) => e.kind)),
       logs: sims.flatMap((s) => s.capturedLogs.map((l) => l.message)),
+      logEvents: sims.flatMap((s) => s.capturedLogs),
       error: runs.find((r) => r.error)?.error ?? null,
       reply: null,
     };
@@ -394,6 +414,7 @@ async function runLive(testCase) {
     eventSource,
     sideEffectKinds: sink.sideEffects.map((s) => s.kind),
     logs: sink.logs.map((l) => l.message),
+    logEvents: sink.logs,
     error,
     reply,
   };
@@ -446,7 +467,7 @@ async function main() {
     } catch (err) {
       outcome = { status: 'failed', eventSource: null, sideEffectKinds: [], logs: [], error: err instanceof Error ? err.message : String(err), reply: null };
     }
-    const checks = checkExpectations(testCase, outcome);
+    const checks = checkExpectations(testCase, outcome, { live: args.live });
     // Judge only chat cases: there the model reply IS the user-facing deliverable
     // the rubric describes. For scheduled/triage/capture the "reply" is internal
     // JSON the handler post-processes, so its routing/side-effect checks are the

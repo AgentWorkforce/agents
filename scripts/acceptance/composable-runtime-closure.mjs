@@ -124,9 +124,15 @@ await runGate(
   'hn-schedule-preview',
   `${formatCommand([
     'invoke',
-    './scripts/acceptance/fixtures/zero-child-persona.ts',
+    './hn-monitor/agent.ts',
     '--schedule',
     'scan',
+    '--reads',
+    'fixtures',
+    '--model',
+    'stub',
+    '--input',
+    'SLACK_CHANNEL=C123',
     '--output',
     '<run-record>',
   ])}`,
@@ -135,9 +141,15 @@ await runGate(
     const result = runAgentworkforce(
       [
         'invoke',
-        './scripts/acceptance/fixtures/zero-child-persona.ts',
+        './hn-monitor/agent.ts',
         '--schedule',
         'scan',
+        '--reads',
+        'fixtures',
+        '--model',
+        'stub',
+        '--input',
+        'SLACK_CHANNEL=C123',
         '--output',
         runRecordPath,
       ],
@@ -150,7 +162,7 @@ await runGate(
       exitCode: result.status === 0 && readJson(runRecordPath).eventContract === 'cron.tick@1' ? 0 : 1,
       summary:
         result.status === 0
-          ? 'Direct --schedule selector succeeded deterministically with a cron RunRecord and no live network dependency.'
+          ? 'Direct HN --schedule selector succeeded deterministically with fixture reads, stub model, and a cron RunRecord.'
           : 'Direct --schedule selector failed.',
       artifactRefs: artifacts,
     };
@@ -465,6 +477,7 @@ await runGate(
       'packages/web/lib/integrations/nango-webhook-route-handler.test.ts',
       'packages/web/lib/integrations/nango-webhook-router-github-forward.test.ts',
       'packages/web/lib/integrations/nango-webhook-router-slack-relayfile-routing.test.ts',
+      'packages/router/test/webhook-routing.test.ts',
       'packages/web/app/api/v1/workspaces/[workspaceId]/events/routes.test.ts',
       'tests/hookdeck-webhook-route.test.ts',
       'packages/web/app/api/v1/webhooks/composio/route.test.ts',
@@ -525,7 +538,7 @@ await runGate(
 await runGate(
   'cloud-replay-bundle-consumption',
   [
-    'node --import tsx scripts/acceptance/generate-cloud-replay-bundle.mjs <bundle>',
+    'npm run composable-runtime:replay-bundle:fixture -- --out <bundle>',
     formatCommand([
       'invoke',
       './scripts/acceptance/fixtures/replay-bundle-persona.ts',
@@ -539,20 +552,14 @@ await runGate(
     const bundlePath = resolve(artifactFilesRoot, 'cloud-replay-bundle.json');
     const generate = runShell(
       [
-        'node',
-        '--import',
-        './node_modules/tsx/dist/loader.mjs',
-        resolve(taskRoot, 'scripts/acceptance/generate-cloud-replay-bundle.mjs'),
+        'npm',
+        'run',
+        'composable-runtime:replay-bundle:fixture',
+        '--',
+        '--out',
         bundlePath,
       ],
-      {
-        cwd: cloudRoot,
-        env: {
-          ...baseAgentworkforceEnv(),
-          CLOUD_WORKTREE_ROOT: cloudRoot,
-          TSX_TSCONFIG_PATH: 'tsconfig.json',
-        },
-      },
+      { cwd: cloudRoot },
     );
     const bundleArtifact = writeArtifact('cloud-replay-bundle.generate.txt', `${generate.stdout}\n${generate.stderr}`.trim() + '\n');
     if (generate.status !== 0) {
@@ -569,10 +576,12 @@ await runGate(
       runFidelity: bundle.manifest?.files?.['run.json']?.fidelity ?? null,
       inputsFidelity: bundle.manifest?.files?.['inputs.redacted.json']?.fidelity ?? null,
       stateFidelity: bundle.manifest?.files?.['state/manifest.json']?.fidelity ?? null,
+      httpFidelity: bundle.manifest?.files?.['http/cassette.json']?.fidelity ?? null,
+      modelFidelity: bundle.manifest?.files?.['models/responses.json']?.fidelity ?? null,
       containsGitHubSecret: serializedBundle.includes('ghp_acceptance_secret_abcdefghijklmnopqrstuvwxyz'),
-      containsRelaySecret: serializedBundle.includes('relay_pa_secret-value'),
-      containsAccessTokenSecret: serializedBundle.includes('x-access-token:secret'),
-      containsPasswordSecret: serializedBundle.includes('ordinary-secret-that-has-no-token-prefix'),
+      containsRelaySecret: serializedBundle.includes('relay_pa_live-secret'),
+      containsAccessTokenSecret: serializedBundle.includes('fixture-secret@example.test'),
+      containsPasswordSecret: serializedBundle.includes('ordinary-secret'),
     };
     const redactionArtifact = writeArtifact('cloud-replay-bundle.redaction.json', JSON.stringify(redactionProof, null, 2) + '\n');
 
@@ -607,8 +616,10 @@ await runGate(
       exitCode:
         redactionProof.eventFidelity === 'historical' &&
         redactionProof.runFidelity === 'historical' &&
-        redactionProof.inputsFidelity === 'historical' &&
-        redactionProof.stateFidelity === 'historical' &&
+        redactionProof.inputsFidelity === 'unavailable' &&
+        redactionProof.stateFidelity === 'unavailable' &&
+        redactionProof.httpFidelity === 'unavailable' &&
+        redactionProof.modelFidelity === 'unavailable' &&
         !redactionProof.containsGitHubSecret &&
         !redactionProof.containsRelaySecret &&
         !redactionProof.containsAccessTokenSecret &&
@@ -621,8 +632,10 @@ await runGate(
       summary:
         redactionProof.eventFidelity === 'historical' &&
         redactionProof.runFidelity === 'historical' &&
-        redactionProof.inputsFidelity === 'historical' &&
-        redactionProof.stateFidelity === 'historical' &&
+        redactionProof.inputsFidelity === 'unavailable' &&
+        redactionProof.stateFidelity === 'unavailable' &&
+        redactionProof.httpFidelity === 'unavailable' &&
+        redactionProof.modelFidelity === 'unavailable' &&
         !redactionProof.containsGitHubSecret &&
         !redactionProof.containsRelaySecret &&
         !redactionProof.containsAccessTokenSecret &&
@@ -630,7 +643,7 @@ await runGate(
         stateSource?.kind === 'replay_bundle' &&
         replayLog &&
         runRecord.status === 'succeeded'
-          ? 'A deterministic Cloud replay bundle was generated from Cloud source and consumed by Workforce invoke.'
+          ? 'A deterministic replay bundle was generated via the real Cloud export path and consumed by Workforce invoke.'
           : 'Replay bundle consumption did not preserve the expected replay provenance.',
       artifactRefs: artifacts,
     };

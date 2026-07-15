@@ -99,7 +99,7 @@ test('deterministic feed case preserves story-selection and memory coverage', ()
   );
   assert.ok(
     deterministic.expect.logsContain.includes(
-      'hn-monitor.feed-scan front_page=1 show_hn=1 new=2',
+      'hn-monitor.feed-scan front_page=2 show_hn=2 new=4',
     ),
   );
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.matched-agentic matched=3'));

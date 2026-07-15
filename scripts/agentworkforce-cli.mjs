@@ -11,9 +11,38 @@ export const agentworkforceBin = resolve(
   '.bin',
   process.platform === 'win32' ? 'agentworkforce.cmd' : 'agentworkforce',
 );
+export const agentworkforceCliOverrideEnv = 'AGENTWORKFORCE_CLI_PATH';
+
+function resolveAgentworkforceExecutable() {
+  const override = process.env[agentworkforceCliOverrideEnv]?.trim();
+  if (!override) {
+    return {
+      source: 'installed-package',
+      command: agentworkforceBin,
+      prefixArgs: [],
+      identity: agentworkforceBin,
+    };
+  }
+
+  const viaNode = /\.(?:c|m)?js$/iu.test(override);
+  return {
+    source: 'override',
+    command: viaNode ? process.execPath : override,
+    prefixArgs: viaNode ? [override] : [],
+    identity: override,
+  };
+}
 
 export function isAgentworkforceInstalled() {
-  return existsSync(agentworkforceBin);
+  return existsSync(resolveAgentworkforceExecutable().identity);
+}
+
+export function getAgentworkforceInvocation(args = []) {
+  const executable = resolveAgentworkforceExecutable();
+  return {
+    ...executable,
+    argv: [...executable.prefixArgs, ...args],
+  };
 }
 
 export function runAgentworkforce(args, options = {}) {
@@ -23,18 +52,19 @@ export function runAgentworkforce(args, options = {}) {
     input,
     timeoutMs,
   } = options;
+  const invocation = getAgentworkforceInvocation(args);
 
   if (!isAgentworkforceInstalled()) {
     return {
       ok: false,
       status: 1,
       stdout: '',
-      stderr: `Missing ${agentworkforceBin}. Run npm install --ignore-scripts first.`,
+      stderr: `Missing ${invocation.identity}. Install agentworkforce locally or set ${agentworkforceCliOverrideEnv}.`,
       command: formatCommand(args),
     };
   }
 
-  const result = spawnSync(agentworkforceBin, args, {
+  const result = spawnSync(invocation.command, invocation.argv, {
     cwd,
     env: { ...process.env, ...env },
     input,
@@ -58,19 +88,20 @@ export function runAgentworkforceAsync(args, options = {}) {
     env = {},
     input,
   } = options;
+  const invocation = getAgentworkforceInvocation(args);
 
   if (!isAgentworkforceInstalled()) {
     return Promise.resolve({
       ok: false,
       status: 1,
       stdout: '',
-      stderr: `Missing ${agentworkforceBin}. Run npm install --ignore-scripts first.`,
+      stderr: `Missing ${invocation.identity}. Install agentworkforce locally or set ${agentworkforceCliOverrideEnv}.`,
       command: formatCommand(args),
     });
   }
 
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(agentworkforceBin, args, {
+    const child = spawn(invocation.command, invocation.argv, {
       cwd,
       env: { ...process.env, ...env },
       stdio: 'pipe',
@@ -142,5 +173,6 @@ export function requireAgentworkforceFlags(commandLabel, args, requiredFlags) {
 }
 
 export function formatCommand(args) {
-  return [agentworkforceBin, ...args].join(' ');
+  const invocation = getAgentworkforceInvocation(args);
+  return [invocation.command, ...invocation.argv].join(' ');
 }

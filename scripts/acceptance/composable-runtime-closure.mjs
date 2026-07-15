@@ -1,39 +1,759 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   agentworkforceBin,
+  agentworkforceCliOverrideEnv,
   checkAgentworkforceFlags,
   formatMissingFlagsMessage,
+  getAgentworkforceInvocation,
   isAgentworkforceInstalled,
   readAgentworkforceHelp,
-  repoRoot,
   runAgentworkforce,
   runAgentworkforceAsync,
 } from '../agentworkforce-cli.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const taskRoot = resolve(here, '..', '..');
+const workspaceRoot = resolve(taskRoot, '..');
+const workforceRoot = resolve(workspaceRoot, 'workforce');
+const cloudRoot = resolve(workspaceRoot, 'cloud');
+const relayfileAdaptersRoot = resolve(workspaceRoot, 'relayfile-adapters');
 const artifactRoot = resolve(taskRoot, '.workflow-artifacts/composable-runtime-closure');
 const artifactFilesRoot = resolve(artifactRoot, 'artifacts');
+const workforceConfigDir = resolve(artifactRoot, 'agentworkforce-config');
 
 mkdirSync(artifactFilesRoot, { recursive: true });
+mkdirSync(workforceConfigDir, { recursive: true });
 rmSync(resolve(artifactFilesRoot, 'tmp'), { recursive: true, force: true });
 
-const pkg = JSON.parse(readFileSync(resolve(taskRoot, 'package.json'), 'utf8'));
-const repoCommit = runShell(['git', 'rev-parse', 'HEAD']).stdout.trim();
+process.env.AGENT_WORKFORCE_CONFIG_DIR ??= workforceConfigDir;
+
+const agentsPkg = readJson(resolve(taskRoot, 'package.json'));
 const startedAt = new Date().toISOString();
 const results = [];
+
+const repoEvidence = collectRepoEvidence();
+const cliIdentity = getAgentworkforceInvocation([]).identity;
+const cliSource = getAgentworkforceInvocation([]).source;
+
+await runGate(
+  'cli-help-snapshot',
+  [
+    'agentworkforce --help',
+    'agentworkforce invoke --help',
+    'agentworkforce runs export --help',
+  ].join('\n'),
+  async () => {
+    const topHelp = readAgentworkforceHelp([]);
+    const invokeFlags = checkAgentworkforceFlags(['invoke'], ['--schedule', '--case', '--reads', '--model', '--watch']);
+    const exportFlags = checkAgentworkforceFlags(['runs', 'export'], ['--bundle']);
+
+    const helpArtifacts = [
+      writeArtifact('cli-help.txt', `${topHelp.stdout}\n${topHelp.stderr}`.trim() + '\n'),
+      writeArtifact('invoke-help.txt', `${invokeFlags.stdout}\n${invokeFlags.stderr}`.trim() + '\n'),
+      writeArtifact('runs-export-help.txt', `${exportFlags.stdout}\n${exportFlags.stderr}`.trim() + '\n'),
+    ];
+
+    const missing = [
+      ...invokeFlags.missingFlags.map((flag) => `invoke:${flag}`),
+      ...exportFlags.missingFlags.map((flag) => `runs export:${flag}`),
+    ];
+    const topCommands = extractTopLevelCommands(`${topHelp.stdout}\n${topHelp.stderr}`);
+    const unexpectedTopLevel = topCommands.filter((command) =>
+      ![
+        'auth',
+        'compile',
+        'deploy',
+        'doctor',
+        'help',
+        'init',
+        'integrations',
+        'invoke',
+        'login',
+        'logout',
+        'models',
+        'persona',
+        'runs',
+        'version',
+        'workspaces',
+      ].includes(command),
+    );
+
+    return {
+      exitCode: topHelp.ok && invokeFlags.ok && exportFlags.ok && missing.length === 0 && unexpectedTopLevel.length === 0 ? 0 : 1,
+      summary:
+        missing.length === 0 && unexpectedTopLevel.length === 0
+          ? `Captured CLI surface for ${cliSource} artifact ${cliIdentity}.`
+          : `CLI surface mismatch: ${[...missing, ...unexpectedTopLevel.map((value) => `unexpected:${value}`)].join(', ')}`,
+      artifactRefs: helpArtifacts,
+    };
+  },
+);
+
+await runGate(
+  'legacy-fixture-compatibility',
+  `${formatCommand([
+    'invoke',
+    './scripts/acceptance/fixtures/zero-child-persona.ts',
+    '--fixture',
+    './scripts/acceptance/fixtures/invoke-safety.fixture.json',
+    '--output',
+    '<run-record>',
+  ])}`,
+  async () => {
+    const runRecordPath = resolve(artifactFilesRoot, 'legacy-fixture.run-record.json');
+    const result = await runAgentworkforceAsync(
+      [
+        'invoke',
+        './scripts/acceptance/fixtures/zero-child-persona.ts',
+        '--fixture',
+        './scripts/acceptance/fixtures/invoke-safety.fixture.json',
+        '--output',
+        runRecordPath,
+      ],
+      { env: baseAgentworkforceEnv() },
+    );
+
+    const stdoutArtifact = writeArtifact('legacy-fixture.stdout.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
+    const artifacts = [stdoutArtifact];
+    if (result.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
+    return {
+      exitCode: result.status,
+      summary: result.status === 0 ? 'Legacy invoke --fixture path succeeded against the closure CLI artifact.' : 'Legacy invoke --fixture path failed.',
+      artifactRefs: artifacts,
+    };
+  },
+);
+
+await runGate(
+  'hn-schedule-preview',
+  `${formatCommand([
+    'invoke',
+    './hn-monitor/agent.ts',
+    '--schedule',
+    'scan',
+    '--reads',
+    'live',
+    '--model',
+    'stub',
+    '--input',
+    'SLACK_CHANNEL=C123',
+    '--output',
+    '<run-record>',
+  ])}`,
+  async () => {
+    const runRecordPath = resolve(artifactFilesRoot, 'hn-schedule.run-record.json');
+    const result = runAgentworkforce(
+      [
+        'invoke',
+        './hn-monitor/agent.ts',
+        '--schedule',
+        'scan',
+        '--reads',
+        'live',
+        '--model',
+        'stub',
+        '--input',
+        'SLACK_CHANNEL=C123',
+        '--output',
+        runRecordPath,
+      ],
+      { env: baseAgentworkforceEnv() },
+    );
+    const stdoutArtifact = writeArtifact('hn-schedule-preview.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
+    const artifacts = [stdoutArtifact];
+    if (result.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
+    return {
+      exitCode: result.status,
+      summary: result.status === 0 ? 'HN schedule preview succeeded through the Workforce invoke path.' : 'HN schedule preview failed.',
+      artifactRefs: artifacts,
+    };
+  },
+);
+
+await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs', async () => {
+  const result = runShell(['node', 'scripts/run-hn-platform-cases.mjs'], {
+    cwd: taskRoot,
+    env: baseAgentworkforceEnv(),
+  });
+  const artifact = writeArtifact('hn-case-suite.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
+  return {
+    exitCode: result.status,
+    summary: result.status === 0 ? 'All checked-in HN case files passed through invoke --case.' : 'At least one HN case failed.',
+    artifactRefs: [artifact],
+  };
+});
+
+await runGate(
+  'multi-turn-state-preservation',
+  `${formatCommand([
+    'invoke',
+    './hn-monitor/agent.ts',
+    '--case',
+    './hn-monitor/cases/slack-follow-up.case.yaml',
+    '--output',
+    '<run-record>',
+  ])}`,
+  async () => {
+    const runRecordPath = resolve(artifactFilesRoot, 'slack-follow-up.run-record.json');
+    const result = runAgentworkforce(
+      [
+        'invoke',
+        './hn-monitor/agent.ts',
+        '--case',
+        './hn-monitor/cases/slack-follow-up.case.yaml',
+        '--output',
+        runRecordPath,
+      ],
+      { env: baseAgentworkforceEnv() },
+    );
+    const stdoutArtifact = writeArtifact('slack-follow-up.stdout.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
+    const artifacts = [stdoutArtifact];
+    if (result.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
+    if (result.status !== 0) {
+      return { exitCode: result.status, summary: 'Multi-turn HN follow-up case failed.', artifactRefs: artifacts };
+    }
+
+    const runRecord = readJson(runRecordPath);
+    const turns = runRecord.extensions?.turns ?? [];
+    const logs = readLogLines(runRecord);
+    const hasHydrated = logs.some((entry) => entry.message === 'hn-monitor.qa.hydrated');
+    const hasReply = logs.some((entry) => entry.message === 'hn-monitor.qa.slack-replied');
+    const recalled = runRecord.actions.some((action) => action.kind === 'memory.recall' && action.data?.items >= 1);
+    return {
+      exitCode: turns.length === 2 && hasHydrated && hasReply && recalled ? 0 : 1,
+      summary:
+        turns.length === 2 && hasHydrated && hasReply && recalled
+          ? 'Two-turn HN follow-up preserved preview state across turns.'
+          : 'Multi-turn HN follow-up did not preserve the expected state/action sequence.',
+      artifactRefs: artifacts,
+    };
+  },
+);
+
+await runGate(
+  'relayfile-slack-preview-threading',
+  `${formatCommand([
+    'invoke',
+    './hn-monitor/agent.ts',
+    '--case',
+    './hn-monitor/cases/agentic-feeds.case.yaml',
+    '--output',
+    '<run-record>',
+  ])}`,
+  async () => {
+    const runRecordPath = resolve(artifactFilesRoot, 'threaded-preview.run-record.json');
+    const env = {
+      ...baseAgentworkforceEnv(),
+      RELAYFILE_URL: 'https://relayfile.example.test',
+      RELAYFILE_TOKEN: 'relay_pa_acceptance_preview_secret',
+      RELAYFILE_WORKSPACE_ID: 'ws_acceptance_preview',
+      SLACK_TOKEN: 'xoxb-acceptance-preview-token',
+    };
+    const result = runAgentworkforce(
+      [
+        'invoke',
+        './hn-monitor/agent.ts',
+        '--case',
+        './hn-monitor/cases/agentic-feeds.case.yaml',
+        '--output',
+        runRecordPath,
+      ],
+      { env },
+    );
+    const stdoutArtifact = writeArtifact('threaded-preview.stdout.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
+    const artifacts = [stdoutArtifact];
+    if (result.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
+    if (result.status !== 0) {
+      return { exitCode: result.status, summary: 'Threaded Slack preview case failed.', artifactRefs: artifacts };
+    }
+
+    const runRecord = readJson(runRecordPath);
+    const writes = runRecord.actions.filter((action) => action.kind === 'provider.write' && action.provider === 'slack');
+    const header = writes.find((action) => action.resource === 'messages' && !action.body?.parentRef);
+    const thread = writes.find((action) => action.resource === 'messages' && typeof action.body?.parentRef === 'string');
+    const previewedOnly = writes.every((action) => action.status === 'previewed');
+
+    return {
+      exitCode: header && thread && thread.body?.thread_ts && previewedOnly ? 0 : 1,
+      summary:
+        header && thread && thread.body?.thread_ts && previewedOnly
+          ? 'Production-shaped Relayfile/Slack credentials still yielded preview-only parent+thread Slack writes.'
+          : 'Preview parent/thread Slack proof was incomplete.',
+      artifactRefs: artifacts,
+    };
+  },
+);
+
+await runGate(
+  'preview-network-safety',
+  [
+    formatCommand([
+      'invoke',
+      './scripts/acceptance/fixtures/fetch-preview-persona.ts',
+      '--fixture',
+      './scripts/acceptance/fixtures/invoke-safety.fixture.json',
+      '--reads',
+      'live',
+      '--input',
+      'ALLOWED_GET_URL=<sentinel>',
+      '--input',
+      'DENIED_POST_URL=<sentinel>',
+      '--output',
+      '<fetch-run-record>',
+    ]),
+    formatCommand([
+      'invoke',
+      './scripts/acceptance/fixtures/invoke-safety-persona.ts',
+      '--fixture',
+      './scripts/acceptance/fixtures/invoke-safety.fixture.json',
+      '--reads',
+      'live',
+      '--input',
+      'ALLOWED_GET_URL=<sentinel>',
+      '--input',
+      'DENIED_POST_URL=<sentinel>',
+    ]),
+  ].join('\n'),
+  async () => {
+    const sentinel = await createSentinelServer();
+    const fetchRunRecordPath = resolve(artifactFilesRoot, 'fetch-preview.run-record.json');
+    const rawStderrPath = resolve(artifactFilesRoot, 'raw-http-denial.stderr.txt');
+
+    try {
+      const fetchProbe = await runAgentworkforceAsync(
+        [
+          'invoke',
+          './scripts/acceptance/fixtures/fetch-preview-persona.ts',
+          '--fixture',
+          './scripts/acceptance/fixtures/invoke-safety.fixture.json',
+          '--reads',
+          'live',
+          '--input',
+          `ALLOWED_GET_URL=${sentinel.allowedUrl}`,
+          '--input',
+          `DENIED_POST_URL=${sentinel.deniedUrl}`,
+          '--output',
+          fetchRunRecordPath,
+        ],
+        { env: baseAgentworkforceEnv() },
+      );
+      const rawImport = await runAgentworkforceAsync(
+        [
+          'invoke',
+          './scripts/acceptance/fixtures/invoke-safety-persona.ts',
+          '--fixture',
+          './scripts/acceptance/fixtures/invoke-safety.fixture.json',
+          '--reads',
+          'live',
+          '--input',
+          `ALLOWED_GET_URL=${sentinel.allowedUrl}`,
+          '--input',
+          `DENIED_POST_URL=${sentinel.deniedUrl}`,
+        ],
+        { env: baseAgentworkforceEnv() },
+      );
+
+      writeFileSync(rawStderrPath, `${rawImport.stdout}\n${rawImport.stderr}`.trim() + '\n');
+      const fetchArtifact = writeArtifact('fetch-preview.stdout.txt', `${fetchProbe.stdout}\n${fetchProbe.stderr}`.trim() + '\n');
+      const rawArtifact = relative(taskRoot, rawStderrPath);
+      const countsArtifact = writeArtifact('preview-network-safety.sentinels.json', JSON.stringify(sentinel.counts, null, 2) + '\n');
+      const artifacts = [fetchArtifact, rawArtifact, countsArtifact];
+      if (fetchProbe.status === 0) artifacts.push(relative(taskRoot, fetchRunRecordPath));
+
+      const rawDenied = /preview bundles may not import node:http/u.test(`${rawImport.stdout}\n${rawImport.stderr}`);
+      const fetchRecord = fetchProbe.status === 0 ? readJson(fetchRunRecordPath) : null;
+      const blockedPost = fetchRecord
+        ? readLogLines(fetchRecord).some((entry) => entry.message === 'acceptance.fetch.denied-post.blocked')
+        : false;
+
+      return {
+        exitCode:
+          fetchProbe.status === 0 &&
+          sentinel.counts.allowed.get === 1 &&
+          sentinel.counts.denied.post === 0 &&
+          sentinel.counts.denied.raw === 0 &&
+          rawImport.status !== 0 &&
+          rawDenied &&
+          blockedPost
+            ? 0
+            : 1,
+        summary:
+          fetchProbe.status === 0 &&
+          sentinel.counts.allowed.get === 1 &&
+          sentinel.counts.denied.post === 0 &&
+          sentinel.counts.denied.raw === 0 &&
+          rawImport.status !== 0 &&
+          rawDenied &&
+          blockedPost
+            ? 'Allowed GET reached the sentinel once; fetch POST and raw node:http writes were blocked before any denied write landed.'
+            : 'Preview network safety boundary did not match the required allow/deny behavior.',
+        artifactRefs: artifacts,
+      };
+    } finally {
+      sentinel.close();
+    }
+  },
+);
+
+await runGate(
+  'compose-parity-zero-child-preview',
+  [
+    'node scripts/test.mjs tests/team-spec.test.mjs',
+    formatCommand([
+      'invoke',
+      './scripts/acceptance/fixtures/zero-child-persona.ts',
+      '--fixture',
+      './scripts/acceptance/fixtures/invoke-safety.fixture.json',
+      '--output',
+      '<run-record>',
+    ]),
+  ].join('\n'),
+  async () => {
+    const composeResult = runShell(['node', 'scripts/test.mjs', 'tests/team-spec.test.mjs'], { cwd: taskRoot });
+    const composeArtifact = writeArtifact('team-spec-compose-parity.txt', `${composeResult.stdout}\n${composeResult.stderr}`.trim() + '\n');
+
+    const runRecordPath = resolve(artifactFilesRoot, 'zero-child.run-record.json');
+    const previewResult = runAgentworkforce(
+      [
+        'invoke',
+        './scripts/acceptance/fixtures/zero-child-persona.ts',
+        '--fixture',
+        './scripts/acceptance/fixtures/invoke-safety.fixture.json',
+        '--output',
+        runRecordPath,
+      ],
+      { env: baseAgentworkforceEnv() },
+    );
+    const previewArtifact = writeArtifact('zero-child.stdout.txt', `${previewResult.stdout}\n${previewResult.stderr}`.trim() + '\n');
+    const artifacts = [composeArtifact, previewArtifact];
+    if (previewResult.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
+
+    const runRecord = previewResult.status === 0 ? readJson(runRecordPath) : null;
+    const workflowPreviewed = runRecord?.actions.some((action) => action.kind === 'workflow.run' && action.status === 'previewed');
+
+    return {
+      exitCode: composeResult.status === 0 && previewResult.status === 0 && workflowPreviewed ? 0 : 1,
+      summary:
+        composeResult.status === 0 && previewResult.status === 0 && workflowPreviewed
+          ? 'Compose remains the TeamSpec authority and previewed child actions stayed simulated.'
+          : 'Compose parity or zero-child preview proof failed.',
+      artifactRefs: artifacts,
+    };
+  },
+);
+
+await runGate(
+  'cloud-adapter-parity',
+  [
+    'cloud: ingress receiver / dedupe / health focused vitest suite',
+    'cloud: replay API focused vitest suite',
+  ].join('\n'),
+  async () => {
+    const ingressArgs = [
+      'node',
+      './node_modules/vitest/vitest.mjs',
+      'run',
+      '--config',
+      'vitest.config.ts',
+      'packages/web/lib/integrations/ingress/receiver.test.ts',
+      'packages/web/lib/integrations/ingress/sql-ledger.pglite.test.ts',
+      'packages/web/lib/integrations/ingress/registration-health.test.ts',
+      'packages/web/lib/integrations/ingress/live-watch-receiver.test.ts',
+      'packages/web/lib/integrations/ingress/live-adapters.test.ts',
+      'packages/web/lib/integrations/nango-webhook-route-handler.test.ts',
+      'packages/web/lib/integrations/nango-webhook-router-github-forward.test.ts',
+      'packages/web/lib/integrations/nango-webhook-router-slack-relayfile-routing.test.ts',
+      'packages/web/app/api/v1/workspaces/[workspaceId]/events/routes.test.ts',
+      'tests/hookdeck-webhook-route.test.ts',
+      'packages/web/app/api/v1/webhooks/composio/connect/callback/route.test.ts',
+    ];
+    const replayArgs = [
+      'node',
+      './node_modules/vitest/vitest.mjs',
+      'run',
+      '--config',
+      'vitest.config.ts',
+      'packages/web/lib/proactive-runtime/deployment-run-observability-core.test.ts',
+      'packages/web/lib/proactive-runtime/replay-bundle.test.ts',
+    ];
+
+    const ingress = runShell(ingressArgs, { cwd: cloudRoot });
+    const replay = runShell(replayArgs, { cwd: cloudRoot });
+    const artifacts = [
+      writeArtifact('cloud-ingress-suite.txt', `${ingress.stdout}\n${ingress.stderr}`.trim() + '\n'),
+      writeArtifact('cloud-replay-suite.txt', `${replay.stdout}\n${replay.stderr}`.trim() + '\n'),
+    ];
+    return {
+      exitCode: ingress.status === 0 && replay.status === 0 ? 0 : 1,
+      summary:
+        ingress.status === 0 && replay.status === 0
+          ? 'Cloud ingress parity/dedupe/health and replay API suites passed at the sibling Cloud commit.'
+          : 'Cloud focused parity or replay suite failed.',
+      artifactRefs: artifacts,
+      repositoryCommits: {
+        ...repoEvidence.repositories,
+        cloud: repoEvidence.repositories.cloud,
+      },
+    };
+  },
+);
+
+await runGate(
+  'cloud-replay-bundle-consumption',
+  [
+    'node --import tsx scripts/acceptance/generate-cloud-replay-bundle.mjs <bundle>',
+    formatCommand([
+      'invoke',
+      './scripts/acceptance/fixtures/replay-bundle-persona.ts',
+      '--fixture',
+      '<bundle>',
+      '--output',
+      '<run-record>',
+    ]),
+  ].join('\n'),
+  async () => {
+    const bundlePath = resolve(artifactFilesRoot, 'cloud-replay-bundle.json');
+    const generate = runShell(
+      [
+        'node',
+        '--import',
+        './node_modules/tsx/dist/loader.mjs',
+        resolve(taskRoot, 'scripts/acceptance/generate-cloud-replay-bundle.mjs'),
+        bundlePath,
+      ],
+      {
+        cwd: cloudRoot,
+        env: {
+          ...baseAgentworkforceEnv(),
+          CLOUD_WORKTREE_ROOT: cloudRoot,
+          TSX_TSCONFIG_PATH: 'tsconfig.json',
+        },
+      },
+    );
+    const bundleArtifact = writeArtifact('cloud-replay-bundle.generate.txt', `${generate.stdout}\n${generate.stderr}`.trim() + '\n');
+    if (generate.status !== 0) {
+      return {
+        exitCode: generate.status,
+        summary: 'Cloud replay bundle generation failed.',
+        artifactRefs: [bundleArtifact],
+      };
+    }
+
+    const runRecordPath = resolve(artifactFilesRoot, 'cloud-replay-bundle.run-record.json');
+    const invoke = runAgentworkforce(
+      [
+        'invoke',
+        './scripts/acceptance/fixtures/replay-bundle-persona.ts',
+        '--fixture',
+        bundlePath,
+        '--output',
+        runRecordPath,
+      ],
+      { env: baseAgentworkforceEnv() },
+    );
+    const invokeArtifact = writeArtifact('cloud-replay-bundle.stdout.txt', `${invoke.stdout}\n${invoke.stderr}`.trim() + '\n');
+    const artifacts = [bundleArtifact, invokeArtifact, relative(taskRoot, bundlePath)];
+    if (invoke.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
+    if (invoke.status !== 0) {
+      return {
+        exitCode: invoke.status,
+        summary: 'Workforce invoke could not consume the Cloud replay bundle.',
+        artifactRefs: artifacts,
+      };
+    }
+
+    const runRecord = readJson(runRecordPath);
+    const stateSource = runRecord.extensions?.stateSource ?? null;
+    const logs = readLogLines(runRecord);
+    const replayLog = logs.some((entry) => entry.message === 'acceptance.replay.event' && entry.type === 'github.issues.labeled');
+    return {
+      exitCode:
+        stateSource?.kind === 'replay_bundle' &&
+        replayLog &&
+        runRecord.status === 'succeeded'
+          ? 0
+          : 1,
+      summary:
+        stateSource?.kind === 'replay_bundle' && replayLog && runRecord.status === 'succeeded'
+          ? 'A deterministic Cloud replay bundle was generated from Cloud source and consumed by Workforce invoke.'
+          : 'Replay bundle consumption did not preserve the expected replay provenance.',
+      artifactRefs: artifacts,
+    };
+  },
+);
+
+await runGate(
+  'split-file-compatibility',
+  `${formatCommand([
+    'invoke',
+    './hn-monitor/persona.ts',
+    '--schedule',
+    'scan',
+    '--reads',
+    'live',
+    '--model',
+    'stub',
+    '--input',
+    'SLACK_CHANNEL=C123',
+    '--output',
+    '<run-record>',
+  ])}`,
+  async () => {
+    const runRecordPath = resolve(artifactFilesRoot, 'split-file.run-record.json');
+    const result = runAgentworkforce(
+      [
+        'invoke',
+        './hn-monitor/persona.ts',
+        '--schedule',
+        'scan',
+        '--reads',
+        'live',
+        '--model',
+        'stub',
+        '--input',
+        'SLACK_CHANNEL=C123',
+        '--output',
+        runRecordPath,
+      ],
+      { env: baseAgentworkforceEnv() },
+    );
+    const stdoutArtifact = writeArtifact('split-file.stdout.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
+    const artifacts = [stdoutArtifact];
+    if (result.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
+    const synthesizedWarning = /synthesized a minimal preview persona/u.test(`${result.stdout}\n${result.stderr}`);
+    return {
+      exitCode: result.status === 0 && !synthesizedWarning ? 0 : 1,
+      summary:
+        result.status === 0 && !synthesizedWarning
+          ? 'Split-file persona.ts + agent.ts invocation succeeded without the bare-agent compatibility warning.'
+          : 'Split-file persona compatibility failed or fell back to the bare-agent shim.',
+      artifactRefs: artifacts,
+    };
+  },
+);
+
+await runGate('artifact-secret-scan', 'scan generated artifact contents for secret values', async () => {
+  const findings = [];
+  const concreteSecrets = [
+    process.env.OPENAI_API_KEY,
+    process.env.SLACK_BOT_TOKEN,
+    process.env.RELAYFILE_TOKEN,
+    process.env.WORKFORCE_TOKEN,
+    'relay_pa_acceptance_preview_secret',
+    'xoxb-acceptance-preview-token',
+  ].filter(Boolean);
+  const secretPatterns = [
+    /\bxox(?:a|b|p|r|s)-[A-Za-z0-9-]+\b/gu,
+    /\brelay(?:_pa)?_[A-Za-z0-9_-]+\b/gu,
+    /\bghp_[A-Za-z0-9]{20,}\b/gu,
+    /\bx-access-token:[^\s"'<>]+/gu,
+    /\bsk-(?:live|proj|test)-[A-Za-z0-9_-]+\b/gu,
+  ];
+
+  for (const file of listFiles(artifactRoot)) {
+    if (file.endsWith('artifact-secret-scan.json')) continue;
+    const text = readFileSync(file, 'utf8');
+    for (const secret of concreteSecrets) {
+      if (secret && text.includes(secret)) {
+        findings.push({ file: relative(taskRoot, file), kind: 'exact', value: secret });
+      }
+    }
+    for (const pattern of secretPatterns) {
+      const matches = [...text.matchAll(pattern)].map((match) => match[0]);
+      for (const match of matches) {
+        findings.push({ file: relative(taskRoot, file), kind: 'pattern', value: match });
+      }
+    }
+  }
+
+  const artifact = writeArtifact('artifact-secret-scan.json', JSON.stringify({ findings }, null, 2) + '\n');
+  return {
+    exitCode: findings.length === 0 ? 0 : 1,
+    summary: findings.length === 0 ? 'No secret-shaped values were found in generated artifact contents.' : 'Secret-shaped values were found in generated artifact contents.',
+    artifactRefs: [artifact],
+  };
+});
+
+const completedAt = new Date().toISOString();
+const finalResults = {
+  startedAt,
+  completedAt,
+  repository: 'AgentWorkforce/agents',
+  repositories: repoEvidence.repositories,
+  packageArtifacts: repoEvidence.packageArtifacts,
+  cli: {
+    source: cliSource,
+    identity: cliIdentity,
+    overrideEnv: agentworkforceCliOverrideEnv,
+    configDir: relative(taskRoot, workforceConfigDir),
+  },
+  gates: results,
+};
+
+writeFileSync(resolve(artifactRoot, 'results.json'), JSON.stringify(finalResults, null, 2) + '\n');
+writeFileSync(resolve(artifactRoot, 'FINAL_ACCEPTANCE.md'), renderMarkdown(finalResults));
+
+const failed = results.filter((gate) => gate.exitCode !== 0);
+process.exit(failed.length === 0 ? 0 : 1);
+
+function collectRepoEvidence() {
+  return {
+    repositories: {
+      agents: gitHead(taskRoot),
+      workforce: gitHead(workforceRoot),
+      cloud: gitHead(cloudRoot),
+      relayfileAdapters: gitHead(relayfileAdaptersRoot),
+    },
+    packageArtifacts: {
+      agents: {
+        agentworkforce: agentsPkg.devDependencies.agentworkforce,
+        compose: agentsPkg.dependencies['@agentworkforce/compose'],
+        runtime: agentsPkg.dependencies['@agentworkforce/runtime'],
+        relayHelpers: agentsPkg.dependencies['@relayfile/relay-helpers'],
+      },
+      workforce: {
+        cliOverride: process.env[agentworkforceCliOverrideEnv] ?? null,
+        installedBin: agentworkforceBin,
+      },
+      cloud: {
+        replayBundleModule: 'packages/web/lib/proactive-runtime/replay-bundle.ts',
+      },
+      relayfileAdapters: {
+        relayHelpersInstalledVersion: readOptionalPackageVersion(resolve(taskRoot, 'node_modules/@relayfile/relay-helpers/package.json')),
+      },
+    },
+  };
+}
+
+function gitHead(cwd) {
+  return runShell(['git', 'rev-parse', 'HEAD'], { cwd }).stdout.trim();
+}
+
+function baseAgentworkforceEnv() {
+  return {
+    AGENT_WORKFORCE_CONFIG_DIR: workforceConfigDir,
+  };
+}
+
+function readOptionalPackageVersion(path) {
+  try {
+    return readJson(path).version ?? null;
+  } catch {
+    return null;
+  }
+}
 
 function runShell(args, options = {}) {
   const [cmd, ...rest] = args;
   const result = spawnSync(cmd, rest, {
-    cwd: taskRoot,
+    cwd: options.cwd ?? taskRoot,
     env: { ...process.env, ...(options.env ?? {}) },
     encoding: 'utf8',
     input: options.input,
@@ -46,6 +766,10 @@ function runShell(args, options = {}) {
   };
 }
 
+function readJson(path) {
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
 function writeArtifact(name, contents) {
   const path = resolve(artifactFilesRoot, name);
   mkdirSync(dirname(path), { recursive: true });
@@ -53,295 +777,77 @@ function writeArtifact(name, contents) {
   return relative(taskRoot, path);
 }
 
-function recordGate({
-  gate,
-  command,
-  exitCode,
-  status,
-  summary,
-  artifactRefs = [],
-  durationMs = 0,
-}) {
-  results.push({
-    gate,
-    command,
-    exitCode,
-    status,
-    summary,
-    durationMs,
-    repositoryCommit: repoCommit,
-    packageVersions: {
-      agentworkforce: pkg.devDependencies.agentworkforce,
-      compose: pkg.dependencies['@agentworkforce/compose'],
-      runtime: pkg.dependencies['@agentworkforce/runtime'],
-      relayHelpers: pkg.dependencies['@relayfile/relay-helpers'],
-    },
-    artifactRefs,
-  });
+function formatCommand(args) {
+  return [getAgentworkforceInvocation(args).command, ...getAgentworkforceInvocation(args).argv].join(' ');
+}
+
+function readLogLines(runRecord) {
+  return (runRecord.extensions?.logs ?? [])
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return { message: line };
+      }
+    });
+}
+
+function listFiles(root) {
+  const pending = [root];
+  const files = [];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = resolve(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(path);
+        continue;
+      }
+      if (entry.isFile()) files.push(path);
+    }
+  }
+  return files.sort();
+}
+
+function extractTopLevelCommands(helpText) {
+  return helpText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^[a-z][a-z-]+(?:\s{2,}|\t)/u.test(line))
+    .map((line) => line.split(/\s+/u)[0])
+    .filter((value, index, list) => list.indexOf(value) === index);
 }
 
 async function runGate(name, command, fn) {
   const begin = Date.now();
   try {
     const outcome = await fn();
-    recordGate({
+    results.push({
       gate: name,
       command,
       exitCode: outcome.exitCode,
       status: outcome.exitCode === 0 ? 'passed' : 'failed',
       summary: outcome.summary,
-      artifactRefs: outcome.artifactRefs ?? [],
       durationMs: Date.now() - begin,
+      repositoryCommits: outcome.repositoryCommits ?? repoEvidence.repositories,
+      packageArtifacts: repoEvidence.packageArtifacts,
+      artifactRefs: outcome.artifactRefs ?? [],
     });
   } catch (error) {
-    const artifact = writeArtifact(`${name}.error.txt`, String(error));
-    recordGate({
+    const artifact = writeArtifact(`${name}.error.txt`, `${String(error)}\n`);
+    results.push({
       gate: name,
       command,
       exitCode: 1,
       status: 'failed',
       summary: String(error),
-      artifactRefs: [artifact],
       durationMs: Date.now() - begin,
-    });
-  }
-}
-
-function runPreconditionGate(name, command, failureMessage, artifactRefs = []) {
-  recordGate({
-    gate: name,
-    command,
-    exitCode: 1,
-    status: 'failed',
-    summary: failureMessage,
-    artifactRefs,
-  });
-}
-
-await runGate('dependency-preflight', 'npm ls --depth=0 --json', () => {
-  if (!isAgentworkforceInstalled()) {
-    const artifact = writeArtifact('dependency-preflight.txt', `Missing ${agentworkforceBin}\n`);
-    return {
-      exitCode: 1,
-      summary: `Missing ${agentworkforceBin}; run npm install --ignore-scripts before acceptance.`,
+      repositoryCommits: repoEvidence.repositories,
+      packageArtifacts: repoEvidence.packageArtifacts,
       artifactRefs: [artifact],
-    };
-  }
-
-  const result = runShell(['npm', 'ls', '--depth=0', '--json']);
-  const artifact = writeArtifact('dependency-preflight.json', `${result.stdout}\n${result.stderr}`.trim() + '\n');
-  return {
-    exitCode: result.status,
-    summary: result.status === 0 ? 'Declared dependencies are installed.' : 'npm ls reported dependency problems.',
-    artifactRefs: [artifact],
-  };
-});
-
-const topHelp = readAgentworkforceHelp([]);
-const invokeHelp = readAgentworkforceHelp(['invoke']);
-const runsExportHelp = readAgentworkforceHelp(['runs', 'export']);
-const helpArtifacts = [
-  writeArtifact('cli-help.txt', `${topHelp.stdout}\n${topHelp.stderr}`.trim() + '\n'),
-  writeArtifact('invoke-help.txt', `${invokeHelp.stdout}\n${invokeHelp.stderr}`.trim() + '\n'),
-  writeArtifact('runs-export-help.txt', `${runsExportHelp.stdout}\n${runsExportHelp.stderr}`.trim() + '\n'),
-];
-
-await runGate('cli-help-snapshot', 'agentworkforce --help / invoke --help / runs export --help', () => ({
-  exitCode: topHelp.ok && invokeHelp.ok && runsExportHelp.ok ? 0 : 1,
-  summary:
-    topHelp.ok && invokeHelp.ok && runsExportHelp.ok
-      ? 'Captured CLI surface snapshots.'
-      : 'One or more CLI help commands failed.',
-  artifactRefs: helpArtifacts,
-}));
-
-await runGate('legacy-fixture-compatibility', 'agentworkforce invoke ./scripts/acceptance/fixtures/invoke-safety-persona.ts --fixture ./scripts/acceptance/fixtures/invoke-safety.fixture.json', async () => {
-  const sentinel = await createSentinelServer();
-  const runRecordPath = resolve(artifactFilesRoot, 'invoke-safety.run-record.json');
-  const stderrPath = resolve(artifactFilesRoot, 'invoke-safety.stderr.txt');
-
-  try {
-    const result = await runAgentworkforceAsync([
-      'invoke',
-      './scripts/acceptance/fixtures/invoke-safety-persona.ts',
-      '--fixture',
-      './scripts/acceptance/fixtures/invoke-safety.fixture.json',
-      '--input',
-      `ALLOWED_GET_URL=${sentinel.allowedUrl}`,
-      '--input',
-      `DENIED_POST_URL=${sentinel.deniedUrl}`,
-      '--output',
-      runRecordPath,
-    ]);
-
-    writeFileSync(stderrPath, `${result.stdout}\n${result.stderr}`.trim() + '\n');
-    const countsArtifact = writeArtifact('invoke-safety.sentinels.json', JSON.stringify(sentinel.counts, null, 2) + '\n');
-    const stderrArtifact = relative(taskRoot, stderrPath);
-    const artifacts = [countsArtifact, stderrArtifact];
-    if (result.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
-
-    const counts = JSON.parse(readFileSync(resolve(taskRoot, countsArtifact), 'utf8'));
-    const deniedWrites = counts.denied.post + counts.denied.raw;
-
-    return {
-      exitCode: result.status === 0 && deniedWrites === 0 ? 0 : 1,
-      summary:
-        result.status !== 0
-          ? 'Legacy fixture invoke failed.'
-          : deniedWrites === 0
-            ? 'Legacy fixture invoke ran; denied sentinel endpoints observed zero writes.'
-            : `Legacy fixture invoke reached denied sentinel endpoints ${deniedWrites} time(s).`,
-      artifactRefs: artifacts,
-    };
-  } finally {
-    sentinel.close();
-  }
-});
-
-await runGate('team-spec-compose-parity', 'node scripts/test.mjs tests/team-spec.test.mjs', () => {
-  const result = runShell(['node', 'scripts/test.mjs', 'tests/team-spec.test.mjs']);
-  const artifact = writeArtifact('team-spec-compose-parity.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
-  return {
-    exitCode: result.status,
-    summary: result.status === 0 ? 'Compose-backed TeamSpec tests passed.' : 'Compose-backed TeamSpec tests failed.',
-    artifactRefs: [artifact],
-  };
-});
-
-await runGate('hn-wrapper-contract', 'node scripts/test.mjs tests/hn-monitor-cases.test.mjs', () => {
-  const result = runShell(['node', 'scripts/test.mjs', 'tests/hn-monitor-cases.test.mjs']);
-  const artifact = writeArtifact('hn-wrapper-contract.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
-  return {
-    exitCode: result.status,
-    summary: result.status === 0 ? 'HN wrapper contract tests passed.' : 'HN wrapper contract tests failed.',
-    artifactRefs: [artifact],
-  };
-});
-
-const scheduleFlags = checkAgentworkforceFlags(['invoke'], ['--schedule', '--reads', '--model']);
-if (scheduleFlags.ok && scheduleFlags.missingFlags.length === 0) {
-  await runGate(
-    'hn-schedule-preview',
-    'agentworkforce invoke ./hn-monitor/agent.ts --schedule scan --reads live --model stub --input SLACK_CHANNEL=C123',
-    () => {
-      const result = runAgentworkforce([
-        'invoke',
-        './hn-monitor/agent.ts',
-        '--schedule',
-        'scan',
-        '--reads',
-        'live',
-        '--model',
-        'stub',
-        '--input',
-        'SLACK_CHANNEL=C123',
-      ]);
-      const artifact = writeArtifact('hn-schedule-preview.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
-      return {
-        exitCode: result.status,
-        summary: result.status === 0 ? 'HN schedule preview command succeeded.' : 'HN schedule preview command failed.',
-        artifactRefs: [artifact],
-      };
-    },
-  );
-} else {
-  runPreconditionGate(
-    'hn-schedule-preview',
-    'agentworkforce invoke ./hn-monitor/agent.ts --schedule scan --reads live --model stub --input SLACK_CHANNEL=C123',
-    formatMissingFlagsMessage('invoke', ['--schedule', '--reads', '--model'], scheduleFlags.text),
-    [helpArtifacts[1]],
-  );
-}
-
-const caseFlags = checkAgentworkforceFlags(['invoke'], ['--case']);
-if (caseFlags.ok && caseFlags.missingFlags.length === 0) {
-  await runGate('hn-case-suite', 'node scripts/run-hn-platform-cases.mjs', () => {
-    const result = runShell(['node', 'scripts/run-hn-platform-cases.mjs']);
-    const artifact = writeArtifact('hn-case-suite.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
-    return {
-      exitCode: result.status,
-      summary: result.status === 0 ? 'HN platform case suite passed.' : 'HN platform case suite failed.',
-      artifactRefs: [artifact],
-    };
-    });
-  } else {
-  runPreconditionGate(
-    'hn-case-suite',
-    'agentworkforce invoke ./hn-monitor/agent.ts --case ./hn-monitor/cases/*.case.yaml',
-    formatMissingFlagsMessage('invoke', ['--case'], caseFlags.text),
-    [helpArtifacts[1]],
-  );
-}
-
-const bundleFlags = checkAgentworkforceFlags(['runs', 'export'], ['--bundle']);
-if (bundleFlags.ok && bundleFlags.missingFlags.length === 0) {
-  const replayRunId = process.env.ACCEPTANCE_REPLAY_RUN_ID;
-  if (!replayRunId) {
-    runPreconditionGate(
-      'replay-bundle-surface',
-      'agentworkforce runs export <runId> --bundle replay-run.json',
-      'Missing ACCEPTANCE_REPLAY_RUN_ID for replay export coverage.',
-    );
-  } else {
-    await runGate('replay-bundle-surface', `agentworkforce runs export ${replayRunId} --bundle replay-run.json`, () => {
-      const bundlePath = resolve(artifactFilesRoot, 'replay-run.json');
-      const result = runAgentworkforce(['runs', 'export', replayRunId, '--bundle', bundlePath]);
-      const artifact = writeArtifact('replay-bundle-surface.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
-      const artifacts = [artifact];
-      if (result.status === 0) artifacts.push(relative(taskRoot, bundlePath));
-      return {
-        exitCode: result.status,
-        summary: result.status === 0 ? 'Replay bundle export succeeded.' : 'Replay bundle export failed.',
-        artifactRefs: artifacts,
-      };
     });
   }
-} else {
-  runPreconditionGate(
-    'replay-bundle-surface',
-    'agentworkforce runs export <runId> --bundle replay-run.json',
-    formatMissingFlagsMessage('runs export', ['--bundle'], bundleFlags.text),
-    [helpArtifacts[2]],
-  );
 }
-
-await runGate('artifact-secret-scan', 'scan generated artifacts for secret-shaped values', () => {
-  const serialized = JSON.stringify(results, null, 2);
-  const suspectNeedles = [
-    process.env.SLACK_BOT_TOKEN,
-    process.env.RELAYFILE_TOKEN,
-    process.env.WORKFORCE_TOKEN,
-    process.env.OPENAI_API_KEY,
-  ].filter(Boolean);
-  const leaked = suspectNeedles.filter((value) => serialized.includes(value));
-  const artifact = writeArtifact('artifact-secret-scan.json', JSON.stringify({ leaked: leaked.length }, null, 2) + '\n');
-  return {
-    exitCode: leaked.length === 0 ? 0 : 1,
-    summary: leaked.length === 0 ? 'No configured secret values were found in recorded gate metadata.' : 'Secret-shaped value found in recorded gate metadata.',
-    artifactRefs: [artifact],
-  };
-});
-
-const completedAt = new Date().toISOString();
-const finalResults = {
-  startedAt,
-  completedAt,
-  repository: 'AgentWorkforce/agents',
-  repositoryCommit: repoCommit,
-  packageVersions: {
-    agentworkforce: pkg.devDependencies.agentworkforce,
-    compose: pkg.dependencies['@agentworkforce/compose'],
-    runtime: pkg.dependencies['@agentworkforce/runtime'],
-    relayHelpers: pkg.dependencies['@relayfile/relay-helpers'],
-  },
-  gates: results,
-};
-
-writeFileSync(resolve(artifactRoot, 'results.json'), JSON.stringify(finalResults, null, 2) + '\n');
-writeFileSync(resolve(artifactRoot, 'FINAL_ACCEPTANCE.md'), renderMarkdown(finalResults));
-
-const failed = results.filter((gate) => gate.exitCode !== 0);
-process.exit(failed.length === 0 ? 0 : 1);
 
 async function createSentinelServer() {
   const counts = {
@@ -370,6 +876,7 @@ async function createSentinelServer() {
     server.once('error', rejectListen);
     server.listen(0, '127.0.0.1', resolveListen);
   });
+
   const address = server.address();
   if (!address || typeof address === 'string') {
     throw new Error('Unable to allocate local sentinel server port');
@@ -378,8 +885,8 @@ async function createSentinelServer() {
   return {
     allowedUrl: `http://127.0.0.1:${address.port}/allowed-get`,
     deniedUrl: `http://127.0.0.1:${address.port}/denied-post`,
-    close: () => server.close(),
     counts,
+    close: () => server.close(),
   };
 }
 
@@ -389,11 +896,12 @@ function renderMarkdown(finalResults) {
     '',
     `- Started: ${finalResults.startedAt}`,
     `- Completed: ${finalResults.completedAt}`,
-    `- Repository commit: ${finalResults.repositoryCommit}`,
-    `- agentworkforce: ${finalResults.packageVersions.agentworkforce}`,
-    `- compose: ${finalResults.packageVersions.compose}`,
-    `- runtime: ${finalResults.packageVersions.runtime}`,
-    `- relay-helpers: ${finalResults.packageVersions.relayHelpers}`,
+    `- Agents commit: ${finalResults.repositories.agents}`,
+    `- Workforce commit: ${finalResults.repositories.workforce}`,
+    `- Cloud commit: ${finalResults.repositories.cloud}`,
+    `- Relayfile adapters commit: ${finalResults.repositories.relayfileAdapters}`,
+    `- Workforce CLI artifact: ${finalResults.cli.identity}`,
+    `- AGENT_WORKFORCE_CONFIG_DIR: ${finalResults.cli.configDir}`,
     '',
     '| Gate | Status | Exit | Summary |',
     '| --- | --- | --- | --- |',

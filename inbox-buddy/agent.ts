@@ -64,7 +64,10 @@ export default defineAgent({
     // the Relayfile trigger + `@mention` text gate instead — the same pattern
     // review-agent (pr-reviewer) and joke-bot actually use in production. Each
     // transport's trigger is pruned at deploy when its id input is empty
-    // (persona enabledByInput).
+    // (persona enabledByInput). `${SLACK_CHANNEL}` below is NOT JS
+    // interpolation (this is a plain single-quoted string) — it's the
+    // persona-kit input-reference syntax, substituted with the deploy-resolved
+    // channel id by the deploy CLI before the trigger ever reaches cloud.
     slack: [{ on: 'message.created', paths: ['/slack/channels/${SLACK_CHANNEL}/**'], match: '@mention' }],
     telegram: [{ on: 'message' }]
   },

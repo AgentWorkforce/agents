@@ -197,7 +197,17 @@ async function resolveRelaySender(event: AgentEvent, expandedFull: unknown): Pro
 export default defineAgent({
   schedules: [{ name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' }],
   triggers: {
-    slack: [{ on: 'app_mention' }],
+    // `on: 'app_mention'` never actually routes: the cloud's integration-watch
+    // matcher hard-excludes app_mention from generic resource matching
+    // (relayfileTriggerMatchesEvent short-circuits false for it), and Slack
+    // mentions inside an existing thread arrive to the webhook as a plain
+    // `message.created` event, not a literal `app_mention` eventType. Match on
+    // the Relayfile trigger + `@mention` text gate instead (same fix joke-bot
+    // already applies). `${SLACK_CHANNEL}` below is NOT JS interpolation (this
+    // is a plain single-quoted string) — it's the persona-kit input-reference
+    // syntax, substituted with the deploy-resolved channel id by the deploy
+    // CLI before the trigger ever reaches cloud.
+    slack: [{ on: 'message.created', paths: ['/slack/channels/${SLACK_CHANNEL}/**'], match: '@mention' }],
     telegram: [{ on: 'message' }]
   },
   handler: async (ctx, event) => {

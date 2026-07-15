@@ -315,8 +315,10 @@ test('loadRecentThreads ignores _index.json and non-thread files', async () => {
 
 // ── dual-transport dispatch (unified agent) ────────────────────────────────────
 
-test('unified agent registers BOTH slack.app_mention and telegram.message triggers', () => {
-  assert.deepEqual(inboxBuddyAgent.triggers?.slack, [{ on: 'app_mention' }]);
+test('unified agent registers BOTH slack.message.created (mention-gated) and telegram.message triggers', () => {
+  assert.deepEqual(inboxBuddyAgent.triggers?.slack, [
+    { on: 'message.created', paths: ['/slack/channels/${SLACK_CHANNEL}/**'], match: '@mention' }
+  ]);
   assert.deepEqual(inboxBuddyAgent.triggers?.telegram, [{ on: 'message' }]);
 });
 

@@ -19,6 +19,16 @@ const cases = new Map(
   }),
 );
 
+function assertInvokeCaseWritePolicy(caseSpec, label) {
+  const writes = caseSpec.policy?.writes;
+  if (writes === 'live' || writes === 'sandbox') {
+    throw new Error(`${label} cannot request ${writes} writes from local invoke`);
+  }
+  if (writes !== undefined && writes !== 'preview' && writes !== 'deny') {
+    throw new Error(`${label} has unknown writes policy ${String(writes)}`);
+  }
+}
+
 test('HN platform cases are one case per file with unique ids and safe writes', () => {
   assert.ok(caseFiles.length >= 6, 'expected the reference, parity, and provider-trigger cases');
   const ids = new Set();
@@ -30,9 +40,7 @@ test('HN platform cases are one case per file with unique ids and safe writes', 
     assert.ok(!ids.has(caseSpec.id), `duplicate case id ${caseSpec.id}`);
     ids.add(caseSpec.id);
     assert.equal(caseSpec.expect?.status, 'succeeded', `${name} expected status`);
-    if (caseSpec.policy?.writes !== undefined) {
-      assert.equal(caseSpec.policy.writes, 'preview', `${name} cannot enable live writes`);
-    }
+    assertInvokeCaseWritePolicy(caseSpec, name);
 
     for (const fixture of caseSpec.http ?? []) {
       assert.equal(fixture.method, 'GET', `${name} HTTP fixtures remain read-only`);
@@ -41,6 +49,14 @@ test('HN platform cases are one case per file with unique ids and safe writes', 
       assert.doesNotThrow(() => JSON.parse(readFileSync(fixturePath, 'utf8')));
     }
   }
+});
+
+test('local invoke case policy rejects writes: live from a case file', () => {
+  const unsafeCase = parse('policy:\n  writes: live\n');
+  assert.throws(
+    () => assertInvokeCaseWritePolicy(unsafeCase, 'unsafe.case.yaml'),
+    /cannot request live writes from local invoke/u,
+  );
 });
 
 test('scheduled scan case keeps the reference policy and Slack thread assertion', () => {

@@ -18,7 +18,8 @@
  */
 
 // TODO: replace with import from '@agentworkforce/compose' once WS-F publishes.
-// Migration: import { validateTeamSpec } from '@agentworkforce/compose';
+// Migration: import { TeamSpec } from '@agentworkforce/compose';
+//            import { validateTeamSpec } from '@agentworkforce/compose';
 // Then delete this mirrored implementation and keep the existing tests as the
 // checked-in team-spec consumer contract.
 

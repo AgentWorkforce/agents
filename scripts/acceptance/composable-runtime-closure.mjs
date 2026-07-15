@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createSentinelServer } from './sentinel-server.mjs';
 import { createIntegrationHealthServer } from './integration-health-server.mjs';
+import { writeBlockedFile, removeBlockedFile } from './blocked-lifecycle.mjs';
 
 import {
   agentworkforceBin,
@@ -568,6 +569,7 @@ await runGate(
       'cloud-integ-health.stdout.txt',
       `${integHealthStdout}\n${integHealthResult?.stderr ?? ''}`.trim() + '\n',
     );
+    // receivedRequests stores only hasAuth/authScheme — never the raw credential.
     const integHealthRequestsArtifact = writeArtifact(
       'cloud-integ-health.server-requests.json',
       JSON.stringify(integHealthServer.receivedRequests, null, 2) + '\n',
@@ -578,7 +580,20 @@ await runGate(
     try { integHealthDoc = integHealthResult?.status === 0 ? JSON.parse(integHealthStdout) : null; } catch {}
     const githubRow = integHealthDoc?.integrations?.find((row) => row.id === 'github');
     const integHealthPopulated = !!(githubRow?.registrationHealth);
-    const integAuthPresent = integHealthServer.receivedRequests.some((r) => r.hasAuth);
+
+    // Assert all five expected Cloud endpoints were reached and all carried auth.
+    const wsId = integHealthServer.workspaceId;
+    const expectedPaths = [
+      '/api/v1/integrations/catalog',
+      '/api/v1/me/integrations',
+      `/api/v1/workspaces/${encodeURIComponent(wsId)}/integrations`,
+      `/api/v1/workspaces/${encodeURIComponent(wsId)}/integrations/github/status?scope=deployer_user`,
+      `/api/v1/workspaces/${encodeURIComponent(wsId)}/integrations/github/status?scope=workspace`,
+    ];
+    const reqs = integHealthServer.receivedRequests;
+    const allFivePresent = expectedPaths.every((p) => reqs.some((r) => r.url === p));
+    const allFiveAuthed = expectedPaths.every((p) => reqs.some((r) => r.url === p && r.hasAuth));
+    const integAuthPresent = allFivePresent && allFiveAuthed;
 
     return {
       exitCode:
@@ -850,30 +865,9 @@ const failed = results.filter((gate) => gate.exitCode !== 0);
 
 const blockedPath = resolve(artifactRoot, 'BLOCKED_NO_MERGE.md');
 if (failed.length > 0) {
-  const failedLines = failed.map((gate) => `- \`${gate.gate}\`: ${gate.summary}`).join('\n');
-  const blockedContent = [
-    '# BLOCKED_NO_MERGE',
-    '',
-    `- Repository: AgentWorkforce/agents`,
-    `- Branch: codex/issue-2619-agents-closure`,
-    `- Commit at block report: ${repoEvidence.repositories.agents}`,
-    '',
-    '## Failed gates',
-    '',
-    failedLines,
-    '',
-    '## Exact failing commands',
-    '',
-    ...failed.map((gate) => [`### ${gate.gate}`, '', '```sh', gate.command, '```', '', `Summary: ${gate.summary}`, '']).flat(),
-    '## Release / merge confirmation',
-    '',
-    '- No PR was merged from this red acceptance evidence.',
-    '- No package release was published from this worktree.',
-    '',
-  ].join('\n');
-  writeFileSync(blockedPath, blockedContent);
+  writeBlockedFile(blockedPath, failed, repoEvidence.repositories.agents);
 } else {
-  try { rmSync(blockedPath); } catch {}
+  removeBlockedFile(blockedPath);
 }
 
 process.exit(failed.length === 0 ? 0 : 1);

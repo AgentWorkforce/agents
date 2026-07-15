@@ -83,8 +83,8 @@ export default definePersona({
   capabilities: {
     httpRead: {
       allow: [
-        { method: 'GET', urlGlob: 'https://hn.algolia.com/api/v1/search*' },
-        { method: 'GET', urlGlob: 'https://hn.algolia.com/api/v1/search_by_date*' },
+        { method: 'GET', urlGlob: 'https://hn.algolia.com/api/v1/search?*' },
+        { method: 'GET', urlGlob: 'https://hn.algolia.com/api/v1/search_by_date?*' },
         { method: 'GET', urlGlob: 'https://hn.algolia.com/api/v1/items/*' },
       ],
     },

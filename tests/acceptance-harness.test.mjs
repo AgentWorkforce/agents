@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { createSentinelServer } from '../scripts/acceptance/sentinel-server.mjs';
 import { createIntegrationHealthServer } from '../scripts/acceptance/integration-health-server.mjs';
+import { writeBlockedFile, removeBlockedFile } from '../scripts/acceptance/blocked-lifecycle.mjs';
+
+// ── sentinel server ──────────────────────────────────────────────────────────
 
 test('sentinel server routes allowed GET correctly', async () => {
   const sentinel = await createSentinelServer();
@@ -52,6 +58,8 @@ test('sentinel server accumulates request log', async () => {
   }
 });
 
+// ── integration health server ─────────────────────────────────────────────────
+
 test('integration health server returns catalog with github', async () => {
   const server = await createIntegrationHealthServer();
   try {
@@ -77,5 +85,100 @@ test('integration health server returns registrationHealth in status', async () 
     assert.ok(server.receivedRequests.some((r) => r.hasAuth), 'server should have received auth header');
   } finally {
     server.close();
+  }
+});
+
+test('integration health server never retains raw auth credential', async () => {
+  const server = await createIntegrationHealthServer();
+  const rawToken = 'Bearer super-secret-token-that-must-not-leak';
+  try {
+    await fetch(`${server.url}/api/v1/integrations/catalog`, {
+      headers: { authorization: rawToken },
+    });
+    for (const req of server.receivedRequests) {
+      // Only hasAuth (boolean) and authScheme (string like 'Bearer') are stored.
+      assert.ok(!('auth' in req), 'raw auth field must not exist on stored request');
+      assert.ok(typeof req.hasAuth === 'boolean');
+      assert.ok(req.authScheme === 'Bearer' || req.authScheme === null);
+      // The raw token value must not be stored anywhere in the record.
+      const serialized = JSON.stringify(req);
+      assert.ok(!serialized.includes('super-secret-token-that-must-not-leak'));
+    }
+  } finally {
+    server.close();
+  }
+});
+
+// ── blocked lifecycle helper ─────────────────────────────────────────────────
+
+function tmpDir() {
+  const dir = join(tmpdir(), `acceptance-test-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+test('writeBlockedFile creates a BLOCKED_NO_MERGE.md with failed gate details', () => {
+  const dir = tmpDir();
+  const path = join(dir, 'BLOCKED_NO_MERGE.md');
+  const failedGates = [
+    { gate: 'cli-help-snapshot', command: 'agentworkforce --help', summary: 'missing --schedule' },
+    { gate: 'hn-schedule-preview', command: 'agentworkforce invoke --schedule scan', summary: 'flag not found' },
+  ];
+  try {
+    writeBlockedFile(path, failedGates, 'abc1234def5678');
+    const content = readFileSync(path, 'utf8');
+    assert.ok(content.includes('# BLOCKED_NO_MERGE'));
+    assert.ok(content.includes('abc1234def5678'));
+    assert.ok(content.includes('cli-help-snapshot'));
+    assert.ok(content.includes('missing --schedule'));
+    assert.ok(content.includes('hn-schedule-preview'));
+    assert.ok(content.includes('No PR was merged'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeBlockedFile deletes the file when it exists', () => {
+  const dir = tmpDir();
+  const path = join(dir, 'BLOCKED_NO_MERGE.md');
+  try {
+    writeBlockedFile(path, [{ gate: 'g', command: 'cmd', summary: 's' }], 'sha');
+    removeBlockedFile(path);
+    let exists = true;
+    try { readFileSync(path); } catch { exists = false; }
+    assert.ok(!exists, 'file should be removed after removeBlockedFile');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeBlockedFile is silent when file does not exist', () => {
+  const dir = tmpDir();
+  const path = join(dir, 'BLOCKED_NO_MERGE.md');
+  try {
+    // Should not throw even when the file never existed.
+    assert.doesNotThrow(() => removeBlockedFile(path));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('failed-then-green lifecycle: file written on failure, removed on success', () => {
+  const dir = tmpDir();
+  const path = join(dir, 'BLOCKED_NO_MERGE.md');
+  const failed = [{ gate: 'g', command: 'c', summary: 's' }];
+  try {
+    // Simulate a failing run.
+    writeBlockedFile(path, failed, 'deadbeef');
+    let content = readFileSync(path, 'utf8');
+    assert.ok(content.includes('deadbeef'));
+
+    // Simulate a green run — file must be removed.
+    removeBlockedFile(path);
+    let exists = true;
+    try { readFileSync(path); } catch { exists = false; }
+    assert.ok(!exists, 'green run must remove BLOCKED_NO_MERGE.md');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -31,8 +31,10 @@ export async function createIntegrationHealthServer(opts = {}) {
   };
 
   const server = http.createServer((req, res) => {
-    const auth = req.headers['authorization'] ?? null;
-    receivedRequests.push({ method: req.method, url: req.url, hasAuth: auth !== null, auth });
+    const authHeader = req.headers['authorization'] ?? null;
+    // Never retain the raw credential — store only presence and scheme.
+    const authScheme = authHeader ? authHeader.split(' ')[0] : null;
+    receivedRequests.push({ method: req.method, url: req.url, hasAuth: authHeader !== null, authScheme });
 
     res.setHeader('content-type', 'application/json');
 

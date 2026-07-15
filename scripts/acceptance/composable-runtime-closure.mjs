@@ -316,11 +316,15 @@ await runGate(
       'ALLOWED_GET_URL=<sentinel>',
       '--input',
       'DENIED_POST_URL=<sentinel>',
+      '--output',
+      '<raw-run-record>',
     ]),
   ].join('\n'),
   async () => {
     const sentinel = await createSentinelServer();
     const fetchRunRecordPath = resolve(artifactFilesRoot, 'fetch-preview.run-record.json');
+    const rawRunRecordPath = resolve(artifactFilesRoot, 'raw-http-denial.run-record.json');
+    const rawStdoutPath = resolve(artifactFilesRoot, 'raw-http-denial.stdout.txt');
     const rawStderrPath = resolve(artifactFilesRoot, 'raw-http-denial.stderr.txt');
 
     try {
@@ -353,18 +357,23 @@ await runGate(
           `ALLOWED_GET_URL=${sentinel.allowedUrl}`,
           '--input',
           `DENIED_POST_URL=${sentinel.deniedUrl}`,
+          '--output',
+          rawRunRecordPath,
         ],
         { env: baseAgentworkforceEnv(), timeoutMs: invokeTimeoutMs },
       );
 
-      writeFileSync(rawStderrPath, `${rawImport.stdout}\n${rawImport.stderr}`.trim() + '\n');
+      writeFileSync(rawStdoutPath, `${rawImport.stdout}`.trim() + '\n');
+      writeFileSync(rawStderrPath, `${rawImport.stderr}`.trim() + '\n');
       const fetchArtifact = writeArtifact('fetch-preview.stdout.txt', `${fetchProbe.stdout}\n${fetchProbe.stderr}`.trim() + '\n');
-      const rawArtifact = relative(taskRoot, rawStderrPath);
+      const rawStdoutArtifact = relative(taskRoot, rawStdoutPath);
+      const rawStderrArtifact = relative(taskRoot, rawStderrPath);
       const countsArtifact = writeArtifact('preview-network-safety.sentinels.json', JSON.stringify(sentinel.counts, null, 2) + '\n');
-      const artifacts = [fetchArtifact, rawArtifact, countsArtifact];
+      const artifacts = [fetchArtifact, rawStdoutArtifact, rawStderrArtifact, countsArtifact];
       if (fetchProbe.status === 0) artifacts.push(relative(taskRoot, fetchRunRecordPath));
+      if (rawImport.status === 0) artifacts.push(relative(taskRoot, rawRunRecordPath));
 
-      const rawRecord = rawImport.status === 0 ? readJsonWithOptionalTrailer(rawStderrPath) : null;
+      const rawRecord = rawImport.status === 0 ? readJson(rawRunRecordPath) : null;
       const rawDenied =
         /(preview bundles may not import node:http|preview worker denied raw module import node:http|denied raw module import node:http)/u.test(`${rawImport.stdout}\n${rawImport.stderr}`) ||
         rawRecord?.actions?.some((action) => action.kind === 'http.read' && action.status === 'denied' && action.data?.module === 'node:http');
@@ -379,7 +388,7 @@ await runGate(
       return {
         exitCode:
           fetchProbe.status === 0 &&
-          sentinel.counts.allowed.get >= 1 &&
+          sentinel.counts.allowed.get === 2 &&
           sentinel.counts.denied.post === 0 &&
           sentinel.counts.denied.raw === 0 &&
           rawImport.status === 0 &&
@@ -390,14 +399,14 @@ await runGate(
             : 1,
         summary:
           fetchProbe.status === 0 &&
-          sentinel.counts.allowed.get >= 1 &&
+          sentinel.counts.allowed.get === 2 &&
           sentinel.counts.denied.post === 0 &&
           sentinel.counts.denied.raw === 0 &&
           rawImport.status === 0 &&
           rawDenied &&
           rawBlocked &&
           blockedPost
-            ? 'Allowed GET reached the sentinel once; fetch POST and raw node:http writes were blocked before any denied write landed.'
+            ? 'Declared GETs reached the sentinel twice; fetch POST and raw node:http writes were blocked before any denied write landed.'
           : 'Preview network safety boundary did not match the required allow/deny behavior.',
         artifactRefs: artifacts,
       };
@@ -840,19 +849,6 @@ function runShell(args, options = {}) {
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
-}
-
-function readJsonWithOptionalTrailer(path) {
-  const text = readFileSync(path, 'utf8');
-  try {
-    return JSON.parse(text);
-  } catch {
-    const previewIndex = text.indexOf('\npreview: ');
-    if (previewIndex >= 0) {
-      return JSON.parse(text.slice(0, previewIndex));
-    }
-    throw new Error(`Unable to parse JSON artifact ${path}`);
-  }
 }
 
 function writeArtifact(name, contents) {

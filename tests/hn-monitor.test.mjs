@@ -351,6 +351,26 @@ test('exact-state failure after Slack delivery rejects with an observable persis
   assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.post-grounding-persistence-failed'));
 });
 
+test('Telegram-only delivery treats Slack exact-state persistence as a successful no-op', async () => {
+  const { ctx, logs } = fakeCtx();
+  ctx.persona.inputs = { TELEGRAM_CHAT: '456' };
+  const posts = [];
+  const delivery = {
+    targets: ['telegram'],
+    async publish() { throw new Error('not simulated'); },
+    async send(text, opts) {
+      posts.push({ text, opts });
+      return { ok: true, refs: [{ provider: 'telegram', chatId: '456', messageId: `msg-${posts.length}` }] };
+    },
+  };
+
+  await postFreshStories(ctx, delivery, [], [STORY]);
+
+  assert.equal(posts.length, 2);
+  assert.ok(logs.some((entry) => entry.level === 'info' && entry.message === 'hn-monitor.post-state-not-applicable'));
+  assert.ok(!logs.some((entry) => entry.message === 'hn-monitor.post-grounding-persistence-failed'));
+});
+
 test('postFreshStories releases claim when header publish fails', async () => {
   const { ctx, events, saved } = fakeCtx();
   const delivery = {

@@ -83,6 +83,7 @@ interface RecentDigestState {
 }
 
 interface ExactPostSaveResult {
+  applicable: boolean;
   saved: boolean;
   threadShardSaved: boolean;
   indexSaved: boolean;
@@ -1335,7 +1336,8 @@ async function loadExactPosts(ctx: WorkforceCtx, threadTs?: string): Promise<Pos
 
 async function saveExactPost(ctx: WorkforceCtx, record: PostRecord): Promise<ExactPostSaveResult> {
   const path = exactDigestStatePath(ctx);
-  if (!path || !ctx.files) return { saved: false, threadShardSaved: false, indexSaved: false };
+  if (!path) return { applicable: false, saved: true, threadShardSaved: false, indexSaved: false };
+  if (!ctx.files) return { applicable: true, saved: false, threadShardSaved: false, indexSaved: false };
 
   // The per-thread shard is authoritative for Slack follow-ups. Concurrent
   // digests have distinct delivered thread timestamps, so they write distinct
@@ -1372,6 +1374,7 @@ async function saveExactPost(ctx: WorkforceCtx, record: PostRecord): Promise<Exa
   }
 
   return {
+    applicable: true,
     saved: slackThreadRefs.length > 0 ? threadShardSaved : indexSaved,
     threadShardSaved,
     indexSaved
@@ -1550,7 +1553,9 @@ async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<boolean>
   try {
     const result = await saveExactPost(ctx, record);
     exactStateSaved = result.saved;
-    if (result.saved) {
+    if (!result.applicable) {
+      ctx.log('info', 'hn-monitor.post-state-not-applicable', { reason: 'Slack is not configured' });
+    } else if (result.saved) {
       ctx.log('info', 'hn-monitor.post-state-saved', {
         stories: record.stories.length,
         threadShardSaved: result.threadShardSaved,

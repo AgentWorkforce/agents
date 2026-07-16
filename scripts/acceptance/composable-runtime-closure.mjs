@@ -39,7 +39,7 @@ const artifactRoot = resolve(taskRoot, '.workflow-artifacts/composable-runtime-c
 const artifactFilesRoot = resolve(artifactRoot, 'artifacts');
 const workforceConfigDir = resolve(artifactRoot, 'agentworkforce-config');
 const baselineRoot = resolve(here, 'baselines');
-const cliBaseline = readJson(resolve(baselineRoot, 'agentworkforce-4.1.22-top-level-commands.json'));
+const cliBaseline = readJson(resolve(baselineRoot, 'agentworkforce-4.1.23-top-level-commands.json'));
 const invokeTimeoutMs = 30_000;
 
 rmSync(artifactFilesRoot, { recursive: true, force: true });

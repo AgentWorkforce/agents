@@ -7,6 +7,8 @@ node_modules/
 # Local agent CLI/tooling state + build output — never commit
 .agentworkforce/
 .test-build/
+.workforce/
+**/.workforce/
 # OpenCode CLI config — contains live relay credentials, must stay local
 opencode.json
 
@@ -16,6 +18,7 @@ memory/workspace/.relay/
 
 # Eval run artifacts
 .evals/
+.workflow-artifacts/
 # Safety net: stray provider draft trees a mis-pointed mount root can leave behind
 /slack/
 /linear/

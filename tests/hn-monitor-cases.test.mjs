@@ -5,9 +5,12 @@ import test from 'node:test';
 
 import { parse } from 'yaml';
 
+import { findMissingFlags, formatMissingFlagsMessage } from '../scripts/agentworkforce-cli.mjs';
+
 const casesDir = resolve('hn-monitor/cases');
 const fixtureDir = resolve('hn-monitor/fixtures');
 const legacyFixtureDir = resolve('evals/seeds');
+const legacyCasesPath = resolve('evals/cases.jsonl');
 
 const caseFiles = readdirSync(casesDir)
   .filter((name) => name.endsWith('.case.yaml'))
@@ -30,7 +33,7 @@ function assertInvokeCaseWritePolicy(caseSpec, label) {
 }
 
 test('HN platform cases are one case per file with unique ids and safe writes', () => {
-  assert.ok(caseFiles.length >= 6, 'expected the reference, parity, and provider-trigger cases');
+  assert.ok(caseFiles.length >= 6, 'expected the reference, parity, live, and provider-trigger cases');
   const ids = new Set();
 
   for (const [name, { path, value: caseSpec }] of cases) {
@@ -97,12 +100,25 @@ test('deterministic feed case preserves story-selection and memory coverage', ()
   );
   assert.ok(
     deterministic.expect.logsContain.includes(
-      'hn-monitor.feed-scan front_page=1 show_hn=1 new=2',
+      'hn-monitor.feed-scan front_page=2 show_hn=2 new=4',
     ),
   );
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.matched-agentic matched=3'));
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.posted'));
   assert.ok(deterministic.expect.effectsContain.includes('memory.save'));
+});
+
+test('legacy eval JSONL keeps the HN deterministic feed-count contract in sync', () => {
+  const legacyEntry = readFileSync(legacyCasesPath, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((entry) => entry.id === 'hn-monitor.agentic-feeds');
+  assert.ok(legacyEntry, 'missing hn-monitor.agentic-feeds in evals/cases.jsonl');
+  assert.ok(
+    legacyEntry.expect.logsAny.includes('hn-monitor.feed-scan front_page=2 show_hn=2 new=4'),
+    'legacy JSONL feed-count contract drifted from the YAML case',
+  );
 });
 
 test('Slack provider-trigger case is multi-turn and shares the HN detail fixture', () => {
@@ -135,8 +151,78 @@ test('agent-local HTTP fixtures preserve the legacy eval inputs byte-for-byte', 
   }
 });
 
-test('legacy HN eval and preview scripts remain available until platform parity', () => {
+test('live-read case is non-vacuous: has inputs and asserts only stable live-read evidence', () => {
+  const liveRead = cases.get('live-read.case.yaml').value;
+  assert.equal(liveRead.policy?.reads, 'live', 'live-read must use reads: live');
+  assert.equal(liveRead.policy?.model, 'stub', 'live-read must use model: stub');
+  assert.ok(liveRead.inputs?.SLACK_CHANNEL, 'live-read must have SLACK_CHANNEL input (agent exits early otherwise)');
+  assert.ok(liveRead.expect?.effectsContain?.includes('http.read'),
+    'live-read must assert http.read effect (proves live GETs occurred)');
+  assert.equal(liveRead.expect?.logsContain, undefined, 'live-read must not pin unstable current-feed log content');
+  assert.equal(liveRead.expect?.providerActions, undefined, 'live-read must not pin data-dependent preview writes');
+});
+
+test('live-model case uses fixture HN reads plus live model mode', () => {
+  const liveModel = cases.get('live-model.case.yaml').value;
+  assert.equal(liveModel.policy?.reads, 'fixtures', 'live-model must use fixture reads');
+  assert.equal(liveModel.policy?.model, 'live', 'live-model must use model: live');
+  assert.ok(liveModel.inputs?.SLACK_CHANNEL, 'live-model must have SLACK_CHANNEL input (agent exits early otherwise)');
+  assert.deepEqual(
+    liveModel.http?.map((fixture) => fixture.match),
+    ['tags=front_page', 'tags=show_hn', 'tags=story'],
+    'live-model must check in the three HN feed fixtures',
+  );
+  assert.ok(liveModel.expect?.logsContain?.some((l) => l.includes('hn-monitor.feed-scan')),
+    'live-model must assert feed-scan log with concrete counts');
+  assert.ok(liveModel.expect?.effectsContain?.includes('http.read'),
+    'live-model must assert http.read effect for fixture-backed HN fetches');
+  assert.ok(liveModel.expect?.effectsContain?.includes('model.complete'),
+    'live-model must assert model.complete effect (proves real model path was exercised)');
+  assert.ok(liveModel.expect?.effectsContain?.includes('provider.write'),
+    'live-model must assert provider.write effect');
+  assert.ok(Array.isArray(liveModel.expect?.providerActions) && liveModel.expect.providerActions.length >= 1,
+    'live-model must assert at least one Slack preview write');
+});
+
+test('slack-follow-up case keeps memory and grounding assertions without claiming receipt continuity', () => {
+  const followUp = cases.get('slack-follow-up.case.yaml').value;
+  assert.ok(followUp.expect?.logsContain?.includes('hn-monitor.qa.hydrated'),
+    'follow-up case must assert qa.hydrated (confirms item fetch from turn 1 state)');
+  assert.ok(followUp.expect?.logsContain?.includes('hn-monitor.qa.slack-replied'),
+    'follow-up case must assert qa.slack-replied');
+  assert.ok(followUp.expect?.effectsContain?.includes('memory.save'),
+    'follow-up case must assert memory.save (turn 1 must persist post data for turn 2)');
+  assert.equal(followUp.turns?.[1]?.thread_ts, '200.1',
+    'follow-up fixture should keep a concrete thread_ts for the inbound Slack thread');
+});
+
+test('HN eval and preview scripts are thin platform-invoke wrappers', () => {
   const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf8'));
-  assert.match(pkg.scripts['evals:hn'], /run-evals/u);
-  assert.match(pkg.scripts['preview:hn'], /preview-hn-monitor/u);
+  assert.equal(pkg.scripts['evals:hn'], 'node scripts/run-hn-platform-cases.mjs');
+  assert.equal(pkg.scripts['preview:hn'], 'node scripts/run-hn-platform-preview.mjs');
+
+  const casesScript = readFileSync(resolve('scripts/run-hn-platform-cases.mjs'), 'utf8');
+  const previewScript = readFileSync(resolve('scripts/run-hn-platform-preview.mjs'), 'utf8');
+
+  assert.match(casesScript, /--case/u);
+  assert.match(casesScript, /requireAgentworkforceFlags/u);
+  assert.match(casesScript, /live-read\.case\.yaml/u);
+  assert.match(casesScript, /live-model\.case\.yaml/u);
+  assert.match(previewScript, /--schedule/u);
+  assert.match(previewScript, /--reads/u);
+  assert.match(previewScript, /--model/u);
+  assert.match(previewScript, /requireAgentworkforceFlags/u);
+});
+
+test('platform invoke wrappers surface actionable missing-flag diagnostics', () => {
+  const help = 'Usage: agentworkforce invoke --fixture <file>\nFlags:\n  --fixture <file>\n';
+  assert.deepEqual(findMissingFlags(help, ['--schedule', '--reads', '--model']), [
+    '--schedule',
+    '--reads',
+    '--model',
+  ]);
+  assert.match(
+    formatMissingFlagsMessage('invoke', ['--schedule', '--reads', '--model'], help),
+    /missing required closure flags: --schedule, --reads, --model/u,
+  );
 });

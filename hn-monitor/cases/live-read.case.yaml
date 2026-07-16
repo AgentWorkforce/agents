@@ -4,9 +4,19 @@ agent: ../agent.ts
 kind: scheduled
 event:
   schedule: scan
+inputs:
+  SLACK_CHANNEL: C123
+  TOPICS: agents,ai,typescript
+  LOOKBACK_HOURS: "24"
+  MAX_STORIES: "8"
 policy:
   reads: live
   writes: preview
   model: stub
+  shell: simulate
+  compose: preview
 expect:
   status: succeeded
+  eventSource: cron
+  effectsContain:
+    - http.read

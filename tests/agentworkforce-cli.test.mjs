@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  agentworkforceBin,
+  agentworkforceCliOverrideEnv,
+  formatCommand,
+  getAgentworkforceInvocation,
+  runAgentworkforceAsync,
+} from '../scripts/agentworkforce-cli.mjs';
+
+test('agentworkforce helper defaults to the installed local binary', () => {
+  delete process.env[agentworkforceCliOverrideEnv];
+  const invocation = getAgentworkforceInvocation(['invoke', '--help']);
+  assert.equal(invocation.source, 'installed-package');
+  assert.equal(invocation.command, process.execPath);
+  assert.deepEqual(invocation.argv, [agentworkforceBin, 'invoke', '--help']);
+});
+
+test('agentworkforce helper accepts an explicit js artifact override', () => {
+  process.env[agentworkforceCliOverrideEnv] = '/tmp/workforce-cli/dist/cli.js';
+  const invocation = getAgentworkforceInvocation(['invoke', '--help']);
+  assert.equal(invocation.source, 'override');
+  assert.equal(invocation.command, process.execPath);
+  assert.deepEqual(invocation.argv, ['/tmp/workforce-cli/dist/cli.js', 'invoke', '--help']);
+  assert.equal(
+    formatCommand(['invoke', '--help']),
+    `${process.execPath} /tmp/workforce-cli/dist/cli.js invoke --help`,
+  );
+  delete process.env[agentworkforceCliOverrideEnv];
+});
+
+test('agentworkforce helper accepts an explicit binary override', () => {
+  process.env[agentworkforceCliOverrideEnv] = '/tmp/workforce-cli/bin/agentworkforce';
+  const invocation = getAgentworkforceInvocation(['runs', 'export', '--help']);
+  assert.equal(invocation.source, 'override');
+  assert.equal(invocation.command, '/tmp/workforce-cli/bin/agentworkforce');
+  assert.deepEqual(invocation.argv, ['runs', 'export', '--help']);
+  delete process.env[agentworkforceCliOverrideEnv];
+});
+
+test('agentworkforce async helper returns a timeout status for hanging override commands', async () => {
+  process.env[agentworkforceCliOverrideEnv] = process.execPath;
+  const result = await runAgentworkforceAsync(
+    ['-e', 'setInterval(() => {}, 1000)'],
+    { timeoutMs: 50 },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 124);
+  assert.match(result.stderr, /Timed out after 50ms/u);
+  delete process.env[agentworkforceCliOverrideEnv];
+});

@@ -1,0 +1,26 @@
+schemaVersion: 1
+id: acceptance.preview-thread-link
+agent: ./preview-thread-link-persona.ts
+kind: chat
+turns:
+  - type: cron.tick
+    name: scan
+    cron: 0 * * * *
+  - type: cron.tick
+    name: scan
+    cron: 0 * * * *
+inputs:
+  SLACK_CHANNEL: C123
+policy:
+  reads: fixtures
+  writes: preview
+  model: stub
+  shell: simulate
+  compose: preview
+expect:
+  status: succeeded
+  eventSource: cron
+  effectsContain:
+    - memory.save
+    - memory.recall
+    - provider.write

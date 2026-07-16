@@ -9,6 +9,15 @@ import { createIntegrationHealthServer } from '../scripts/acceptance/integration
 import { createModelMockServer } from '../scripts/acceptance/model-mock-server.mjs';
 import { writeBlockedFile, removeBlockedFile } from '../scripts/acceptance/blocked-lifecycle.mjs';
 import {
+  cloudComposioIntegrationTitle,
+  expectedHnSlackParentText,
+  expectedHnSlackReplyText,
+  validateCloudComposioVitestEvidence,
+  validateHumanSlackTrace,
+  validateSingleProviderReadEvidence,
+  validateWritesDenyEvidence,
+} from '../scripts/acceptance/closure-evidence.mjs';
+import {
   acceptancePackageSourceEnv,
   acceptancePackageSourceModes,
   resolveAcceptancePackageSourceMode,
@@ -22,6 +31,7 @@ test('sentinel server routes allowed GET correctly', async () => {
   const sentinel = await createSentinelServer();
   try {
     const res = await fetch(sentinel.allowedUrl);
+    assert.ok(sentinel.allowedUrl.startsWith(sentinel.url));
     assert.equal(res.status, 200);
     assert.equal(sentinel.counts.allowed.get, 1);
     assert.equal(sentinel.counts.denied.post, 0);
@@ -382,13 +392,252 @@ test('published package proof derives exact versions from the producer manifests
   assert.ok(Object.values(expected).every((version) => version === producerVersion));
 });
 
-test('closure acceptance keeps twelve gates and folds package proof into CLI evidence', () => {
+test('closure acceptance keeps fourteen gates and folds package proof into CLI evidence', () => {
   const source = readFileSync(
     new URL('../scripts/acceptance/composable-runtime-closure.mjs', import.meta.url),
     'utf8',
   );
-  assert.equal([...source.matchAll(/await runGate\(/gu)].length, 12);
+  assert.equal([...source.matchAll(/await runGate\(/gu)].length, 14);
   assert.match(source, /'cli-help-snapshot'/u);
   assert.match(source, /createLocalPackWorkforceProof/u);
+  assert.match(source, /'authored-writes-deny'/u);
+  assert.match(source, /'relayfile-single-provider-read'/u);
+  assert.match(source, /route\.integration\.test\.ts/u);
+  assert.match(source, /development-override/u);
   assert.doesNotMatch(source, /'workforce-installed-package-proof'/u);
+});
+
+// ── closure finding evidence validators ─────────────────────────────────────
+
+function writesDenyRecord(overrides = {}) {
+  return {
+    status: 'failed',
+    policy: { writes: 'deny' },
+    actions: [
+      { kind: 'provider.write', provider: 'slack', status: 'denied', data: { body: { text: 'denied HN digest' } } },
+      { kind: 'memory.save', status: 'denied', data: {} },
+    ],
+    stateDiff: { files: [], memory: [] },
+    ...overrides,
+  };
+}
+
+test('writes-deny evidence requires nonzero failure, denied HN writes, no mutation/receipts, and zero sentinel hits', () => {
+  const evidence = validateWritesDenyEvidence({
+    exitStatus: 1,
+    runRecord: writesDenyRecord(),
+    sentinelCounts: { requests: [] },
+  });
+  assert.equal(evidence.ok, true);
+  assert.equal(evidence.deniedWriteCount, 2);
+});
+
+test('writes-deny evidence rejects vacuous and escaped-write records', () => {
+  const vacuous = validateWritesDenyEvidence({
+    exitStatus: 0,
+    runRecord: writesDenyRecord({ status: 'succeeded', actions: [] }),
+    sentinelCounts: { requests: [] },
+  });
+  assert.equal(vacuous.ok, false);
+  assert.ok(vacuous.errors.some((error) => error.includes('nonzero')));
+  assert.ok(vacuous.errors.some((error) => error.includes('at least one required write')));
+
+  const escaped = validateWritesDenyEvidence({
+    exitStatus: 1,
+    runRecord: writesDenyRecord({
+      actions: [
+        { kind: 'provider.write', provider: 'slack', status: 'denied', data: {} },
+        { kind: 'files.write', status: 'previewed', data: { simulatedReceipt: { id: 'receipt' } } },
+      ],
+      stateDiff: { files: [{ path: '/escaped' }], memory: [] },
+    }),
+    sentinelCounts: { requests: [{ method: 'POST', url: '/escaped' }] },
+  });
+  assert.equal(escaped.ok, false);
+  assert.ok(escaped.errors.some((error) => error.includes('escaped denial')));
+  assert.ok(escaped.errors.some((error) => error.includes('zero simulated receipts')));
+  assert.ok(escaped.errors.some((error) => error.includes('zero state mutations')));
+  assert.ok(escaped.errors.some((error) => error.includes('sentinel received 1')));
+});
+
+function humanSlackRecord() {
+  return {
+    actions: [
+      { kind: 'model.complete', status: 'previewed', data: {} },
+      {
+        kind: 'provider.write',
+        provider: 'slack',
+        resource: 'messages',
+        status: 'previewed',
+        data: {
+          path: '/slack/channels/C123/messages/preview-parent.json',
+          body: { text: expectedHnSlackParentText },
+          simulatedReceipt: { id: 'preview-parent' },
+        },
+      },
+      {
+        kind: 'provider.write',
+        provider: 'slack',
+        resource: 'messages',
+        status: 'previewed',
+        data: {
+          path: '/slack/channels/C123/messages/preview-reply.json',
+          body: {
+            text: expectedHnSlackReplyText,
+            parentRef: '/slack/channels/C123/messages/preview-parent.json',
+            thread_ts: 'preview-parent',
+          },
+          simulatedReceipt: { id: 'preview-reply' },
+        },
+      },
+    ],
+  };
+}
+
+function humanSlackOutput() {
+  return [
+    'preview: 1 run(s) — 1 ok, 0 failed',
+    '    trace:',
+    '      01. [PREVIEW] model.complete',
+    '      02. [PREVIEW] provider.write slack.messages',
+    '          slack message: parent',
+    '          channel: C123',
+    `          text (exact): ${JSON.stringify(expectedHnSlackParentText)}`,
+    '      03. [PREVIEW] provider.write slack.messages',
+    '          slack message: reply',
+    '          channel: C123',
+    '          linkage: parentRef=/slack/channels/C123/messages/preview-parent.json thread_ts=preview-parent receipt=preview-reply',
+    `          text (exact): ${JSON.stringify(expectedHnSlackReplyText)}`,
+    '',
+  ].join('\n');
+}
+
+test('human Slack evidence requires exact HN texts, channel, linkage, and action order', () => {
+  const evidence = validateHumanSlackTrace({
+    humanOutput: humanSlackOutput(),
+    runRecord: humanSlackRecord(),
+  });
+  assert.equal(evidence.ok, true);
+  assert.equal(evidence.parentActionSequence, 2);
+  assert.equal(evidence.replyActionSequence, 3);
+});
+
+test('human Slack evidence rejects aggregate-only and partial output', () => {
+  const aggregateOnly = validateHumanSlackTrace({
+    humanOutput: 'preview: 1 run(s) — 1 ok, 0 failed\n  [ok] cron.tick@1 run_1 (3 action(s))\n',
+    runRecord: humanSlackRecord(),
+  });
+  assert.equal(aggregateOnly.ok, false);
+  assert.ok(aggregateOnly.errors.some((error) => error.includes('exact parent text')));
+  assert.ok(aggregateOnly.errors.some((error) => error.includes('reply thread timestamp')));
+
+  const noActions = validateHumanSlackTrace({ humanOutput: humanSlackOutput(), runRecord: { actions: [] } });
+  assert.equal(noActions.ok, false);
+  assert.ok(noActions.errors.some((error) => error.includes('exactly two Slack writes')));
+});
+
+test('human Slack evidence rejects independently truncated or substituted HN snapshots', () => {
+  const truncatedRecord = humanSlackRecord();
+  truncatedRecord.actions[2].data.body.text = expectedHnSlackReplyText.slice(0, -1);
+  const truncated = validateHumanSlackTrace({ humanOutput: humanSlackOutput(), runRecord: truncatedRecord });
+  assert.equal(truncated.ok, false);
+  assert.ok(truncated.errors.some((error) => error.includes('RunRecord reply text')));
+
+  const substitutedOutput = humanSlackOutput().replace('Claude Code adds background coding agents', 'substituted story');
+  const substituted = validateHumanSlackTrace({ humanOutput: substitutedOutput, runRecord: humanSlackRecord() });
+  assert.equal(substituted.ok, false);
+  assert.ok(substituted.errors.some((error) => error.includes('exact reply text snapshot')));
+});
+
+test('single provider-read evidence rejects duplicate action or trace recording', () => {
+  const action = {
+    kind: 'provider.read',
+    status: 'previewed',
+    provider: 'slack',
+    resource: 'messages',
+    data: { operation: 'list', parameters: { channelId: 'C123' }, path: '/slack/channels/C123/messages' },
+  };
+  const span = {
+    kind: 'provider.read',
+    data: { operation: 'list', parameters: { channelId: 'C123' }, path: '/slack/channels/C123/messages' },
+  };
+  assert.equal(validateSingleProviderReadEvidence({ actions: [action], trace: [span] }).ok, true);
+  assert.equal(validateSingleProviderReadEvidence({ actions: [action, action], trace: [span] }).ok, false);
+  assert.equal(validateSingleProviderReadEvidence({ actions: [action], trace: [] }).ok, false);
+  assert.equal(validateSingleProviderReadEvidence({ actions: [], trace: [] }).ok, false);
+});
+
+test('Cloud Composio evidence requires the dedicated verbose integration title and a green exit', () => {
+  const evidence = {
+    schemaVersion: 1,
+    first: { httpStatus: 200, accepted: true, state: 'unmatched' },
+    duplicate: { httpStatus: 200, accepted: true, state: 'duplicate', duplicateOf: 'event_1' },
+    event: {
+      id: 'event_1',
+      type: 'composio.trigger.message',
+      contractVersion: 1,
+      workspaceId: '11111111-1111-4111-8111-111111111111',
+      resource: {
+        provider: 'composio',
+        kind: 'composio.trigger',
+        id: 'ti_github_123',
+        path: '/composio/triggers/ti_github_123',
+      },
+      occurredAt: '2026-07-16T01:00:00.000Z',
+      deliveryId: 'msg_composio_123',
+      payloadDeliveryId: 'msg_composio_123',
+      payloadConnectionId: 'ca_composio_123',
+    },
+    identity: {
+      workspaceIntegrationId: '33333333-3333-4333-8333-333333333333',
+      workspaceId: '11111111-1111-4111-8111-111111111111',
+      provider: 'github',
+      connectedAccountId: 'ca_composio_123',
+      backend: 'composio',
+    },
+    dedupe: { first: 'claimed', second: 'duplicate', duplicateOf: 'event_1' },
+    trace: {
+      first: [
+        'event.ingress.received',
+        'event.ingress.verified',
+        'event.contract.resolved',
+        'event.normalized',
+        'event.dedupe.claimed',
+        'event.match.completed',
+        'event.completed',
+      ],
+      second: [
+        'event.ingress.received',
+        'event.ingress.verified',
+        'event.contract.resolved',
+        'event.normalized',
+        'event.dedupe.duplicate',
+      ],
+    },
+    dispatchCount: 1,
+  };
+  const output = [
+    'packages/web/app/api/v1/webhooks/composio/route.integration.test.ts',
+    ` ✓ ${cloudComposioIntegrationTitle}`,
+    `COMPOSIO_CLOSURE_EVIDENCE=${JSON.stringify(evidence)}`,
+  ].join('\n');
+  assert.equal(validateCloudComposioVitestEvidence({ exitStatus: 0, output }).ok, true);
+  assert.equal(validateCloudComposioVitestEvidence({ exitStatus: 0, output: 'route.test.ts 1 passed' }).ok, false);
+  assert.equal(validateCloudComposioVitestEvidence({ exitStatus: 1, output }).ok, false);
+
+  const omitted = output.split('\n').slice(0, 2).join('\n');
+  assert.equal(validateCloudComposioVitestEvidence({ exitStatus: 0, output: omitted }).ok, false);
+  const malformed = `${omitted}\nCOMPOSIO_CLOSURE_EVIDENCE={not-json}`;
+  assert.equal(validateCloudComposioVitestEvidence({ exitStatus: 0, output: malformed }).ok, false);
+
+  const wrong = structuredClone(evidence);
+  wrong.identity.connectedAccountId = 'ca_wrong';
+  wrong.trace.first = [...wrong.trace.first].reverse();
+  wrong.dispatchCount = 0;
+  const wrongOutput = `${omitted}\nCOMPOSIO_CLOSURE_EVIDENCE=${JSON.stringify(wrong)}`;
+  const wrongResult = validateCloudComposioVitestEvidence({ exitStatus: 0, output: wrongOutput });
+  assert.equal(wrongResult.ok, false);
+  assert.ok(wrongResult.errors.some((error) => error.includes('persisted connection')));
+  assert.ok(wrongResult.errors.some((error) => error.includes('out of order')));
+  assert.ok(wrongResult.errors.some((error) => error.includes('exactly once')));
 });

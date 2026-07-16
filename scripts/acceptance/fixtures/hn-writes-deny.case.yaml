@@ -1,0 +1,31 @@
+schemaVersion: 1
+id: hn-monitor.authored-writes-deny
+agent: ../../../hn-monitor/agent.ts
+kind: chat
+event:
+  type: slack.app_mention
+  resource:
+    channel: C123
+    ts: "300.2"
+    thread_ts: "300.1"
+    text: <@UBOT> European Parliament MCP Server – Political Intelligence for AI Agents -> give me more info on this
+    user: U1
+inputs:
+  SLACK_CHANNEL: C123
+policy:
+  reads: fixtures
+  writes: deny
+  model: stub
+  shell: simulate
+  compose: preview
+http:
+  - method: GET
+    match: restrictSearchableAttributes=title
+    file: ../../../hn-monitor/fixtures/hn-european-title-search.json
+  - method: GET
+    match: /api/v1/items/4242
+    file: ../../../hn-monitor/fixtures/hn-item-4242.json
+expect:
+  status: failed
+  effectsContain:
+    - provider.write

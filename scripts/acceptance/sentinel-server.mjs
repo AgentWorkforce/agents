@@ -36,6 +36,7 @@ export async function createSentinelServer() {
   }
 
   return {
+    url: `http://127.0.0.1:${address.port}`,
     allowedUrl: `http://127.0.0.1:${address.port}/allowed-get`,
     deniedUrl: `http://127.0.0.1:${address.port}/denied-post`,
     undeclaredUrl: `http://127.0.0.1:${address.port}/undeclared-get`,

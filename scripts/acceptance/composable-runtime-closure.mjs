@@ -11,6 +11,13 @@ import { createIntegrationHealthServer } from './integration-health-server.mjs';
 import { createModelMockServer } from './model-mock-server.mjs';
 import { writeBlockedFile, removeBlockedFile } from './blocked-lifecycle.mjs';
 import {
+  cloudComposioIntegrationTitle,
+  validateCloudComposioVitestEvidence,
+  validateHumanSlackTrace,
+  validateSingleProviderReadEvidence,
+  validateWritesDenyEvidence,
+} from './closure-evidence.mjs';
+import {
   acceptancePackageSourceModes,
   createLocalPackWorkforceProof,
   createPublishedInstalledWorkforceProof,
@@ -70,22 +77,16 @@ let cliSource = 'installed-package';
 await runGate(
   'cli-help-snapshot',
   [
-    acceptancePackageSourceMode === acceptancePackageSourceModes.localPack
-      ? 'pack and install the reviewed Workforce producer artifacts'
-      : 'validate the exact published Workforce package versions',
+    process.env[agentworkforceCliOverrideEnv]?.trim()
+      ? `development override: ${process.env[agentworkforceCliOverrideEnv]?.trim()}`
+      : acceptancePackageSourceMode === acceptancePackageSourceModes.localPack
+        ? 'pack and install the reviewed Workforce producer artifacts'
+        : 'validate the exact published Workforce package versions',
     'agentworkforce --help',
     'agentworkforce invoke --help',
     'agentworkforce runs export --help',
   ].join('\n'),
   async () => {
-    if (process.env[agentworkforceCliOverrideEnv]?.trim()) {
-      return {
-        exitCode: 1,
-        summary: `${agentworkforceCliOverrideEnv} is set. This acceptance must run through the installed package path without source overrides.`,
-        artifactRefs: [],
-      };
-    }
-
     if (!isSupportedAcceptanceNode()) {
       return {
         exitCode: 1,
@@ -94,18 +95,36 @@ await runGate(
       };
     }
 
-    const packageOutcome = acceptancePackageSourceMode === acceptancePackageSourceModes.localPack
-      ? createLocalPackWorkforceProof({
-        taskRoot,
-        workforceRoot,
-        artifactRoot,
-        agentsPackage: agentsPkg,
-      })
-      : createPublishedInstalledWorkforceProof({
-        taskRoot,
-        workforceRoot,
-        agentsPackage: agentsPkg,
-      });
+    const cliOverride = process.env[agentworkforceCliOverrideEnv]?.trim();
+    const packageOutcome = cliOverride
+      ? {
+        exitCode: isAgentworkforceInstalled() ? 0 : 1,
+        summary: isAgentworkforceInstalled()
+          ? `Development validation is using the explicit built Workforce CLI override ${cliOverride}; release acceptance still requires ${acceptancePackageSourceModes.publishedInstalled} with all overrides unset.`
+          : `Development CLI override does not exist: ${cliOverride}`,
+        artifactRefs: [],
+        proof: {
+          proofMode: 'development-override',
+          cliOverrideRequested: cliOverride,
+          producerArtifacts: [],
+          requiredPackages: [],
+          installedPackages: {},
+          installCommand: null,
+          installedBin: cliOverride,
+        },
+      }
+      : acceptancePackageSourceMode === acceptancePackageSourceModes.localPack
+        ? createLocalPackWorkforceProof({
+          taskRoot,
+          workforceRoot,
+          artifactRoot,
+          agentsPackage: agentsPkg,
+        })
+        : createPublishedInstalledWorkforceProof({
+          taskRoot,
+          workforceRoot,
+          agentsPackage: agentsPkg,
+        });
 
     Object.assign(workforcePackageArtifacts, packageOutcome.proof);
     cliIdentity = getAgentworkforceInvocation([]).identity;
@@ -577,26 +596,131 @@ await runGate(
       ],
       { env, timeoutMs: invokeTimeoutMs },
     );
+    const humanOutput = `${result.stdout}${result.stderr}`;
+    const humanArtifact = writeArtifact('threaded-preview.human.txt', humanOutput.trim() + '\n');
     const stdoutArtifact = writeArtifact('threaded-preview.stdout.txt', `${result.stdout}\n${result.stderr}`.trim() + '\n');
-    const artifacts = [stdoutArtifact];
+    const artifacts = [humanArtifact, stdoutArtifact];
     if (result.status === 0) artifacts.push(relative(taskRoot, runRecordPath));
     if (result.status !== 0) {
       return { exitCode: result.status, summary: 'Threaded Slack preview case failed.', artifactRefs: artifacts };
     }
 
     const runRecord = readJson(runRecordPath);
-    const writes = runRecord.actions.filter((action) => action.kind === 'provider.write' && action.provider === 'slack');
-    const header = writes.find((action) => action.resource === 'messages' && !action.data?.body?.parentRef);
-    const thread = writes.find((action) => action.resource === 'messages' && typeof action.data?.body?.parentRef === 'string');
-    const previewedOnly = writes.every((action) => action.status === 'previewed');
+    const evidence = validateHumanSlackTrace({ humanOutput, runRecord, channel: 'C123' });
+    const evidenceArtifact = writeArtifact('threaded-preview.human-evidence.json', JSON.stringify(evidence, null, 2) + '\n');
 
     return {
-      exitCode: header && thread && thread.data?.body?.thread_ts && previewedOnly ? 0 : 1,
-      summary:
-        header && thread && thread.data?.body?.thread_ts && previewedOnly
-          ? 'Production-shaped Relayfile/Slack credentials still yielded preview-only parent+thread Slack writes.'
-          : 'Preview parent/thread Slack proof was incomplete.',
-      artifactRefs: artifacts,
+      exitCode: evidence.ok ? 0 : 1,
+      summary: evidence.ok
+        ? `Default human output rendered the exact HN Slack parent and threaded reply in action order for channel ${evidence.channel}, parentRef=${evidence.parentRef}, thread_ts=${evidence.threadTs}.`
+        : `Exact default human Slack trace proof failed: ${evidence.errors.join('; ')}.`,
+      artifactRefs: [...artifacts, evidenceArtifact],
+    };
+  },
+);
+
+await runGate(
+  'authored-writes-deny',
+  `${formatCommand([
+    'invoke',
+    './hn-monitor/agent.ts',
+    '--case',
+    './scripts/acceptance/fixtures/hn-writes-deny.case.yaml',
+    '--output',
+    '<run-record>',
+  ])}`,
+  async () => {
+    const sentinel = await createSentinelServer();
+    const runRecordPath = resolve(artifactFilesRoot, 'hn-writes-deny.run-record.json');
+    const productionEnv = buildSanitizedAgentworkforceEnv({
+      RELAYFILE_URL: sentinel.url,
+      RELAYFILE_TOKEN: 'rf_live_51N7INEL_PRODUCTION_SHAPED',
+      RELAYFILE_WORKSPACE_ID: 'rf_ws_production',
+      RELAYCAST_URL: sentinel.url,
+      RELAY_BASE_URL: sentinel.url,
+      RELAY_API_KEY: 'rk_live_51N7INEL_PRODUCTION_SHAPED',
+      WORKFORCE_AGENT_TOKEN: 'wa_live_51N7INEL_PRODUCTION_SHAPED',
+      WORKFORCE_CLOUD_URL: sentinel.url,
+      AGENTRELAY_CLOUD_URL: sentinel.url,
+      CLOUD_API_ACCESS_TOKEN: 'wft_live_51N7INEL_PRODUCTION_SHAPED',
+      SLACK_BOT_TOKEN: 'xoxb-123456789012-123456789012-SENTINEL',
+      SLACK_TOKEN: 'xoxb-123456789012-123456789012-SENTINEL',
+    });
+
+    try {
+      const invoke = await runAgentworkforceExactEnvAsync(
+        [
+          'invoke',
+          './hn-monitor/agent.ts',
+          '--case',
+          './scripts/acceptance/fixtures/hn-writes-deny.case.yaml',
+          '--output',
+          runRecordPath,
+        ],
+        { env: productionEnv, timeoutMs: invokeTimeoutMs },
+      );
+      const outputArtifact = writeArtifact('hn-writes-deny.stdout.txt', `${invoke.stdout}\n${invoke.stderr}`.trim() + '\n');
+      const sentinelArtifact = writeArtifact('hn-writes-deny.sentinels.json', JSON.stringify(sentinel.counts, null, 2) + '\n');
+      let runRecord = null;
+      try { runRecord = readJson(runRecordPath); } catch {}
+      const evidence = validateWritesDenyEvidence({
+        exitStatus: invoke.status,
+        runRecord,
+        sentinelCounts: sentinel.counts,
+      });
+      const evidenceArtifact = writeArtifact('hn-writes-deny.evidence.json', JSON.stringify(evidence, null, 2) + '\n');
+      const artifacts = [outputArtifact, sentinelArtifact, evidenceArtifact];
+      if (runRecord) artifacts.push(relative(taskRoot, runRecordPath));
+      return {
+        exitCode: evidence.ok ? 0 : 1,
+        summary: evidence.ok
+          ? `Authored writes: deny failed the real HN invoke with ${evidence.deniedWriteCount} denied required write(s), zero previewed mutations/receipts, and zero sentinel requests.`
+          : `Authored writes: deny proof failed: ${evidence.errors.join('; ')}.`,
+        artifactRefs: artifacts,
+      };
+    } finally {
+      sentinel.close();
+    }
+  },
+);
+
+await runGate(
+  'relayfile-single-provider-read',
+  `${formatCommand([
+    'invoke',
+    './scripts/acceptance/fixtures/provider-read-persona.ts',
+    '--schedule',
+    'scan',
+    '--output',
+    '<run-record>',
+  ])}`,
+  async () => {
+    const runRecordPath = resolve(artifactFilesRoot, 'provider-read.run-record.json');
+    const invoke = runAgentworkforce(
+      [
+        'invoke',
+        './scripts/acceptance/fixtures/provider-read-persona.ts',
+        '--schedule',
+        'scan',
+        '--output',
+        runRecordPath,
+      ],
+      { env: baseAgentworkforceEnv(), timeoutMs: invokeTimeoutMs },
+    );
+    const outputArtifact = writeArtifact('provider-read.stdout.txt', `${invoke.stdout}\n${invoke.stderr}`.trim() + '\n');
+    const artifacts = [outputArtifact];
+    if (invoke.status !== 0) {
+      return { exitCode: invoke.status, summary: 'Authored Relayfile provider-read invoke failed.', artifactRefs: artifacts };
+    }
+    const runRecord = readJson(runRecordPath);
+    const evidence = validateSingleProviderReadEvidence(runRecord);
+    const evidenceArtifact = writeArtifact('provider-read.evidence.json', JSON.stringify(evidence, null, 2) + '\n');
+    return {
+      exitCode: evidence.ok ? 0 : 1,
+      summary: evidence.ok
+        ? 'One authored Relayfile Slack read produced exactly one Run action and one trace span.'
+        : `Relayfile provider-read cardinality proof failed: ${evidence.errors.join('; ')}.`,
+      artifactRefs: [...artifacts, relative(taskRoot, runRecordPath), evidenceArtifact],
     };
   },
 );
@@ -801,6 +925,7 @@ await runGate(
     'npm run test --workspace @cloud/webhook-worker',
     'node scripts/check-route-coverage.mjs',
     'node ./node_modules/vitest/vitest.mjs run --config vitest.config.ts <cloud ingress suites>',
+    `npm exec -- vitest run packages/web/app/api/v1/webhooks/composio/route.integration.test.ts --reporter=verbose # ${cloudComposioIntegrationTitle}`,
     'npm run web:webhook-ingress:test',
     'node ./node_modules/vitest/vitest.mjs run --config vitest.config.ts <cloud replay suites>',
   ].join('\n'),
@@ -830,6 +955,15 @@ await runGate(
       'packages/web/app/api/v1/webhooks/composio/connect/callback/route.test.ts',
     ];
     const webhookIngress = runShell(['npm', 'run', 'web:webhook-ingress:test'], { cwd: cloudRoot });
+    const composioRouteIntegrationArgs = [
+      'npm',
+      'exec',
+      '--',
+      'vitest',
+      'run',
+      'packages/web/app/api/v1/webhooks/composio/route.integration.test.ts',
+      '--reporter=verbose',
+    ];
     const replayArgs = [
       'node',
       './node_modules/vitest/vitest.mjs',
@@ -841,7 +975,12 @@ await runGate(
     ];
 
     const ingress = runShell(ingressArgs, { cwd: cloudRoot });
+    const composioRouteIntegration = runShell(composioRouteIntegrationArgs, { cwd: cloudRoot });
     const replay = runShell(replayArgs, { cwd: cloudRoot });
+    const composioRouteEvidence = validateCloudComposioVitestEvidence({
+      exitStatus: composioRouteIntegration.status,
+      output: `${composioRouteIntegration.stdout}\n${composioRouteIntegration.stderr}`,
+    });
     const artifacts = [
       writeArtifact('cloud-webhook-worker-typecheck.txt', `${workerTypecheck.stdout}\n${workerTypecheck.stderr}`.trim() + '\n'),
       writeArtifact('cloud-router-typecheck.txt', `${routerTypecheck.stdout}\n${routerTypecheck.stderr}`.trim() + '\n'),
@@ -849,6 +988,8 @@ await runGate(
       writeArtifact('cloud-route-coverage.txt', `${routeCoverage.stdout}\n${routeCoverage.stderr}`.trim() + '\n'),
       writeArtifact('cloud-ingress-suite.txt', `${ingress.stdout}\n${ingress.stderr}`.trim() + '\n'),
       writeArtifact('cloud-webhook-ingress-suite.txt', `${webhookIngress.stdout}\n${webhookIngress.stderr}`.trim() + '\n'),
+      writeArtifact('cloud-composio-route-integration.txt', `${composioRouteIntegration.stdout}\n${composioRouteIntegration.stderr}`.trim() + '\n'),
+      writeArtifact('cloud-composio-route-evidence.json', JSON.stringify(composioRouteEvidence, null, 2) + '\n'),
       writeArtifact('cloud-replay-suite.txt', `${replay.stdout}\n${replay.stderr}`.trim() + '\n'),
     ];
 
@@ -913,6 +1054,7 @@ await runGate(
         routeCoverage.status === 0 &&
         ingress.status === 0 &&
         webhookIngress.status === 0 &&
+        composioRouteEvidence.ok &&
         replay.status === 0 &&
         integHealthResult?.status === 0 &&
         integHealthPopulated &&
@@ -926,12 +1068,13 @@ await runGate(
         routeCoverage.status === 0 &&
         ingress.status === 0 &&
         webhookIngress.status === 0 &&
+        composioRouteEvidence.ok &&
         replay.status === 0 &&
         integHealthResult?.status === 0 &&
         integHealthPopulated &&
         integAuthPresent
-          ? 'Cloud router/webhook-worker/ingress/Composio/replay parity suites passed at the sibling Cloud commit; integration health projection populated and auth was forwarded.'
-          : 'Cloud focused parity, replay suite, or integration health projection failed.',
+          ? 'Cloud router/webhook-worker/ingress/replay suites passed; the authenticated persisted-identity Composio production route reached canonical Event Receiver dedupe/trace coverage; integration health projection populated and auth was forwarded.'
+          : `Cloud focused parity, authenticated Composio route, replay suite, or integration health projection failed. ${composioRouteEvidence.errors.join('; ')}`,
       artifactRefs: artifacts,
       repositoryCommits: {
         ...repoEvidence.repositories,
@@ -1120,6 +1263,11 @@ await runGate('artifact-secret-scan', 'scan generated artifact contents for secr
     'dummy-mock-access-token',
     'dummy-mock-refresh-token',
     'acct-live-model-mock',
+    'rf_live_51N7INEL_PRODUCTION_SHAPED',
+    'rk_live_51N7INEL_PRODUCTION_SHAPED',
+    'wa_live_51N7INEL_PRODUCTION_SHAPED',
+    'wft_live_51N7INEL_PRODUCTION_SHAPED',
+    'xoxb-123456789012-123456789012-SENTINEL',
   ].filter(Boolean);
   const secretPatterns = [
     ['slack-token', /\bxox(?:a|b|p|r|s)-[A-Za-z0-9-]+\b/gu],

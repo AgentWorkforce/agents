@@ -16,7 +16,7 @@ import {
   loadRecentThreads
 } from '../.test-build/inbox-buddy/lib/gmail.js';
 import { buildPrompt, focusedThreadIds } from '../.test-build/inbox-buddy/lib/prompt.js';
-import { renderTranscript } from '../.test-build/inbox-buddy/lib/conversation.js';
+import { convTag, loadConversation, renderTranscript } from '../.test-build/inbox-buddy/lib/conversation.js';
 import {
   readSlackMessage,
   skipReason,
@@ -204,6 +204,44 @@ test('stripLeadingMention removes a leading @mention', () => {
 
 test('renderTranscript is empty on the first turn', () => {
   assert.equal(renderTranscript([]), '');
+});
+
+test('loadConversation selects the newest snapshot when recall ranks a stale snapshot first', async () => {
+  const key = 'C_CHAT';
+  const stale = [{ role: 'user', text: 'stale turn', at: '2026-06-10T10:00:00.000Z' }];
+  const latest = [
+    ...stale,
+    { role: 'assistant', text: 'latest reply', at: '2026-06-10T11:00:00.000Z' }
+  ];
+  let recallOptions;
+  const ctx = {
+    memory: {
+      async recall(_query, options) {
+        recallOptions = options;
+        return [
+          {
+            id: 'stale-but-relevant',
+            content: JSON.stringify(stale),
+            tags: [convTag(key)],
+            scope: 'workspace',
+            createdAt: '2026-06-10T10:00:00.000Z'
+          },
+          {
+            id: 'latest',
+            content: JSON.stringify(latest),
+            tags: [convTag(key)],
+            scope: 'workspace',
+            createdAt: '2026-06-10T11:00:00.000Z'
+          }
+        ];
+      }
+    }
+  };
+
+  assert.deepEqual(await loadConversation(ctx, key), latest);
+  assert.deepEqual(recallOptions.tags, [convTag(key)]);
+  assert.equal(recallOptions.scope, 'workspace');
+  assert.ok(recallOptions.limit > 1);
 });
 
 // ── conversational continuity (the forcing-function) ──────────────────────────

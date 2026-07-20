@@ -22,6 +22,9 @@ export interface ConvTurn {
 /** Keep prompts bounded: replay at most the last N turns. */
 export const MAX_TURNS = 16;
 
+/** Recall enough snapshots to recover the newest append-only memory record. */
+const SNAPSHOT_RECALL_LIMIT = 20;
+
 /** Memory tag for a conversation's transcript record. */
 export function convTag(key: string): string {
   return `inbox-buddy:conv:${key}`;
@@ -29,16 +32,17 @@ export function convTag(key: string): string {
 
 /**
  * Load the transcript for a conversation, oldest-first. We store the whole
- * transcript as a single evolving JSON blob (same pattern as hn-monitor's
- * seen-set): `recall(..., { limit: 1 })` returns the most recent save.
+ * transcript as a single evolving JSON blob. Memory recall is relevance-ranked,
+ * so fetch several tagged snapshots and select the most recent save explicitly.
  */
 export async function loadConversation(ctx: WorkforceCtx, key: string): Promise<ConvTurn[]> {
   try {
-    const [item] = await ctx.memory.recall(`conversation ${key}`, {
+    const items = await ctx.memory.recall(`conversation ${key}`, {
       tags: [convTag(key)],
       scope: 'workspace',
-      limit: 1
+      limit: SNAPSHOT_RECALL_LIMIT
     });
+    const [item] = [...items].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     if (!item) return [];
     const parsed = JSON.parse(item.content) as unknown;
     if (!Array.isArray(parsed)) return [];

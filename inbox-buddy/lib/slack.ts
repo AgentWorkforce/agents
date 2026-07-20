@@ -101,7 +101,7 @@ export function conversationKeyForSlack(msg: SlackMessage): string {
 export function skipReason(msg: SlackMessage, boardChannel: string | undefined): string | null {
   if (msg.isBot) return 'bot message';
   if (msg.subtype) return `slack subtype ${msg.subtype}`;
-  if (boardChannel && bareChannelId(msg.channel) !== bareChannelId(boardChannel)) return 'not the chat channel';
+  if (!boardChannel || bareChannelId(msg.channel) !== bareChannelId(boardChannel)) return 'not the chat channel';
   if (!stripLeadingMention(msg.text).trim()) return 'empty message text';
   return null;
 }

@@ -61,10 +61,11 @@ function seedMount() {
 }
 
 /** In-memory ctx: newest-first recall by tag, capturing logs. */
-function makeCtx() {
+function makeCtx(inputs = {}) {
   const store = [];
   let seq = 0;
   return {
+    persona: { inputs, inputSpecs: {} },
     logs: [],
     log(level, message, data) {
       this.logs.push({ level, message, data });
@@ -189,6 +190,8 @@ test('skipReason: loop guard on bot messages, channel filter, empty text', () =>
   assert.equal(skipReason({ channel: 'C_CHAT', ts: '1', text: 'hi', isBot: true }, 'C_CHAT'), 'bot message');
   assert.match(skipReason({ channel: 'C_CHAT', ts: '1', text: 'hi', isBot: false, subtype: 'message_changed' }, 'C_CHAT'), /subtype/);
   assert.equal(skipReason({ channel: 'C_OTHER', ts: '1', text: 'hi', isBot: false }, 'C_CHAT'), 'not the chat channel');
+  assert.equal(skipReason({ channel: 'C_CHAT', ts: '1', text: 'hi', isBot: false }, undefined), 'not the chat channel');
+  assert.equal(skipReason({ channel: 'C_CHAT', ts: '1', text: 'hi', isBot: false }, ''), 'not the chat channel');
   assert.equal(skipReason({ channel: 'C_CHAT', ts: '1', text: '   ', isBot: false }, 'C_CHAT'), 'empty message text');
   assert.equal(skipReason({ channel: 'C_CHAT', ts: '1', text: 'real question', isBot: false }, 'C_CHAT'), null);
 });
@@ -212,7 +215,7 @@ test('multi-turn: turn 2 prompt replays turn 1 (continuity across messages)', as
   const mount = seedMount();
   process.env.RELAYFILE_MOUNT_ROOT = mount;
   try {
-    const ctx = makeCtx();
+    const ctx = makeCtx({ SLACK_CHANNEL: 'C_CHAT' });
     const slack = makeSlack();
     const prompts = [];
 
@@ -250,7 +253,7 @@ test('handleSlackMessage loads threads from the mount and focuses the right one'
   const mount = seedMount();
   process.env.RELAYFILE_MOUNT_ROOT = mount;
   try {
-    const ctx = makeCtx();
+    const ctx = makeCtx({ SLACK_CHANNEL: 'C_CHAT' });
     let seenPrompt = '';
     await handleSlackMessage(
       ctx,
@@ -282,11 +285,27 @@ test('handleSlackMessage ignores bot messages (no model call, no reply) — loop
   assert.ok(ctx.logs.some((l) => l.message.startsWith('inbox-buddy.skip') && l.message.includes('reason=bot-message')));
 });
 
+test('handleSlackMessage fails closed when SLACK_CHANNEL is unset', async () => {
+  const ctx = makeCtx();
+  const slack = makeSlack();
+  let completeCalls = 0;
+  await handleSlackMessage(
+    ctx,
+    slackEvent({ ts: '1', text: 'a human message' }),
+    { complete: async () => { completeCalls++; return 'x'; }, slack }
+  );
+  assert.equal(completeCalls, 0);
+  assert.equal(slack.calls.length, 0);
+  assert.ok(
+    ctx.logs.some((l) => l.message.includes('reason=not-the-chat-channel') && l.message.includes('configured=unset'))
+  );
+});
+
 test('handleSlackMessage replies in-thread when the message is threaded', async () => {
   const mount = seedMount();
   process.env.RELAYFILE_MOUNT_ROOT = mount;
   try {
-    const ctx = makeCtx();
+    const ctx = makeCtx({ SLACK_CHANNEL: 'C_CHAT' });
     const slack = makeSlack();
     await handleSlackMessage(
       ctx,

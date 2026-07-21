@@ -84,7 +84,7 @@ export function conversationKeyForTelegram(msg: TelegramMessage): string {
  */
 export function skipReason(msg: TelegramMessage, boardChat: string | undefined): string | null {
   if (msg.fromIsBot) return 'bot message';
-  if (boardChat && bareChatId(msg.chatId) !== bareChatId(boardChat)) return 'not the configured chat';
+  if (!boardChat || bareChatId(msg.chatId) !== bareChatId(boardChat)) return 'not the configured chat';
   if (!msg.text.trim()) return 'empty message text';
   return null;
 }

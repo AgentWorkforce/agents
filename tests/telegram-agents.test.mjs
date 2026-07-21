@@ -98,6 +98,8 @@ test('conversationKeyForTelegram keys on bare chat, plus forum topic', () => {
 test('skipReason: bot loop guard, wrong chat, empty text', () => {
   assert.equal(skipReason({ chatId: '1', messageId: '1', text: 'hi', fromIsBot: true }, '1'), 'bot message');
   assert.equal(skipReason({ chatId: '2', messageId: '1', text: 'hi', fromIsBot: false }, '1'), 'not the configured chat');
+  assert.equal(skipReason({ chatId: '1', messageId: '1', text: 'hi', fromIsBot: false }, undefined), 'not the configured chat');
+  assert.equal(skipReason({ chatId: '1', messageId: '1', text: 'hi', fromIsBot: false }, ''), 'not the configured chat');
   assert.equal(skipReason({ chatId: '1', messageId: '1', text: '   ', fromIsBot: false }, '1'), 'empty message text');
   assert.equal(skipReason({ chatId: '1__g', messageId: '1', text: 'real', fromIsBot: false }, '1'), null);
 });
@@ -161,6 +163,22 @@ test('inbox-buddy (telegram): skips the bot\'s own messages (loop guard)', async
     { complete: async () => 'should not run', telegram: tg }
   );
   assert.equal(tg.sends.length, 0);
+});
+
+test('inbox-buddy (telegram): fails closed when TELEGRAM_CHAT is unset', async () => {
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  let completeCalls = 0;
+  await inboxHandle(
+    ctx,
+    telegramEvent({ chatId: '123', messageId: '7', text: 'a human message' }),
+    { complete: async () => { completeCalls++; return 'should not run'; }, telegram: tg }
+  );
+  assert.equal(completeCalls, 0);
+  assert.equal(tg.sends.length, 0);
+  assert.ok(
+    ctx.logs.some((l) => l.message.includes('reason=not-the-configured-chat') && l.message.includes('configured=unset'))
+  );
 });
 
 // ── joke-bot (Telegram transport of the unified dual-transport agent) ──────────
@@ -388,4 +406,3 @@ test('spotify-releases (slack): DMs releases to SLACK_USER, advances checkpoint'
   const notified = await ctx.memory.recall('x', { tags: ['spotify-releases:notified'] });
   assert.deepEqual(JSON.parse(notified[0].content), ['https://open.spotify.com/album/9']);
 });
-

@@ -84,6 +84,12 @@ export default definePersona({
       optional: true,
       picker: { provider: 'slack', resource: 'channels' }
     },
+    SLACK_BOT_USER_ID: {
+      description:
+        'Slack user id of the connected bot (the id in its <@...> mention). Required when SLACK_CHANNEL is set so joke-bot only answers messages addressed to it.',
+      env: 'SLACK_BOT_USER_ID',
+      optional: true
+    },
     TELEGRAM_CHAT: {
       description:
         'Telegram chat id to reply in (and post the daily joke to). Setting it enables the Telegram transport. Leave empty to skip Telegram. No chat picker exists yet — enter the numeric chat id.',

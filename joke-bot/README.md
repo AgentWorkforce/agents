@@ -13,7 +13,8 @@ DMs, and Telegram messages, **replies on the origin transport**, posts a daily
 memory so follow-up jokes can use callbacks.
 
 Transport is configuration-driven (workforce#252 optional integrations): `slack`
-is gated on `SLACK_CHANNEL`, `telegram` on `TELEGRAM_CHAT`. Set either or both;
+is gated on `SLACK_CHANNEL`, `telegram` on `TELEGRAM_CHAT`. Slack also requires
+`SLACK_BOT_USER_ID` to identify its exact @mention. Set either transport or both;
 the unconfigured transport is pruned at deploy. At least one must be set.
 
 ## Inputs
@@ -21,4 +22,5 @@ the unconfigured transport is pruned at deploy. At least one must be set.
 | input | required | purpose |
 |---|---|---|
 | `SLACK_CHANNEL` | one of | Slack channel id to reply in. Setting it enables the Slack transport. Empty = skip Slack. |
+| `SLACK_BOT_USER_ID` | with Slack | Slack user id of the connected bot (the id in its `<@...>` mention). Required with `SLACK_CHANNEL` so only messages addressed to joke-bot receive a reply. |
 | `TELEGRAM_CHAT` | one of | Telegram chat id to reply in (and post the daily joke to). Setting it enables Telegram. Empty = skip Telegram. (No chat picker yet — enter the numeric id.) |

@@ -170,15 +170,29 @@ export async function handleSlackMention(
     ctx.log?.('info', 'joke-bot.skip transport=slack reason=bot-or-non-plain-message');
     return;
   }
+  // The Slack trigger's `match` gate is not enforced cloud-side yet, so match
+  // the connected bot's exact user mention here. Fail closed when its id is
+  // absent: accepting any `<@...>` token would wake joke-bot for conversations
+  // addressed only to somebody else.
+  const botUserId = input(ctx, 'SLACK_BOT_USER_ID')?.split('__')[0];
+  if (!botUserId) {
+    ctx.log?.('warn', 'joke-bot.skip transport=slack reason=no-bot-user-id-configured');
+    return;
+  }
   const rawText = typeof data.text === 'string' ? data.text : '';
-  if (!/<@[^>]+>/.test(rawText)) {
+  const botMention = `<@${botUserId}>`;
+  if (!rawText.includes(botMention)) {
     ctx.log?.('info', 'joke-bot.skip transport=slack reason=no-mention');
     return;
   }
   const threadTs = typeof data.thread_ts === 'string' && data.thread_ts ? data.thread_ts : ts;
   // Strip ONLY the leading bot mention; preserve any other mentions in the text
   // (e.g. "@joke-bot tell a joke about @alice" keeps @alice).
-  const question = rawText.replace(/^\s*<@[^>]+>\s*/, '').trim();
+  const leadingTrimmed = rawText.trimStart();
+  const question = (leadingTrimmed.startsWith(botMention)
+    ? leadingTrimmed.slice(botMention.length)
+    : rawText
+  ).trim();
   if (!question) {
     ctx.log?.('info', 'joke-bot.skip transport=slack reason=empty-after-mention');
     return;

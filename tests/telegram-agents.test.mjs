@@ -16,6 +16,7 @@ import {
 } from '../.test-build/shared/telegram.js';
 import { handleTelegramMessage as inboxHandle } from '../.test-build/inbox-buddy/agent.js';
 import { handleTelegramMention, handleJokeOfTheDay, handleSlackMention } from '../.test-build/joke-bot/agent.js';
+import jokeBotPersona from '../.test-build/joke-bot/persona.js';
 import { checkReleases } from '../.test-build/spotify-releases/agent.js';
 import { postFreshStories, retryPendingThreadBody } from '../.test-build/hn-monitor/agent.js';
 
@@ -320,26 +321,74 @@ function slackMentionEvent({ channel = 'C_CHAT', ts = '1', text = '<@U_BOT> hi',
   });
 }
 
+test('joke-bot (slack): declares its own Slack user id as deployment configuration', () => {
+  assert.deepEqual(jokeBotPersona.inputs?.SLACK_BOT_USER_ID, {
+    description:
+      'Slack user id of the connected bot (the id in its <@...> mention). Required when SLACK_CHANNEL is set so joke-bot only answers messages addressed to it.',
+    env: 'SLACK_BOT_USER_ID',
+    optional: true
+  });
+});
+
 test('joke-bot (slack): replies in-thread to an @mention in the configured channel', async () => {
   const ctx = makeCtx();
   const slack = makeSlack();
+  let prompt = '';
   await handleSlackMention(
-    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' }, inputSpecs: {} } },
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT', SLACK_BOT_USER_ID: 'U_BOT' }, inputSpecs: {} } },
     slackMentionEvent({ channel: 'C_CHAT', ts: '5', threadTs: '4', text: '<@U_BOT> joke about yaml' }),
-    { complete: async () => 'YAML walks into a bar. The bar is also valid YAML.', slack }
+    { complete: async (value) => { prompt = value; return 'YAML walks into a bar. The bar is also valid YAML.'; }, slack }
   );
   assert.equal(slack.calls.length, 1);
   assert.equal(slack.calls[0].kind, 'reply');
   assert.equal(slack.calls[0].threadTs, '4');
   assert.match(slack.calls[0].text, /YAML/);
+  assert.doesNotMatch(prompt, /<@U_BOT>/);
 });
 
 test('joke-bot (slack): ignores an @mention in a different channel (fail closed)', async () => {
   const ctx = makeCtx();
   const slack = makeSlack();
   await handleSlackMention(
-    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' }, inputSpecs: {} } },
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT', SLACK_BOT_USER_ID: 'U_BOT' }, inputSpecs: {} } },
     slackMentionEvent({ channel: 'C_OTHER', ts: '6', text: '<@U_BOT> joke' }),
+    { complete: async () => 'nope', slack }
+  );
+  assert.equal(slack.calls.length, 0);
+});
+
+test('joke-bot (slack): ignores a message that mentions only another user', async () => {
+  const ctx = makeCtx();
+  const slack = makeSlack();
+  let completed = false;
+  await handleSlackMention(
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT', SLACK_BOT_USER_ID: 'U_BOT' }, inputSpecs: {} } },
+    slackMentionEvent({ channel: 'C_CHAT', ts: '7', text: '<@U_ALICE> hey' }),
+    { complete: async () => { completed = true; return 'nope'; }, slack }
+  );
+  assert.equal(completed, false);
+  assert.equal(slack.calls.length, 0);
+});
+
+test('joke-bot (slack): preserves another leading mention when the bot mention is later', async () => {
+  const ctx = makeCtx();
+  const slack = makeSlack();
+  let prompt = '';
+  await handleSlackMention(
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT', SLACK_BOT_USER_ID: 'U_BOT' }, inputSpecs: {} } },
+    slackMentionEvent({ channel: 'C_CHAT', ts: '8', text: '<@U_ALICE> ask <@U_BOT> for a joke' }),
+    { complete: async (value) => { prompt = value; return 'A joke for Alice.'; }, slack }
+  );
+  assert.equal(slack.calls.length, 1);
+  assert.match(prompt, /The user just said: <@U_ALICE> ask <@U_BOT> for a joke/);
+});
+
+test('joke-bot (slack): fails closed when its Slack user id is not configured', async () => {
+  const ctx = makeCtx();
+  const slack = makeSlack();
+  await handleSlackMention(
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' }, inputSpecs: {} } },
+    slackMentionEvent({ channel: 'C_CHAT', ts: '9', text: '<@U_BOT> joke' }),
     { complete: async () => 'nope', slack }
   );
   assert.equal(slack.calls.length, 0);
@@ -388,4 +437,3 @@ test('spotify-releases (slack): DMs releases to SLACK_USER, advances checkpoint'
   const notified = await ctx.memory.recall('x', { tags: ['spotify-releases:notified'] });
   assert.deepEqual(JSON.parse(notified[0].content), ['https://open.spotify.com/album/9']);
 });
-

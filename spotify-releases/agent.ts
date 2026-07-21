@@ -8,10 +8,10 @@
  *
  * Cron-only (no chat surface). Transport is configuration-driven (workforce#252):
  * the persona gates `slack` on SLACK_USER and `telegram` on TELEGRAM_CHAT, so the
- * unconfigured transport is pruned at deploy. The checkpoint (last-check date +
- * notified-release set) advances ONLY after every configured transport delivered
- * and no artist fetch failed — so a flaky send re-notifies next tick rather than
- * silently dropping releases.
+ * unconfigured transport is pruned at deploy. Delivered releases are recorded
+ * after every configured transport succeeds, while the last-check date advances
+ * only after a complete artist scan. That avoids duplicate notifications without
+ * skipping artists whose fetch failed.
  */
 import { defineAgent, isCronTickEvent, type WorkforceCtx } from '@agentworkforce/runtime';
 import { slackClient } from '@relayfile/relay-helpers';
@@ -100,11 +100,12 @@ export async function checkReleases(
     ctx.log?.('info', 'spotify-releases.nothing-new', { since });
   }
 
+  if (delivered && releases.length > 0) {
+    await saveNotified(ctx, [...notified, ...releases.map(releaseKey)].slice(-500));
+  }
+
   if (delivered && failed.length === 0) {
     await saveLastCheck(ctx, today());
-    if (releases.length > 0) {
-      await saveNotified(ctx, [...notified, ...releases.map(releaseKey)].slice(-500));
-    }
   } else {
     ctx.log?.('warn', 'spotify-releases.checkpoint-not-advanced', {
       since,

@@ -222,11 +222,19 @@ export function createLocalPackWorkforceProof({
 
 export function createPublishedInstalledWorkforceProof({
   taskRoot,
-  workforceRoot,
   agentsPackage,
 }) {
-  const requiredPackageNames = resolveRequiredWorkforcePackageNames({ workforceRoot, agentsPackage });
-  const expectedPackages = resolveExpectedPublishedVersions({ workforceRoot, agentsPackage });
+  const lockPath = resolve(taskRoot, 'package-lock.json');
+  const lock = readJson(lockPath);
+  const workforceVersion = agentsPackage.devDependencies?.agentworkforce ?? null;
+  const relayHelpersVersion = agentsPackage.dependencies?.['@relayfile/relay-helpers'] ?? null;
+  const requiredPackageNames = resolvePublishedInstalledPackageNames({ lock, agentsPackage });
+  const expectedPackages = Object.fromEntries(
+    requiredPackageNames.map((name) => [
+      name,
+      name === '@relayfile/relay-helpers' ? relayHelpersVersion : workforceVersion,
+    ]),
+  );
   const installedPackages = Object.fromEntries(
     requiredPackageNames.map((name) => [name, readInstalledPackageVersion(taskRoot, name)]),
   );
@@ -241,6 +249,31 @@ export function createPublishedInstalledWorkforceProof({
       ])
       .filter(([, version]) => version !== null),
   );
+  const installedCopies = Object.fromEntries(
+    requiredPackageNames.map((name) => {
+      const lockEntry = lock.packages?.[`node_modules/${name}`] ?? null;
+      const installedDir = resolve(taskRoot, 'node_modules', ...name.split('/'));
+      return [
+        name,
+        {
+          version: installedPackages[name],
+          lockVersion: lockEntry?.version ?? null,
+          resolved: lockEntry?.resolved ?? null,
+          integrity: lockEntry?.integrity ?? null,
+          registryArtifact:
+            typeof lockEntry?.resolved === 'string'
+            && lockEntry.resolved.startsWith('https://registry.npmjs.org/')
+            && typeof lockEntry.integrity === 'string'
+            && lockEntry.integrity.length > 0,
+          installedAsSymlink: existsSync(installedDir) && lstatSync(installedDir).isSymbolicLink(),
+        },
+      ];
+    }),
+  );
+  const overlayEnvironment = Object.fromEntries(
+    ['AGENTWORKFORCE_CLI_PATH', 'NODE_PATH', 'NODE_OPTIONS']
+      .map((name) => [name, process.env[name]?.trim() || null]),
+  );
   const mismatches = requiredPackageNames.flatMap((name) => {
     const problems = [];
     const expected = expectedPackages[name];
@@ -252,21 +285,36 @@ export function createPublishedInstalledWorkforceProof({
     if (declared !== undefined && declared !== expected) {
       problems.push(`${name} declaration ${declared} != expected exact version ${expected}`);
     }
+    const installedCopy = installedCopies[name];
+    if (installedCopy.lockVersion !== expected) {
+      problems.push(`${name} lock version ${installedCopy.lockVersion ?? 'missing'} != expected ${expected ?? 'unknown'}`);
+    }
+    if (!installedCopy.registryArtifact) {
+      problems.push(`${name} is not locked to an integrity-protected npm registry artifact`);
+    }
+    if (installedCopy.installedAsSymlink) {
+      problems.push(`${name} is installed through a symlink instead of the published artifact`);
+    }
     return problems;
   });
+  for (const [name, value] of Object.entries(overlayEnvironment)) {
+    if (value !== null) mismatches.push(`${name} must be unset for published-installed acceptance`);
+  }
   const binPath = resolve(taskRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'agentworkforce.cmd' : 'agentworkforce');
   const binValidation = validateInstalledBin(binPath);
   const proof = {
     mode: acceptancePackageSourceModes.publishedInstalled,
-    workforceCommit: readGitHead(workforceRoot),
+    workforceCommit: null,
     installRoot: '.',
+    lockfile: relative(taskRoot, lockPath),
     installCommand: null,
     producerArtifacts: [],
     requiredPackages: requiredPackageNames,
     expectedPackages,
     declaredPackages,
     installedPackages,
-    installedCopies: {},
+    installedCopies,
+    overlayEnvironment,
     installedBin: relative(taskRoot, binPath),
     installedBinValidation: binValidation,
   };
@@ -275,7 +323,7 @@ export function createPublishedInstalledWorkforceProof({
     exitCode: mismatches.length === 0 && binValidation.ok ? 0 : 1,
     summary:
       mismatches.length === 0 && binValidation.ok
-        ? 'Validated exact published Workforce package versions through the installed binary path.'
+        ? `Validated ${requiredPackageNames.length} exact published package artifacts through the frozen npm lockfile and installed binary path with no symlink or environment overlays.`
         : `Published installed-package validation failed: ${[
           ...mismatches,
           !binValidation.ok ? binValidation.error : null,
@@ -283,6 +331,36 @@ export function createPublishedInstalledWorkforceProof({
     artifactRefs: [],
     proof,
   };
+}
+
+function resolvePublishedInstalledPackageNames({ lock, agentsPackage }) {
+  const required = new Set(['agentworkforce', '@relayfile/relay-helpers']);
+  const queue = [
+    ...Object.keys(agentsPackage.dependencies ?? {}),
+    ...Object.keys(agentsPackage.devDependencies ?? {}),
+    ...Object.keys(agentsPackage.overrides ?? {}),
+  ].filter((name) => name === 'agentworkforce' || name.startsWith('@agentworkforce/'));
+
+  for (const name of queue) required.add(name);
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const lockEntry = lock.packages?.[`node_modules/${current}`];
+    for (const depName of [
+      ...Object.keys(lockEntry?.dependencies ?? {}),
+      ...Object.keys(lockEntry?.optionalDependencies ?? {}),
+    ]) {
+      if (
+        depName !== 'agentworkforce'
+        && !depName.startsWith('@agentworkforce/')
+      ) continue;
+      if (required.has(depName)) continue;
+      required.add(depName);
+      queue.push(depName);
+    }
+  }
+
+  return [...required].sort();
 }
 
 function collectWorkforcePackageMap(workforceRoot) {

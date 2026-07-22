@@ -20,6 +20,7 @@ import {
 import {
   acceptancePackageSourceEnv,
   acceptancePackageSourceModes,
+  createPublishedInstalledWorkforceProof,
   resolveAcceptancePackageSourceMode,
   resolveExpectedPublishedVersions,
   resolveRequiredWorkforcePackageNames,
@@ -390,6 +391,39 @@ test('published package proof derives exact versions from the producer manifests
   assert.equal(expected['@agentworkforce/cli'], producerVersion);
   assert.equal(expected['@agentworkforce/runtime'], producerVersion);
   assert.ok(Object.values(expected).every((version) => version === producerVersion));
+});
+
+test('published installed proof is registry-backed and independent of the sibling producer version', () => {
+  const agentsPkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const taskRoot = fileURLToPath(new URL('../', import.meta.url));
+  const previousCliOverride = process.env.AGENTWORKFORCE_CLI_PATH;
+  const previousNodePath = process.env.NODE_PATH;
+  const previousNodeOptions = process.env.NODE_OPTIONS;
+  delete process.env.AGENTWORKFORCE_CLI_PATH;
+  delete process.env.NODE_PATH;
+  delete process.env.NODE_OPTIONS;
+
+  try {
+    const outcome = createPublishedInstalledWorkforceProof({ taskRoot, agentsPackage: agentsPkg });
+    assert.equal(outcome.exitCode, 0, outcome.summary);
+    assert.equal(outcome.proof.expectedPackages.agentworkforce, agentsPkg.devDependencies.agentworkforce);
+    assert.equal(
+      outcome.proof.expectedPackages['@relayfile/relay-helpers'],
+      agentsPkg.dependencies['@relayfile/relay-helpers'],
+    );
+    assert.ok(
+      Object.values(outcome.proof.installedCopies).every(
+        (entry) => entry.registryArtifact && !entry.installedAsSymlink,
+      ),
+    );
+  } finally {
+    if (previousCliOverride === undefined) delete process.env.AGENTWORKFORCE_CLI_PATH;
+    else process.env.AGENTWORKFORCE_CLI_PATH = previousCliOverride;
+    if (previousNodePath === undefined) delete process.env.NODE_PATH;
+    else process.env.NODE_PATH = previousNodePath;
+    if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = previousNodeOptions;
+  }
 });
 
 test('closure acceptance keeps fourteen gates and folds package proof into CLI evidence', () => {

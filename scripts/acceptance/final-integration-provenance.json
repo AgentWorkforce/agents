@@ -1,0 +1,59 @@
+{
+  "workforce": {
+    "version": "4.1.24",
+    "releaseCommit": "78124b5b3be7442d2bf6f3b2c9ebd859768941fb",
+    "pullRequest": 273,
+    "mergeCommit": "393dcb21800447cb7aeb946cff88a9f6a7347512"
+  },
+  "relayHelpers": {
+    "version": "0.4.7",
+    "releaseCommit": "317952190590687f47de25bf5c3a002f0d455a8f",
+    "pullRequest": 245,
+    "mergeCommit": "2c53b826ca1758344e6fa7f384bd1f07e920cdf5"
+  },
+  "cloud": {
+    "implementationPullRequest": 2645,
+    "implementationMergeCommit": "0458056e4ff0f71fe84b1ac6d6a47a88a02a27ca",
+    "selectorCommit": "7a63ecc1411a46fad609ab97be43e7099e16f170",
+    "domainRepairPullRequest": 2646,
+    "domainRepairMergeCommit": "76f4cefea11fccfc2aa9afe45d1704b52cbb9c18",
+    "finalDomainRepairPullRequest": 2647,
+    "finalDomainRepairMergeCommit": "e6ed1fc18d06b774c509cf711b831013018d9e24",
+    "snapshotRun": 29472337790,
+    "snapshotConclusion": "success",
+    "productionDeployRun": 29472745986,
+    "productionDeployConclusion": "success",
+    "initialStagingDeployRun": 29473290174,
+    "initialStagingDeployConclusion": "failure",
+    "stagingRetryRun": 29473781479,
+    "stagingRetryConclusion": "failure",
+    "sageStagingDeployRun": 29475705448,
+    "sageStagingDeployConclusion": "failure",
+    "finalStagingDeployRun": 29477911123,
+    "finalStagingDeployHeadCommit": "e6ed1fc18d06b774c509cf711b831013018d9e24",
+    "finalStagingDeployConclusion": "failure",
+    "finalStagingDeployFailure": "Legacy CloudVpc teardown was blocked by a Cloud Map namespace with associated services and two in-use Lambda ENIs; post-deploy verification was skipped.",
+    "postFailureHostnameProbe": {
+      "conclusion": "success",
+      "tlsVerifyResult": 0,
+      "httpStatuses": {
+        "catalog-linear.staging.agentrelay.com": 404,
+        "catalog-github.staging.agentrelay.com": 404,
+        "specialist.staging.agentrelay.com": 404,
+        "staging.sage.agentrelay.com": 404,
+        "staging.agentrelay.com": 200
+      },
+      "doesNotReplaceGreenDeploy": true
+    }
+  },
+  "agents": {
+    "baseCommit": "9463aa4f2c2f23d8fb7e48ab93cca07ba403c738",
+    "finalCommit": null
+  },
+  "acceptance": {
+    "requiredGateCount": 14,
+    "executedGateCount": 0,
+    "passedGateCount": 0,
+    "status": "blocked-before-run"
+  }
+}

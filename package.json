@@ -18,25 +18,25 @@
     "evals:live": "npm run compile && node scripts/evals/run-evals.mjs --live --judge"
   },
   "dependencies": {
-    "@agentworkforce/compose": "4.1.23",
-    "@agentworkforce/delivery": "4.1.23",
-    "@agentworkforce/persona-kit": "4.1.23",
-    "@agentworkforce/runtime": "4.1.23",
+    "@agentworkforce/compose": "4.1.24",
+    "@agentworkforce/delivery": "4.1.24",
+    "@agentworkforce/persona-kit": "4.1.24",
+    "@agentworkforce/runtime": "4.1.24",
     "@relayfile/adapter-daytona": "^0.1.1",
-    "@relayfile/relay-helpers": "0.4.6"
+    "@relayfile/relay-helpers": "0.4.7"
   },
   "devDependencies": {
     "@types/node": "^22",
-    "agentworkforce": "4.1.23",
+    "agentworkforce": "4.1.24",
     "esbuild": "^0.25.12",
     "tsx": "^4.22.4",
     "typescript": "^5.6.0"
   },
   "overrides": {
-    "@agentworkforce/deploy": "4.1.23",
-    "@agentworkforce/local-surface": "4.1.23",
-    "@agentworkforce/persona-kit": "4.1.23",
-    "@agentworkforce/runtime": "4.1.23",
+    "@agentworkforce/deploy": "4.1.24",
+    "@agentworkforce/local-surface": "4.1.24",
+    "@agentworkforce/persona-kit": "4.1.24",
+    "@agentworkforce/runtime": "4.1.24",
     "@relayfile/adapter-linear": "0.3.11",
     "@opentelemetry/otlp-transformer": {
       "protobufjs": "^8.5.0"

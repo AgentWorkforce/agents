@@ -46,8 +46,10 @@ const artifactRoot = resolve(taskRoot, '.workflow-artifacts/composable-runtime-c
 const artifactFilesRoot = resolve(artifactRoot, 'artifacts');
 const workforceConfigDir = resolve(artifactRoot, 'agentworkforce-config');
 const baselineRoot = resolve(here, 'baselines');
-const cliBaseline = readJson(resolve(baselineRoot, 'agentworkforce-4.1.23-top-level-commands.json'));
+const cliBaseline = readJson(resolve(baselineRoot, 'agentworkforce-4.1.24-top-level-commands.json'));
 const invokeTimeoutMs = 30_000;
+
+const finalIntegrationProvenance = readJson(resolve(here, 'final-integration-provenance.json'));
 
 rmSync(artifactFilesRoot, { recursive: true, force: true });
 rmSync(workforceConfigDir, { recursive: true, force: true });
@@ -1315,6 +1317,7 @@ const finalResults = {
   completedAt,
   repository: 'AgentWorkforce/agents',
   repositories: repoEvidence.repositories,
+  finalIntegrationProvenance,
   packageArtifacts: repoEvidence.packageArtifacts,
   cli: {
     source: cliSource,
@@ -1696,6 +1699,13 @@ function renderMarkdown(finalResults) {
     `- Workforce commit: ${finalResults.repositories.workforce}`,
     `- Cloud commit: ${finalResults.repositories.cloud}`,
     `- Relayfile adapters commit: ${finalResults.repositories.relayfileAdapters}`,
+    `- Workforce release: ${finalResults.finalIntegrationProvenance.workforce.version} (${finalResults.finalIntegrationProvenance.workforce.releaseCommit}; PR #${finalResults.finalIntegrationProvenance.workforce.pullRequest}, merge ${finalResults.finalIntegrationProvenance.workforce.mergeCommit})`,
+    `- Relay helpers release: ${finalResults.finalIntegrationProvenance.relayHelpers.version} (${finalResults.finalIntegrationProvenance.relayHelpers.releaseCommit}; PR #${finalResults.finalIntegrationProvenance.relayHelpers.pullRequest}, merge ${finalResults.finalIntegrationProvenance.relayHelpers.mergeCommit})`,
+    `- Cloud implementation: PR #${finalResults.finalIntegrationProvenance.cloud.implementationPullRequest}, merge ${finalResults.finalIntegrationProvenance.cloud.implementationMergeCommit}`,
+    `- Cloud selector: ${finalResults.finalIntegrationProvenance.cloud.selectorCommit}`,
+    `- Cloud domain repairs: PR #${finalResults.finalIntegrationProvenance.cloud.domainRepairPullRequest}, merge ${finalResults.finalIntegrationProvenance.cloud.domainRepairMergeCommit}; PR #${finalResults.finalIntegrationProvenance.cloud.finalDomainRepairPullRequest}, merge ${finalResults.finalIntegrationProvenance.cloud.finalDomainRepairMergeCommit}`,
+    `- Cloud deploy runs: snapshot ${finalResults.finalIntegrationProvenance.cloud.snapshotRun} (${finalResults.finalIntegrationProvenance.cloud.snapshotConclusion}); production ${finalResults.finalIntegrationProvenance.cloud.productionDeployRun} (${finalResults.finalIntegrationProvenance.cloud.productionDeployConclusion}); staging ${finalResults.finalIntegrationProvenance.cloud.initialStagingDeployRun} (${finalResults.finalIntegrationProvenance.cloud.initialStagingDeployConclusion}); staging ${finalResults.finalIntegrationProvenance.cloud.stagingRetryRun} (${finalResults.finalIntegrationProvenance.cloud.stagingRetryConclusion}); Sage staging ${finalResults.finalIntegrationProvenance.cloud.sageStagingDeployRun} (${finalResults.finalIntegrationProvenance.cloud.sageStagingDeployConclusion}); final staging ${finalResults.finalIntegrationProvenance.cloud.finalStagingDeployRun} at ${finalResults.finalIntegrationProvenance.cloud.finalStagingDeployHeadCommit} (${finalResults.finalIntegrationProvenance.cloud.finalStagingDeployConclusion})`,
+    `- Agents acceptance base: ${finalResults.finalIntegrationProvenance.agents.baseCommit}`,
     `- CLI source: ${finalResults.cli.source}`,
     `- Workforce CLI artifact: ${finalResults.cli.identity}`,
     `- Node runtime: ${finalResults.cli.nodeVersion} (${finalResults.cli.nodeExecutable})`,

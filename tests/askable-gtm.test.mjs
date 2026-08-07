@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   WATCH_SWEEP_CRON,
+  ListenGatewayError,
   createWatch,
   handleRelayMessage,
   parseCommand,
@@ -17,6 +18,10 @@ test('machine-readable capability manifest is versioned and honest about live ac
   assert.equal(ASKABLE_GTM_CAPABILITY.schema, 'agentrelay.askable.v1');
   assert.equal(ASKABLE_GTM_CAPABILITY.status, 'prototype-blocked');
   assert.equal(ASKABLE_GTM_CAPABILITY.credentials.personaInput, false);
+  assert.equal(ASKABLE_GTM_CAPABILITY.credentials.canonicalStore, 'nango');
+  assert.equal(ASKABLE_GTM_CAPABILITY.credentials.retrieval, 'single-nango-action');
+  assert.equal(ASKABLE_GTM_CAPABILITY.provider.endpointSource, 'nango-connection');
+  assert.equal(ASKABLE_GTM_CAPABILITY.operations[2].availability, 'blocked');
   assert.equal(ASKABLE_GTM_CAPABILITY.provider.liveResultVerification, 'blocked-op-cli-unavailable');
   assert.equal(WATCH_SWEEP_CRON, '*/15 * * * *');
 });
@@ -89,30 +94,39 @@ test('relay watch utterance persists durable state and returns the scheduling tr
   assert.equal(sent[0].to, 'requester');
   assert.match(sent[0].text, /shared 15-minute recurring sweep/);
   assert.match(sent[0].text, /did not create a per-watch Relaycron schedule/);
-  assert.match(sent[0].text, /Live execution is currently blocked/);
+  assert.match(sent[0].text, /Live execution is blocked/);
+  assert.match(sent[0].text, /Revternal Nango action bridge/);
 });
 
-test('Listen client sends one bounded Reddit request and never serializes the key', async () => {
-  const calls = [];
-  const response = await queryListen('developer tool migration pain', 'test-only-key', async (url, init) => {
-    calls.push({ url: String(url), init });
-    return new Response(JSON.stringify({
-      meta: { query: 'developer tool migration pain', fetched_at: '2026-08-07T12:00:00Z' },
-      results: [],
-      source_status: { reddit: { status: 'ok', count: 0 } },
-    }), { status: 200, headers: { 'content-type': 'application/json' } });
+test('Listen gateway receives one bounded request with no credential or endpoint field', async () => {
+  const requests = [];
+  const result = await queryListen('developer tool migration pain', {
+    status: 'configured',
+    async listen(request) {
+      requests.push(request);
+      return {
+        data: {
+          meta: {
+            query: 'developer tool migration pain',
+            fetched_at: '2026-08-07T12:00:00Z',
+          },
+          results: [],
+          source_status: { reddit: { status: 'ok', count: 0 } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+      };
+    },
   });
 
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, 'https://api.revternal.com/social/listen');
-  assert.equal(calls[0].init.method, 'POST');
-  assert.equal(calls[0].init.headers['x-api-key'], 'test-only-key');
-  const body = JSON.parse(calls[0].init.body);
-  assert.equal(body.sources[0].platform, 'reddit');
-  assert.equal(body.page, 1);
-  assert.equal(body.per_page, 20);
-  assert.doesNotMatch(calls[0].init.body, /test-only-key/);
-  assert.equal(response.source_status.reddit.status, 'ok');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].sources[0].platform, 'reddit');
+  assert.equal(requests[0].page, 1);
+  assert.equal(requests[0].per_page, 20);
+  assert.equal('credential' in requests[0], false);
+  assert.equal('apiKey' in requests[0], false);
+  assert.equal('endpoint' in requests[0], false);
+  assert.equal('baseUrl' in requests[0], false);
+  assert.equal(result.data.source_status.reddit.status, 'ok');
 });
 
 test('answers expose freshness, coverage, engagement, and source URL', () => {
@@ -136,13 +150,59 @@ test('answers expose freshness, coverage, engagement, and source URL', () => {
   assert.match(answer, /themes or intent require separate inference/);
 });
 
-test('Listen errors expose status only and do not include response bodies', async () => {
-  await assert.rejects(
-    queryListen('query', 'test-only-key', async () => new Response('sensitive upstream detail', { status: 401 })),
-    (error) => {
-      assert.match(error.message, /HTTP 401/);
-      assert.doesNotMatch(error.message, /sensitive upstream detail/);
-      return true;
+test('answers disclose managed fallback and the connection-provided host', () => {
+  const answer = renderListenAnswer('query', { results: [] }, [], {
+    credentialSource: 'managed',
+    endpointHost: 'managed.provider.example',
+  });
+
+  assert.match(answer, /Agent Workforce managed Revternal access/);
+  assert.match(answer, /paid allowance/);
+  assert.match(answer, /Host: managed\.provider\.example/);
+});
+
+test('answers suppress unsafe host metadata', () => {
+  const answer = renderListenAnswer('query', { results: [] }, [], {
+    credentialSource: 'user',
+    endpointHost: 'user:secret@internal.example/path?token=value',
+  });
+
+  assert.match(answer, /Host: not disclosed/);
+  assert.doesNotMatch(answer, /secret|internal\.example|token=value/);
+});
+
+test('gateway failures expose only an allowlisted code to logs and the user', async () => {
+  const logs = [];
+  const sent = [];
+  const event = envelopeToAgentEvent({
+    id: 'evt-question',
+    workspace: 'workspace-test',
+    type: 'relaycast.message',
+    occurredAt: '2026-08-07T10:00:00Z',
+    summary: { actor: { id: 'requester' } },
+    resource: { text: 'What are developers saying about Acme?' },
+  });
+  assert.ok(event);
+
+  const ctx = {
+    log(level, message, fields) { logs.push({ level, message, fields }); },
+    memory: { async recall() { return []; }, async save() {} },
+    relay: {
+      async dm(to, text) { sent.push({ to, text }); return { ok: true, messageId: 'message-test' }; },
     },
-  );
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      const error = new ListenGatewayError('provider-auth-failed');
+      error.cause = new Error('upstream body with credential-shaped sensitive detail');
+      throw error;
+    },
+  };
+
+  await handleRelayMessage(ctx, event, gateway);
+
+  const observable = JSON.stringify({ logs, sent });
+  assert.match(observable, /provider-auth-failed/);
+  assert.doesNotMatch(observable, /upstream body|credential-shaped|sensitive detail/);
 });

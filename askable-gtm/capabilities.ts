@@ -35,8 +35,9 @@ export const ASKABLE_GTM_CAPABILITY = {
     },
     {
       id: 'query-public-social-signals',
-      availability: 'implemented_unverified',
-      requires: ['server-side Revternal credential bridge', 'authenticated live-result gate'],
+      availability: 'blocked',
+      requires: ['Revternal Nango provider/action bridge', 'authenticated live-result gate'],
+      implementedPieces: ['bounded query planner', 'evidence renderer', 'secretless gateway contract'],
       evidence: [
         'source URL',
         'source timestamp',
@@ -72,7 +73,9 @@ export const ASKABLE_GTM_CAPABILITY = {
   ],
   provider: {
     id: 'revternal.listen',
-    operation: 'POST https://api.revternal.com/social/listen',
+    availability: 'blocked-provider-not-registered',
+    operation: 'POST /social/listen through Nango',
+    endpointSource: 'nango-connection',
     authentication: 'required-observed',
     documentedRegisteredSources: ['reddit'],
     identicalRequestCache: '15m-documented-unverified',
@@ -80,11 +83,31 @@ export const ASKABLE_GTM_CAPABILITY = {
   },
   credentials: {
     personaInput: false,
-    byok: { availability: 'blocked', requires: 'scoped Revternal provider connection and proxy' },
-    managed: { availability: 'blocked', requires: 'paid entitlement, metering, hard quota, audit, rotation' },
+    canonicalStore: 'nango',
+    retrieval: 'single-nango-action',
+    userKey: {
+      availability: 'blocked-provider-not-registered',
+      source: 'nango-connection-credential',
+      setupPath: '/integrations',
+    },
+    endpoint: {
+      availability: 'blocked-provider-not-registered',
+      source: 'nango-connection-config',
+      disclosedToUser: true,
+    },
+    managedFallback: {
+      availability: 'blocked-no-entitlement-metering',
+      source: 'nango-environment-variable',
+      variable: 'REVTERNAL_API_KEY',
+      endpointVariable: 'REVTERNAL_BASE_URL',
+      disclosureRequired: true,
+    },
+    selection: 'user connection first; managed fallback only after trusted entitlement and quota authorization; otherwise fail closed',
   },
   limitations: [
     'No successful keyed Listen response was observed during this investigation.',
+    'Cloud has no Revternal provider, Nango action, or persona action bridge today.',
+    'Managed fallback has no Revternal entitlement, per-workspace meter, or hard quota today.',
     'Only Reddit is documented as currently registered.',
     'No full comments, contact data, employer/title, or qualification evidence.',
     'Per-watch recurrence is evaluated by one deploy-time sweep, not a dynamic Relaycron recurrence.',

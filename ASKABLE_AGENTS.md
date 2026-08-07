@@ -38,7 +38,8 @@ An askable agent has four contracts:
    into an explicit provider query. It returns source URLs, timestamps, and
    coverage/freshness metadata with its synthesis.
 2. **The provider is queried on demand.** Revternal is treated as a pull/search
-   service, not a Nango sync whose rows become the conversational data model.
+   service reached through a Nango action, not a Nango sync whose rows become
+   the conversational data model.
    The agent stores only durable watch definitions, dedupe identifiers, run
    provenance, and delivery state. It does not accumulate a general-purpose
    copy of Listen results.
@@ -100,8 +101,8 @@ advertised live capability.
 
 ### Data boundary
 
-Nango may eventually hold a user's provider credential or implement a provider
-proxy, but it should not become the agent's memory. Cloud's current Nango path
+Nango is the canonical credential-and-endpoint boundary, but it should not
+become the agent's memory. Cloud's current Nango path
 materializes provider records before dispatching deltas; that is a sync model,
 not a conversational query contract
 ([sync runtime](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/core/src/sync/nango-sync-runtime.ts#L150-L215),
@@ -217,10 +218,12 @@ engagement threshold, and periodic objection/feature-request digests. Current
 implementation supports query-and-cadence watch definitions on the shared
 15-minute sweep; threshold configuration is a design target.
 
-Credential: either a user's Revternal key behind a scoped server-side provider
-connection (BYOK), or a managed Agent Workforce key behind paid entitlement,
-per-user metering, quotas, audit, and rotation. Never a persona input or browser
-value.
+Credential and endpoint: one Nango query path with two pair sources. The
+primary pair comes from the user's connection; the managed Agent Workforce pair
+comes from Nango environment variables and is selected inside the same action
+only after paid entitlement and quota authorization. The API host travels with
+the selected credential. Neither value is a persona input or handler
+environment variable.
 
 ## Concrete persona 2: Recruiting Scout
 
@@ -240,42 +243,129 @@ Watches: first-time public authors on a niche topic, repeat authors over an
 opted-in history window, and new posts containing explicit job-search/hiring
 language.
 
-Credential: the same BYOK or managed Revternal mode as GTM. Recruiting also
+Credential and endpoint: the same single Nango path as GTM. Recruiting also
 needs a stricter retention/deletion policy and must not infer protected traits,
 employment, contact information, or qualification from absent fields.
 
 ## Credential and commercial model
 
-There is no Revternal provider in Cloud today (a repository search at
-`bc41e61aad15` found zero `revternal` occurrences). The proactive runtime's
-integration environment resolver currently special-cases Daytona only
-([resolver](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/lib/proactive-runtime/deployment-trigger-delivery.ts#L1709-L1732)).
-The existing provider credential and spend code is for model/harness credentials,
-not Listen calls; its monthly threshold logs a warning rather than enforcing a
-hard stop
-([spend writer](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/lib/billing/spend-writer.ts#L16-L90)).
+### Concrete answer: how a user adds the key
 
-Required before BYOK:
+**Today, they cannot add a Revternal key in Agent Workforce.** Cloud has a real
+Nango connection UX, but Revternal is absent. At Cloud commit `bc41e61aad15`, a
+repository search found no `revternal` provider, UI card, Nango integration, or
+action. The current Integrations page enumerates its supported providers and
+does not list Revternal
+([page](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/app/integrations/page.tsx#L117-L164)).
 
-- Revternal provider registration and server-side connection flow;
-- encrypted key storage, scoped lookup, rotation/revocation, and audit;
-- a server-side Listen proxy/adapter so the key never enters the persona bundle,
-  prompt, browser, logs, or Relayfile;
-- per-workspace request attribution and provider error normalization.
+The required user path is concrete:
 
-Additional requirements before managed-key/premium:
+1. Open **Workspace Integrations** at `/integrations` and click **Connect
+   Revternal**.
+2. Cloud requests a server-issued, provider-restricted Nango Connect session;
+   the existing UI already does this for registered providers
+   ([session request and hosted UI](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/app/integrations/IntegrationConnectionControls.tsx#L103-L185)).
+3. In Nango's hosted form, paste the Revternal API key. For the standard hosted
+   service, the user confirms a visible default host rather than pasting it. A
+   supported self-hosted or staging connection must enter its host in the same
+   form. An arbitrary host must not be accepted without HTTPS and allowlist or
+   administrator validation.
+4. Nango stores the secret credential and the endpoint connection config as one
+   connection. Cloud stores only the returned `connectionId` and
+   `providerConfigKey`
+   ([save contract](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/app/integrations/IntegrationConnectionControls.tsx#L188-L207)).
 
-- a real paid entitlement checked before every managed-key request;
-- per-user/workspace request metering, hard quota, concurrency control, and
-  rate-limit coordination for the shared upstream key;
-- cost attribution despite Listen's undocumented credit cost;
-- abuse controls, audit, key rotation, and a kill switch;
-- agentrelay.com catalog fields and UI for tier, price/entitlement state, and a
-  disabled launch path when access is absent.
+The future persona declaration is:
 
-A shared managed key with no per-user meter or hard quota is unsafe: one tenant
-can exhaust the upstream key or create unallocatable cost for every tenant.
-“Paid” display metadata alone is not an enforcement boundary.
+```ts
+integrations: {
+  revternal: { source: { kind: 'workspace' } }
+}
+```
+
+Persona-kit already defines `source` as the connection resolver, and Cloud's
+normalizer accepts `workspace`
+([resolver contract](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/lib/integrations/persona-integration-config.ts#L1-L35)).
+The prototype deliberately does **not** declare this yet: deployment cannot
+resolve a provider that Cloud has not registered.
+
+Existing personas prove only the safe half of this shape. `neon-monitor`
+declares a Neon integration, reads Relayfile VFS data, and receives no token
+([persona](https://github.com/AgentWorkforce/agents/blob/a84c55cd2623/neon-monitor/persona.ts#L28-L61));
+the Neon Nango code says an API-key connection is stored in Nango and injected
+into Nango requests
+([Nango adapter](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/nango-integrations/neon-relay/shared/neon-api.ts#L1-L2)).
+No existing persona performs an on-demand generic Nango action. The proactive
+runtime's integration environment resolver special-cases Daytona only
+([runtime resolver](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/lib/proactive-runtime/deployment-trigger-delivery.ts#L1698-L1733)).
+Therefore a new secretless Cloud-to-Nango query bridge is required; the handler
+must never receive the key or endpoint.
+
+### Credential and endpoint are one fact
+
+The Nango action resolves a pair, not two independent settings:
+
+```text
+user connection:    { connection credential, connection-config endpoint }
+managed fallback:   { REVTERNAL_API_KEY, REVTERNAL_BASE_URL } from Nango environment
+action output:       { results, credentialSource, endpointHost } (no secret)
+```
+
+This prevents a production credential from drifting onto a staging or
+attacker-controlled host. Sending a valid key to the wrong host is credential
+exposure, not merely configuration failure. Existing PostHog integration code
+can read `host`/`baseUrl` from Nango connection config, but falls back to a
+hard-coded default
+([implementation](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/nango-integrations/posthog-relay/shared.ts#L212-L222)).
+Revternal should reuse the endpoint-bearing connection shape, not that fallback:
+the agent bundle must contain neither an endpoint constant nor a default URL.
+The agent's capability response and every result disclose the selected host.
+
+### One resolver, two secret sources
+
+The future `revternal-relay/listen` Nango action is the only query path:
+
+1. Resolve the workspace connection. If it contains a user API-key credential,
+   use that credential with its connection-config endpoint and report
+   `credentialSource: "user"`.
+2. If the user key is absent, require a trusted Cloud entitlement decision and
+   an atomic quota reservation **before** reading the managed Nango environment
+   variables. Nango functions can read environment variables today
+   ([existing use](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/nango-integrations/shared/composio-tool.ts#L54-L72)).
+3. If entitlement or quota is absent, indeterminate, or exhausted, fail closed.
+   Missing BYOK must never automatically unlock the managed credential.
+4. Return non-secret `credentialSource` and a normalized, allowlisted display
+   host with the result. The persona rejects userinfo, path, query, fragment,
+   control characters, and overlong values before display. Managed answers and
+   alerts say: “Using Agent Workforce managed Revternal access; usage counts
+   against your paid allowance.”
+
+There is an additional unimplemented edge: Cloud's current Nango action calls
+are connection-bound, but a managed-only user has no API-key connection created
+by Connect. Cloud must prove and implement a safe Nango-supported keyless
+workspace/service-account connection, or an equivalently scoped broker, without
+using a fake key, plaintext connection config, or persona input. That decision
+cannot be hidden behind the persona prototype.
+
+### Headline commercial gap: managed fallback is unsafe today
+
+There is no Revternal paid entitlement, per-user/workspace Listen meter,
+enforceable quota, or shared-key rate coordination. The existing spend writer
+records model/harness token cost and merely logs when its soft cap is exceeded
+([implementation](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/lib/billing/spend-writer.ts#L29-L87));
+it is not a Listen gate.
+
+Before the managed Nango environment fallback can be configured, Cloud needs:
+
+- an authoritative paid entitlement checked on every fallback request;
+- an atomic usage reservation and request ledger keyed to user and workspace;
+- hard period, concurrency, and rate quotas plus idempotency;
+- `user`/`managed` source audit, rotation, abuse controls, and a kill switch;
+- agentrelay.com tier/entitlement UI that disables launch when authorization is
+  absent.
+
+A shared managed key with no hard policy boundary lets one tenant exhaust the
+upstream allowance for every tenant. “Paid” display metadata is not enforcement.
 
 ## Not possible today
 
@@ -302,6 +392,11 @@ can exhaust the upstream key or create unallocatable cost for every tenant.
   the prototype's 90-day workspace-memory snapshot.
 - Safe Boolean query grammar or known Listen credit cost; neither is documented.
 - BYOK Revternal deployment through today's Cloud integration registry.
+- Adding a Revternal credential or endpoint through today's `/integrations`
+  catalog.
+- Calling a generic Nango action from a deployed persona handler.
+- Provisioning a proven connection-bound execution context for managed-only
+  access without requiring a user key.
 - Managed/premium Revternal access with today's catalog and billing enforcement.
 - Automatic catalog discovery of `capabilities.askable`; agentrelay.com is still
   a static hand-authored catalog.
@@ -309,11 +404,13 @@ can exhaust the upstream key or create unallocatable cost for every tenant.
 ## Production gates
 
 1. Complete the three-call authenticated Listen measurement described above.
-2. Add the scoped Revternal credential proxy and redaction tests in Cloud.
+2. Add the Revternal provider, endpoint-bearing Nango connection, single query
+   action, secretless persona bridge, and redaction/host-validation tests.
 3. Add recurrence policy only if per-watch native Relaycron entries are still
    preferable to the shared-sweep design.
 4. Ingest and expose `capabilities.askable` through the catalog.
-5. Add entitlement, hard metering/quota, and managed-key kill switch before
-   marking the catalog entry paid or enabling managed credentials.
+5. Add entitlement, atomic metering/hard quota, managed-key kill switch, and a
+   proven managed-only connection context before configuring the managed Nango
+   environment variables or marking the catalog entry paid.
 6. Deploy to a non-production workspace and verify relay Q&A, watch persistence,
    tick delivery, result citations, dedupe, and credential non-disclosure.

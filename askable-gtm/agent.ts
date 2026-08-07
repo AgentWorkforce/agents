@@ -7,7 +7,6 @@ import {
 } from '@agentworkforce/runtime';
 import { ASKABLE_GTM_CAPABILITY } from './capabilities.js';
 
-const LISTEN_URL = 'https://api.revternal.com/social/listen';
 const WATCH_STATE_TAG = 'askable-gtm:watch-state';
 const MAX_SEEN_IDS = 500;
 
@@ -66,6 +65,55 @@ export interface ListenResponse {
   }>;
 }
 
+export interface ListenRequest {
+  query: string;
+  sources: Array<{ platform: 'reddit'; subreddits: string[]; limit: number }>;
+  filters: { timeline: 'week'; languages: string[]; exclude_nsfw: boolean };
+  sort_by: 'relevance_score';
+  page: number;
+  per_page: number;
+}
+
+export type CredentialSource = 'user' | 'managed';
+
+export interface ListenGatewayResult {
+  data: ListenResponse;
+  access: {
+    credentialSource: CredentialSource;
+    /** Normalized, allowlisted display host emitted by the server-side bridge. */
+    endpointHost: string;
+  };
+}
+
+export interface ListenGateway {
+  status: 'configured' | 'blocked';
+  listen(request: ListenRequest): Promise<ListenGatewayResult>;
+}
+
+export type ListenGatewayErrorCode =
+  | 'connection-required'
+  | 'managed-access-denied'
+  | 'quota-exhausted'
+  | 'provider-auth-failed'
+  | 'provider-rate-limited'
+  | 'provider-unavailable'
+  | 'invalid-response'
+  | 'request-failed';
+
+export class ListenGatewayError extends Error {
+  constructor(readonly code: ListenGatewayErrorCode) {
+    super(code);
+    this.name = 'ListenGatewayError';
+  }
+}
+
+const BLOCKED_NANGO_GATEWAY: ListenGateway = {
+  status: 'blocked',
+  async listen() {
+    throw new Error('Revternal Nango action bridge is not available');
+  },
+};
+
 export type ParsedCommand =
   | { kind: 'capabilities-json' }
   | { kind: 'capabilities-human' }
@@ -116,7 +164,11 @@ export function parseCommand(text: string): ParsedCommand {
   return { kind: 'question', query: normalized };
 }
 
-export async function handleRelayMessage(ctx: WorkforceCtx, event: AgentEvent): Promise<void> {
+export async function handleRelayMessage(
+  ctx: WorkforceCtx,
+  event: AgentEvent,
+  gateway: ListenGateway = BLOCKED_NANGO_GATEWAY,
+): Promise<void> {
   const full = await event.expand('full').catch(() => undefined);
   const text = relayText(event, full);
   const sender = relaySender(event, full);
@@ -133,12 +185,14 @@ export async function handleRelayMessage(ctx: WorkforceCtx, event: AgentEvent): 
     await reply(ctx, sender, JSON.stringify({
       type: 'askable.capabilities',
       capability: ASKABLE_GTM_CAPABILITY,
-      runtimeDataAccess: revternalKey() ? 'available-unverified' : 'blocked-no-credential-bridge',
+      runtimeDataAccess: gateway.status === 'configured'
+        ? 'nango-gateway-configured-authorization-checked-per-request'
+        : 'blocked-no-nango-action-bridge',
     }));
     return;
   }
   if (command.kind === 'capabilities-human') {
-    await reply(ctx, sender, renderCapabilities(Boolean(revternalKey())));
+    await reply(ctx, sender, renderCapabilities(gateway.status));
     return;
   }
   if (command.kind === 'list-watches') {
@@ -178,14 +232,14 @@ export async function handleRelayMessage(ctx: WorkforceCtx, event: AgentEvent): 
       `Saved ${watch.id}: “${watch.query}” every ${watch.cadence}. `
         + 'It is evaluated by the agent’s shared 15-minute recurring sweep; '
         + 'this did not create a per-watch Relaycron schedule. '
-        + (revternalKey()
-          ? 'A credential is present, but live result quality remains unverified.'
-          : 'Live execution is currently blocked until Cloud supplies a scoped Revternal credential bridge.'),
+        + (gateway.status === 'configured'
+          ? 'The Nango query gateway is configured; credential and entitlement are checked on each run.'
+          : 'Live execution is blocked until Cloud supplies the Revternal Nango action bridge.'),
     );
     return;
   }
 
-  await answerQuestion(ctx, sender, command.query);
+  await answerQuestion(ctx, sender, command.query, gateway);
 }
 
 export function createWatch(
@@ -217,49 +271,26 @@ export function watchIsDue(watch: WatchDefinition, now: Date): boolean {
 
 export async function queryListen(
   query: string,
-  apiKey: string,
-  fetchImpl: typeof fetch = globalThis.fetch,
-): Promise<ListenResponse> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20_000);
-  try {
-    const response = await fetchImpl(LISTEN_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-      },
-      body: JSON.stringify({
-        query,
-        sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
-        filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
-        sort_by: 'relevance_score',
-        page: 1,
-        per_page: 20,
-      }),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`Revternal Listen returned HTTP ${response.status}`);
-    }
-    const body = await response.json() as unknown;
-    if (!isRecord(body)) throw new Error('Revternal Listen returned a non-object response');
-    return body as ListenResponse;
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('Revternal Listen timed out after 20000ms');
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
+  gateway: ListenGateway,
+): Promise<ListenGatewayResult> {
+  return gateway.listen({
+    query,
+    sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+    filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+    sort_by: 'relevance_score',
+    page: 1,
+    per_page: 20,
+  });
 }
 
-export async function runWatchSweep(ctx: WorkforceCtx, now: Date): Promise<void> {
-  const key = revternalKey();
-  if (!key) {
+export async function runWatchSweep(
+  ctx: WorkforceCtx,
+  now: Date,
+  gateway: ListenGateway = BLOCKED_NANGO_GATEWAY,
+): Promise<void> {
+  if (gateway.status === 'blocked') {
     ctx.log('warn', 'askable-gtm.sweep-blocked', {
-      reason: 'scoped Revternal credential bridge is not available',
+      reason: 'Revternal Nango action bridge is not available',
     });
     return;
   }
@@ -269,7 +300,8 @@ export async function runWatchSweep(ctx: WorkforceCtx, now: Date): Promise<void>
   for (const watch of state.watches) {
     if (!watchIsDue(watch, now)) continue;
     try {
-      const response = await queryListen(watch.query, key);
+      const result = await queryListen(watch.query, gateway);
+      const response = result.data;
       const results = response.results ?? [];
       const previous = new Set(watch.seenIds);
       const fresh = results.filter((result) => {
@@ -284,38 +316,53 @@ export async function runWatchSweep(ctx: WorkforceCtx, now: Date): Promise<void>
       watch.lastFetchedAt = response.meta?.fetched_at;
       changed = true;
       if (fresh.length > 0) {
-        await reply(ctx, watch.owner, renderListenAnswer(watch.query, response, fresh));
+        await reply(ctx, watch.owner, renderListenAnswer(watch.query, response, fresh, result.access));
       }
     } catch (error) {
       ctx.log('error', 'askable-gtm.watch-failed', {
         watchId: watch.id,
-        error: error instanceof Error ? error.message : String(error),
+        errorCode: safeGatewayErrorCode(error),
       });
     }
   }
   if (changed) await saveWatchState(ctx, state.watches);
 }
 
-async function answerQuestion(ctx: WorkforceCtx, sender: string, query: string): Promise<void> {
-  const key = revternalKey();
-  if (!key) {
+async function answerQuestion(
+  ctx: WorkforceCtx,
+  sender: string,
+  query: string,
+  gateway: ListenGateway,
+): Promise<void> {
+  if (gateway.status === 'blocked') {
     await reply(
       ctx,
       sender,
-      'Live public-signal search is blocked: Cloud has not supplied a scoped Revternal '
-        + 'credential bridge. I can still describe my manifest and manage watch definitions. '
+      'Live public-signal search is blocked: Cloud has not supplied the Revternal Nango '
+        + 'action bridge. I can still describe my manifest and manage watch definitions. '
         + 'Send “capabilities --json” for the exact machine-readable status.',
     );
     return;
   }
-  const response = await queryListen(query, key);
-  await reply(ctx, sender, renderListenAnswer(query, response, response.results ?? []));
+  try {
+    const result = await queryListen(query, gateway);
+    await reply(
+      ctx,
+      sender,
+      renderListenAnswer(query, result.data, result.data.results ?? [], result.access),
+    );
+  } catch (error) {
+    const errorCode = safeGatewayErrorCode(error);
+    ctx.log('error', 'askable-gtm.question-failed', { errorCode });
+    await reply(ctx, sender, renderGatewayFailure(errorCode));
+  }
 }
 
 export function renderListenAnswer(
   query: string,
   response: ListenResponse,
   results: ListenResult[],
+  access?: ListenGatewayResult['access'],
 ): string {
   const fetchedAt = response.meta?.fetched_at ?? 'not supplied';
   const coverage = Object.entries(response.source_status ?? {})
@@ -331,16 +378,17 @@ export function renderListenAnswer(
   return [
     `Public-signal evidence for “${oneLine(query)}”`,
     `Fetched: ${fetchedAt} · coverage: ${coverage}`,
+    ...(access ? [renderAccessDisclosure(access)] : []),
     items.length ? items.join('\n') : 'No results were returned.',
     'Source facts are shown above; themes or intent require separate inference.',
   ].join('\n');
 }
 
-export function renderCapabilities(hasCredential: boolean): string {
+export function renderCapabilities(gatewayStatus: ListenGateway['status']): string {
   return [
     'I am GTM Signal Scout, an askable proactive-agent prototype.',
     'Verified here: machine-readable self-description and durable watch-definition management.',
-    `Live Revternal search: ${hasCredential ? 'credential present, but result quality remains unverified' : 'blocked until Cloud supplies a scoped credential bridge'}.`,
+    `Live Revternal search: ${gatewayStatus === 'configured' ? 'Nango gateway configured; credential and entitlement are checked per request, and result quality remains unverified' : 'blocked until Cloud supplies the Revternal Nango action bridge'}.`,
     'Designed questions: competitor mentions, category objections/migration pain, launch reaction, and public community/author activity.',
     'Watch syntax: watch <query> every <15m|1h|6h|12h|24h|7d>.',
     'All watches share one deploy-time 15-minute sweep; an utterance does not create its own Relaycron recurrence.',
@@ -430,9 +478,37 @@ async function reply(ctx: WorkforceCtx, to: string, text: string): Promise<void>
   if (!result.ok) throw new Error(`Relay DM delivery failed for ${to}`);
 }
 
-function revternalKey(): string | undefined {
-  const key = process.env.REVTERNAL_API_KEY?.trim();
-  return key || undefined;
+function renderAccessDisclosure(access: ListenGatewayResult['access']): string {
+  const host = safeDisplayHost(access.endpointHost);
+  return access.credentialSource === 'managed'
+    ? `Access: Agent Workforce managed Revternal access; usage counts against your paid allowance. Host: ${host}.`
+    : `Access: your Nango-connected Revternal credential. Host: ${host}.`;
+}
+
+function safeDisplayHost(value: string): string {
+  const host = value.trim().toLowerCase();
+  if (host.length < 1 || host.length > 253) return 'not disclosed';
+  if (!/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::[0-9]{1,5})?$/u.test(host)) {
+    return 'not disclosed';
+  }
+  return host;
+}
+
+function safeGatewayErrorCode(error: unknown): ListenGatewayErrorCode {
+  return error instanceof ListenGatewayError ? error.code : 'request-failed';
+}
+
+function renderGatewayFailure(code: ListenGatewayErrorCode): string {
+  if (code === 'connection-required') {
+    return 'Revternal access is not connected. Add the credential and endpoint in Workspace Integrations.';
+  }
+  if (code === 'managed-access-denied') {
+    return 'Managed Revternal access is not authorized for this workspace. Connect your own credential or upgrade.';
+  }
+  if (code === 'quota-exhausted') {
+    return 'The Revternal allowance for this workspace is exhausted. No provider request was made.';
+  }
+  return `Revternal query failed safely (${code}). No provider response detail was logged.`;
 }
 
 function cadenceMs(cadence: WatchCadence): number {

@@ -5,9 +5,17 @@ conversation surface, a machine-readable capability manifest, durable user
 watch definitions, and a real deploy-time 15-minute sweep.
 
 It intentionally fails closed for live Revternal access. The current Cloud
-runtime has no scoped Revternal integration/credential bridge, so this persona
-does not declare or accept an API key input. Do not add a key to `persona.ts`, a
-fixture, a README command, or Relayfile.
+runtime has no Revternal provider or persona-to-Nango action bridge, so this
+persona does not declare or accept an API key or endpoint input. Do not add a
+key or provider base URL to `persona.ts`, `agent.ts`, a fixture, a README
+command, or Relayfile.
+
+The required product flow is Workspace Integrations (`/integrations`) → Connect
+Revternal. Standard hosted users paste their API key and confirm the visible
+provider host; a supported self-hosted deployment also supplies its host. Nango
+stores a user-owned credential and endpoint together. Managed access uses the
+same Nango action but a gated environment-held pair. This UI is a design target
+today: Revternal is not yet registered in Cloud's provider catalog.
 
 ## Conversation contract
 

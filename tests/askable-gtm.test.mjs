@@ -3,16 +3,63 @@ import test from 'node:test';
 
 import {
   WATCH_SWEEP_CRON,
+  WATCH_STATE_PATH,
   ListenGatewayError,
   createWatch,
+  createRelayfileWatchStateStore,
   handleRelayMessage,
   parseCommand,
   queryListen,
+  renderCapabilities,
   renderListenAnswer,
+  runWatchSweep,
   watchIsDue,
 } from '../.test-build/askable-gtm/agent.js';
 import { ASKABLE_GTM_CAPABILITY } from '../.test-build/askable-gtm/capabilities.js';
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
+
+function emptyWatchState(watches = []) {
+  return {
+    kind: 'askable-gtm watch state',
+    version: 1,
+    updatedAt: new Date(0).toISOString(),
+    watches,
+  };
+}
+
+function createCasStore(initialState = emptyWatchState()) {
+  let state = structuredClone(initialState);
+  let revision = 0;
+  const store = {
+    async read() {
+      return { state: structuredClone(state), revision: `rev-${revision}` };
+    },
+    async compareAndSet(expectedRevision, nextState) {
+      await Promise.resolve();
+      if (expectedRevision !== `rev-${revision}`) return false;
+      state = structuredClone(nextState);
+      revision += 1;
+      return true;
+    },
+  };
+  return {
+    store,
+    state: () => structuredClone(state),
+  };
+}
+
+function relayEvent(id, text, sender = 'requester') {
+  const event = envelopeToAgentEvent({
+    id,
+    workspace: 'workspace-test',
+    type: 'relaycast.message',
+    occurredAt: '2026-08-07T10:00:00Z',
+    summary: { actor: { id: sender } },
+    resource: { text },
+  });
+  assert.ok(event);
+  return event;
+}
 
 test('machine-readable capability manifest is versioned and honest about live access', () => {
   assert.equal(ASKABLE_GTM_CAPABILITY.schema, 'agentrelay.askable.v1');
@@ -45,6 +92,18 @@ test('conversation commands cover self-description and durable watch management'
   });
 });
 
+test('human capability advertisement is rendered from the machine manifest', () => {
+  const rendered = renderCapabilities('blocked');
+  const watchOperation = ASKABLE_GTM_CAPABILITY.operations.find(
+    (operation) => operation.id === 'manage-watch-definitions',
+  );
+  assert.match(rendered, new RegExp(watchOperation.accepts[0].replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
+  assert.match(rendered, new RegExp(watchOperation.recurrence.sweepCron.replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
+  for (const question of ASKABLE_GTM_CAPABILITY.questions) {
+    assert.match(rendered, new RegExp(question.example.replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
+  }
+});
+
 test('watch definitions are stable per owner/query and evaluated at their requested cadence', () => {
   const created = new Date('2026-08-07T10:00:00.000Z');
   const watch = createWatch('  Acme   migration pain ', '6h', 'requester', created);
@@ -59,33 +118,19 @@ test('watch definitions are stable per owner/query and evaluated at their reques
 });
 
 test('relay watch utterance persists durable state and returns the scheduling truth', async () => {
-  const saved = [];
   const sent = [];
-  const event = envelopeToAgentEvent({
-    id: 'evt-watch',
-    workspace: 'workspace-test',
-    type: 'relaycast.message',
-    occurredAt: '2026-08-07T10:00:00Z',
-    summary: { actor: { id: 'requester' } },
-    resource: { text: 'watch Acme migration pain every 6h' },
-  });
-  assert.ok(event);
+  const event = relayEvent('evt-watch', 'watch Acme migration pain every 6h');
+  const cas = createCasStore();
 
   const ctx = {
     log() {},
-    memory: {
-      async recall() { return []; },
-      async save(content, opts) { saved.push({ content, opts }); },
-    },
     relay: {
       async dm(to, text) { sent.push({ to, text }); return { ok: true, messageId: 'message-test' }; },
     },
   };
 
-  await handleRelayMessage(ctx, event);
-  assert.equal(saved.length, 1);
-  assert.deepEqual(saved[0].opts.tags, ['askable-gtm:watch-state']);
-  const state = JSON.parse(saved[0].content);
+  await handleRelayMessage(ctx, event, undefined, cas.store);
+  const state = cas.state();
   assert.equal(state.watches.length, 1);
   assert.equal(state.watches[0].query, 'Acme migration pain');
   assert.equal(state.watches[0].cadence, '6h');
@@ -127,6 +172,227 @@ test('Listen gateway receives one bounded request with no credential or endpoint
   assert.equal('endpoint' in requests[0], false);
   assert.equal('baseUrl' in requests[0], false);
   assert.equal(result.data.source_status.reddit.status, 'ok');
+});
+
+test('interactive queries are normalized and validated before the gateway is called', async () => {
+  const requests = [];
+  const gateway = {
+    status: 'configured',
+    async listen(request) {
+      requests.push(request);
+      return {
+        data: { results: [] },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+      };
+    },
+  };
+
+  await assert.rejects(() => queryListen('', gateway), /between 2 and 500 characters/);
+  await assert.rejects(() => queryListen('x', gateway), /between 2 and 500 characters/);
+  await queryListen('  ok  ', gateway);
+  await queryListen('x'.repeat(500), gateway);
+  await assert.rejects(() => queryListen('x'.repeat(501), gateway), /between 2 and 500 characters/);
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].query, 'ok');
+  assert.equal(requests[1].query.length, 500);
+});
+
+test('invalid interactive query returns an error without invoking the gateway', async () => {
+  let gatewayCalls = 0;
+  const sent = [];
+  const ctx = {
+    log() {},
+    relay: {
+      async dm(to, text) { sent.push({ to, text }); return { ok: true }; },
+    },
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      gatewayCalls += 1;
+      throw new Error('must not be called');
+    },
+  };
+
+  await handleRelayMessage(ctx, relayEvent('evt-short', 'x'), gateway);
+
+  assert.equal(gatewayCalls, 0);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /between 2 and 500 characters/);
+});
+
+test('Relayfile watch store uses creation-only and revision-matched writes', async () => {
+  const requests = [];
+  const responses = [
+    new Response('', { status: 404 }),
+    new Response('', { status: 200, headers: { etag: 'rev-1' } }),
+  ];
+  const store = createRelayfileWatchStateStore({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'test-token-placeholder',
+            workspaceId: 'workspace-test',
+          },
+        };
+      },
+    },
+  }, async (input, init) => {
+    requests.push(new Request(input, init));
+    return responses.shift();
+  });
+
+  const snapshot = await store.read();
+  assert.equal(snapshot.revision, '0');
+  assert.equal(await store.compareAndSet(snapshot.revision, snapshot.state), true);
+  assert.equal(requests[0].method, 'GET');
+  assert.equal(new URL(requests[0].url).searchParams.get('path'), WATCH_STATE_PATH);
+  assert.equal(requests[1].method, 'PUT');
+  assert.equal(requests[1].headers.get('if-match'), '0');
+});
+
+test('failed watch delivery does not consume results and the next sweep retries them', async () => {
+  const now = new Date('2026-08-07T12:00:00.000Z');
+  const watch = createWatch('Acme migration pain', '15m', 'requester', now);
+  const cas = createCasStore(emptyWatchState([watch]));
+  let deliveryAttempts = 0;
+  let gatewayCalls = 0;
+  const ctx = {
+    log() {},
+    relay: {
+      async dm() {
+        deliveryAttempts += 1;
+        return deliveryAttempts === 1 ? { ok: false } : { ok: true, messageId: 'message-ok' };
+      },
+    },
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      gatewayCalls += 1;
+      return {
+        data: {
+          meta: { fetched_at: '2026-08-07T12:00:01.000Z' },
+          results: [{ platform: 'reddit', source_id: 'post-1', title: 'Result' }],
+          source_status: { reddit: { status: 'ok', count: 1 } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+      };
+    },
+  };
+
+  await runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-first');
+  let persisted = cas.state().watches[0];
+  assert.deepEqual(persisted.seenIds, []);
+  assert.equal(persisted.lastRunAt, undefined);
+  assert.equal(persisted.runClaim, undefined);
+
+  await runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-second');
+  persisted = cas.state().watches[0];
+  assert.deepEqual(persisted.seenIds, ['reddit:post-1']);
+  assert.equal(persisted.lastRunAt, now.toISOString());
+  assert.equal(persisted.runClaim, undefined);
+  assert.equal(deliveryAttempts, 2);
+  assert.equal(gatewayCalls, 2);
+});
+
+test('CAS preserves concurrent create, remove, and sweep mutations without duplicate delivery', async () => {
+  const now = new Date('2026-08-07T12:00:00.000Z');
+  const removeTarget = createWatch('remove me', '15m', 'requester', now);
+  removeTarget.lastRunAt = now.toISOString();
+  const sweepTarget = createWatch('sweep me', '15m', 'requester', now);
+  const cas = createCasStore(emptyWatchState([removeTarget, sweepTarget]));
+  const sent = [];
+  let gatewayCalls = 0;
+  const ctx = {
+    log() {},
+    relay: {
+      async dm(to, text) {
+        sent.push({ to, text });
+        return { ok: true, messageId: `message-${sent.length}` };
+      },
+    },
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      gatewayCalls += 1;
+      await Promise.resolve();
+      return {
+        data: {
+          meta: { fetched_at: '2026-08-07T12:00:01.000Z' },
+          results: [{ platform: 'reddit', source_id: 'post-2', title: 'Concurrent result' }],
+          source_status: { reddit: { status: 'ok', count: 1 } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+      };
+    },
+  };
+
+  await Promise.all([
+    handleRelayMessage(
+      ctx,
+      relayEvent('evt-create-concurrent', 'watch keep me every 1h'),
+      gateway,
+      cas.store,
+    ),
+    handleRelayMessage(
+      ctx,
+      relayEvent('evt-remove-concurrent', `unwatch ${removeTarget.id}`),
+      gateway,
+      cas.store,
+    ),
+    runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-concurrent'),
+  ]);
+
+  const state = cas.state();
+  assert.equal(state.watches.some((watch) => watch.id === removeTarget.id), false);
+  assert.equal(state.watches.some((watch) => watch.query === 'keep me'), true);
+  const swept = state.watches.find((watch) => watch.id === sweepTarget.id);
+  assert.deepEqual(swept.seenIds, ['reddit:post-2']);
+  assert.equal(swept.runClaim, undefined);
+  assert.equal(gatewayCalls, 1);
+  assert.equal(sent.filter(({ text }) => text.includes('Concurrent result')).length, 1);
+});
+
+test('a CAS run claim fences concurrent sweeps for the same work unit', async () => {
+  const now = new Date('2026-08-07T12:00:00.000Z');
+  const watch = createWatch('one delivery', '15m', 'requester', now);
+  const cas = createCasStore(emptyWatchState([watch]));
+  let gatewayCalls = 0;
+  let deliveries = 0;
+  let releaseGateway;
+  const gatewayBarrier = new Promise((resolve) => { releaseGateway = resolve; });
+  const ctx = {
+    log() {},
+    relay: {
+      async dm() { deliveries += 1; return { ok: true }; },
+    },
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      gatewayCalls += 1;
+      await gatewayBarrier;
+      return {
+        data: { results: [{ platform: 'reddit', source_id: 'post-3' }] },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+      };
+    },
+  };
+
+  const first = runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-a');
+  const second = runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-b');
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseGateway();
+  await Promise.all([first, second]);
+
+  assert.equal(gatewayCalls, 1);
+  assert.equal(deliveries, 1);
+  assert.deepEqual(cas.state().watches[0].seenIds, ['reddit:post-3']);
 });
 
 test('answers expose freshness, coverage, engagement, and source URL', () => {

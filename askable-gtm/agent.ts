@@ -5,10 +5,14 @@ import {
   type AgentEvent,
   type WorkforceCtx,
 } from '@agentworkforce/runtime';
+import { randomUUID } from 'node:crypto';
 import { ASKABLE_GTM_CAPABILITY } from './capabilities.js';
 
-const WATCH_STATE_TAG = 'askable-gtm:watch-state';
 const MAX_SEEN_IDS = 500;
+const MAX_WATCH_STATE_CAS_ATTEMPTS = 8;
+const WATCH_CLAIM_LEASE_MS = 30 * 60 * 1000;
+
+export const WATCH_STATE_PATH = '/revternal/_agents/askable-gtm/watch-state.json';
 
 export const WATCH_SWEEP_CRON = '*/15 * * * *';
 
@@ -23,13 +27,27 @@ export interface WatchDefinition {
   lastRunAt?: string;
   lastFetchedAt?: string;
   seenIds: string[];
+  runClaim?: {
+    id: string;
+    claimedAt: string;
+  };
 }
 
-interface WatchState {
+export interface WatchState {
   kind: 'askable-gtm watch state';
   version: 1;
   updatedAt: string;
   watches: WatchDefinition[];
+}
+
+export interface WatchStateSnapshot {
+  state: WatchState;
+  revision: string;
+}
+
+export interface WatchStateStore {
+  read(): Promise<WatchStateSnapshot>;
+  compareAndSet(expectedRevision: string, state: WatchState): Promise<boolean>;
 }
 
 export interface ListenResult {
@@ -91,6 +109,7 @@ export interface ListenGateway {
 }
 
 export type ListenGatewayErrorCode =
+  | 'invalid-query'
   | 'connection-required'
   | 'managed-access-denied'
   | 'quota-exhausted'
@@ -101,8 +120,8 @@ export type ListenGatewayErrorCode =
   | 'request-failed';
 
 export class ListenGatewayError extends Error {
-  constructor(readonly code: ListenGatewayErrorCode) {
-    super(code);
+  constructor(readonly code: ListenGatewayErrorCode, message: string = code) {
+    super(message);
     this.name = 'ListenGatewayError';
   }
 }
@@ -123,8 +142,9 @@ export type ParsedCommand =
   | { kind: 'question'; query: string };
 
 export default defineAgent({
-  // User watch definitions live in workspace memory. This one deploy-time
-  // Relaycron schedule evaluates which definitions are due every 15 minutes.
+  // User watch definitions live in revisioned Relayfile state. This one
+  // deploy-time Relaycron schedule evaluates which definitions are due every
+  // 15 minutes.
   schedules: [{ name: 'watch-sweep', cron: WATCH_SWEEP_CRON, tz: 'UTC' }],
 
   handler: async (ctx, event) => {
@@ -168,6 +188,7 @@ export async function handleRelayMessage(
   ctx: WorkforceCtx,
   event: AgentEvent,
   gateway: ListenGateway = BLOCKED_NANGO_GATEWAY,
+  stateStore?: WatchStateStore,
 ): Promise<void> {
   const full = await event.expand('full').catch(() => undefined);
   const text = relayText(event, full);
@@ -196,25 +217,32 @@ export async function handleRelayMessage(
     return;
   }
   if (command.kind === 'list-watches') {
-    const state = await loadWatchState(ctx);
+    const state = (await resolveWatchStateStore(ctx, stateStore).read()).state;
     await reply(ctx, sender, renderWatches(state.watches.filter((watch) => watch.owner === sender)));
     return;
   }
   if (command.kind === 'remove-watch') {
-    const state = await loadWatchState(ctx);
-    const remaining = state.watches.filter(
-      (watch) => !(watch.id === command.id && watch.owner === sender),
+    const removed = await mutateWatchState(
+      resolveWatchStateStore(ctx, stateStore),
+      (state) => {
+        const remaining = state.watches.filter(
+          (watch) => !(watch.id === command.id && watch.owner === sender),
+        );
+        if (remaining.length === state.watches.length) {
+          return { changed: false, value: false };
+        }
+        state.watches = remaining;
+        return { changed: true, value: true };
+      },
     );
-    if (remaining.length === state.watches.length) {
+    if (!removed) {
       await reply(ctx, sender, `I could not find watch ${command.id} owned by you.`);
       return;
     }
-    await saveWatchState(ctx, remaining);
     await reply(ctx, sender, `Removed watch ${command.id}.`);
     return;
   }
   if (command.kind === 'create-watch') {
-    const state = await loadWatchState(ctx);
     let watch: WatchDefinition;
     try {
       watch = createWatch(command.query, command.cadence, sender, new Date());
@@ -222,10 +250,16 @@ export async function handleRelayMessage(
       await reply(ctx, sender, error instanceof Error ? error.message : 'Invalid watch request.');
       return;
     }
-    const withoutDuplicate = state.watches.filter(
-      (candidate) => !(candidate.owner === sender && candidate.query === watch.query),
+    await mutateWatchState(
+      resolveWatchStateStore(ctx, stateStore),
+      (state) => {
+        const withoutDuplicate = state.watches.filter(
+          (candidate) => !(candidate.owner === sender && candidate.query === watch.query),
+        );
+        state.watches = [...withoutDuplicate, watch];
+        return { changed: true, value: undefined };
+      },
     );
-    await saveWatchState(ctx, [...withoutDuplicate, watch]);
     await reply(
       ctx,
       sender,
@@ -248,10 +282,7 @@ export function createWatch(
   owner: string,
   now: Date,
 ): WatchDefinition {
-  const cleaned = query.replace(/\s+/gu, ' ').trim();
-  if (cleaned.length < 2 || cleaned.length > 500) {
-    throw new Error('Watch query must contain between 2 and 500 characters');
-  }
+  const cleaned = normalizeListenQuery(query, 'Watch query');
   return {
     id: `watch-${shortHash(`${owner}\n${cleaned.toLowerCase()}`)}`,
     query: cleaned,
@@ -273,8 +304,9 @@ export async function queryListen(
   query: string,
   gateway: ListenGateway,
 ): Promise<ListenGatewayResult> {
+  const normalizedQuery = normalizeListenQuery(query, 'Query');
   return gateway.listen({
-    query,
+    query: normalizedQuery,
     sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
     filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
     sort_by: 'relevance_score',
@@ -287,6 +319,8 @@ export async function runWatchSweep(
   ctx: WorkforceCtx,
   now: Date,
   gateway: ListenGateway = BLOCKED_NANGO_GATEWAY,
+  stateStore?: WatchStateStore,
+  claimIdFactory: () => string = () => `claim-${randomUUID()}`,
 ): Promise<void> {
   if (gateway.status === 'blocked') {
     ctx.log('warn', 'askable-gtm.sweep-blocked', {
@@ -295,9 +329,11 @@ export async function runWatchSweep(
     return;
   }
 
-  const state = await loadWatchState(ctx);
-  let changed = false;
-  for (const watch of state.watches) {
+  const store = resolveWatchStateStore(ctx, stateStore);
+  const state = (await store.read()).state;
+  for (const candidate of state.watches) {
+    const watch = await claimDueWatch(store, candidate.id, now, claimIdFactory());
+    if (!watch) continue;
     if (!watchIsDue(watch, now)) continue;
     try {
       const result = await queryListen(watch.query, gateway);
@@ -308,24 +344,24 @@ export async function runWatchSweep(
         const id = resultId(result);
         return Boolean(id && !previous.has(id));
       });
-      watch.seenIds = unique([
-        ...results.map(resultId).filter((id): id is string => Boolean(id)),
-        ...watch.seenIds,
-      ]).slice(0, MAX_SEEN_IDS);
-      watch.lastRunAt = now.toISOString();
-      watch.lastFetchedAt = response.meta?.fetched_at;
-      changed = true;
       if (fresh.length > 0) {
         await reply(ctx, watch.owner, renderListenAnswer(watch.query, response, fresh, result.access));
       }
+      await finalizeWatchRun(
+        store,
+        watch,
+        results.map(resultId).filter((id): id is string => Boolean(id)),
+        now,
+        response.meta?.fetched_at,
+      );
     } catch (error) {
+      await releaseWatchClaim(store, watch.id, watch.runClaim?.id).catch(() => undefined);
       ctx.log('error', 'askable-gtm.watch-failed', {
         watchId: watch.id,
         errorCode: safeGatewayErrorCode(error),
       });
     }
   }
-  if (changed) await saveWatchState(ctx, state.watches);
 }
 
 async function answerQuestion(
@@ -334,6 +370,13 @@ async function answerQuestion(
   query: string,
   gateway: ListenGateway,
 ): Promise<void> {
+  let normalizedQuery: string;
+  try {
+    normalizedQuery = normalizeListenQuery(query, 'Query');
+  } catch (error) {
+    await reply(ctx, sender, error instanceof Error ? error.message : 'Invalid query.');
+    return;
+  }
   if (gateway.status === 'blocked') {
     await reply(
       ctx,
@@ -345,11 +388,11 @@ async function answerQuestion(
     return;
   }
   try {
-    const result = await queryListen(query, gateway);
+    const result = await queryListen(normalizedQuery, gateway);
     await reply(
       ctx,
       sender,
-      renderListenAnswer(query, result.data, result.data.results ?? [], result.access),
+      renderListenAnswer(normalizedQuery, result.data, result.data.results ?? [], result.access),
     );
   } catch (error) {
     const errorCode = safeGatewayErrorCode(error);
@@ -385,13 +428,21 @@ export function renderListenAnswer(
 }
 
 export function renderCapabilities(gatewayStatus: ListenGateway['status']): string {
+  const watchOperation = ASKABLE_GTM_CAPABILITY.operations.find(
+    (operation) => operation.id === 'manage-watch-definitions',
+  );
+  const watchSyntax = watchOperation?.accepts.find((value) => value.startsWith('watch '))
+    ?? 'not advertised';
+  const designedQuestions = ASKABLE_GTM_CAPABILITY.questions
+    .map((question) => question.example)
+    .join(' ');
   return [
     'I am GTM Signal Scout, an askable proactive-agent prototype.',
     'Verified here: machine-readable self-description and durable watch-definition management.',
     `Live Revternal search: ${gatewayStatus === 'configured' ? 'Nango gateway configured; credential and entitlement are checked per request, and result quality remains unverified' : 'blocked until Cloud supplies the Revternal Nango action bridge'}.`,
-    'Designed questions: competitor mentions, category objections/migration pain, launch reaction, and public community/author activity.',
-    'Watch syntax: watch <query> every <15m|1h|6h|12h|24h|7d>.',
-    'All watches share one deploy-time 15-minute sweep; an utterance does not create its own Relaycron recurrence.',
+    `Designed questions: ${designedQuestions}`,
+    `Watch syntax: ${watchSyntax}.`,
+    `Scheduling: ${watchOperation?.recurrence.mechanism ?? 'not advertised'} at ${watchOperation?.recurrence.sweepCron ?? 'not advertised'}; per-watch Relaycron schedule: ${String(watchOperation?.recurrence.perWatchRelaycronSchedule ?? false)}.`,
     'Send “capabilities --json” for the complete machine-readable manifest.',
   ].join('\n');
 }
@@ -403,34 +454,175 @@ function renderWatches(watches: WatchDefinition[]): string {
     .join('\n');
 }
 
-async function loadWatchState(ctx: WorkforceCtx): Promise<WatchState> {
-  const items = await ctx.memory.recall('askable GTM watch state', {
-    tags: [WATCH_STATE_TAG],
-    limit: 20,
-  });
-  const states = items.flatMap((item) => {
-    try {
-      const value = JSON.parse(item.content) as unknown;
-      return validWatchState(value) ? [value] : [];
-    } catch {
-      return [];
-    }
-  });
-  states.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  return states[0] ?? emptyWatchState();
+export function createRelayfileWatchStateStore(
+  ctx: WorkforceCtx,
+  fetchImpl: typeof fetch = fetch,
+): WatchStateStore {
+  const credentials = ctx.credentials.tryRequire()?.relayfile;
+  if (!credentials) {
+    throw new Error('Durable watch state is unavailable: Relayfile credentials are required');
+  }
+  const fileUrl = new URL(
+    `/v1/workspaces/${encodeURIComponent(credentials.workspaceId)}/fs/file`,
+    `${credentials.url.replace(/\/+$/u, '')}/`,
+  );
+  fileUrl.searchParams.set('path', WATCH_STATE_PATH);
+
+  return {
+    async read() {
+      const response = await fetchImpl(fileUrl, {
+        method: 'GET',
+        headers: { authorization: `Bearer ${credentials.token}` },
+      });
+      if (response.status === 404) {
+        return { state: emptyWatchState(), revision: '0' };
+      }
+      if (!response.ok) {
+        throw new Error(`Durable watch state read failed (${response.status})`);
+      }
+      const body = await response.json() as { content?: unknown; revision?: unknown };
+      const value = typeof body.content === 'string'
+        ? parseWatchState(body.content)
+        : undefined;
+      if (!value) throw new Error('Durable watch state is invalid');
+      const revision = typeof body.revision === 'string'
+        ? body.revision
+        : response.headers.get('etag');
+      if (!revision) throw new Error('Durable watch state read did not return a revision');
+      return { state: value, revision };
+    },
+    async compareAndSet(expectedRevision, state) {
+      const response = await fetchImpl(fileUrl, {
+        method: 'PUT',
+        headers: {
+          authorization: `Bearer ${credentials.token}`,
+          'content-type': 'application/json',
+          'if-match': expectedRevision,
+        },
+        body: JSON.stringify(state),
+      });
+      if (response.status === 409 || response.status === 412) return false;
+      if (!response.ok) {
+        throw new Error(`Durable watch state write failed (${response.status})`);
+      }
+      return true;
+    },
+  };
 }
 
-async function saveWatchState(ctx: WorkforceCtx, watches: WatchDefinition[]): Promise<void> {
-  const state: WatchState = {
-    kind: 'askable-gtm watch state',
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    watches,
-  };
-  await ctx.memory.save(JSON.stringify(state), {
-    tags: [WATCH_STATE_TAG],
-    scope: 'workspace',
+function resolveWatchStateStore(
+  ctx: WorkforceCtx,
+  stateStore?: WatchStateStore,
+): WatchStateStore {
+  return stateStore ?? createRelayfileWatchStateStore(ctx);
+}
+
+type WatchStateMutation<T> =
+  | { changed: false; value: T }
+  | { changed: true; value: T };
+
+async function mutateWatchState<T>(
+  store: WatchStateStore,
+  mutate: (state: WatchState) => WatchStateMutation<T>,
+): Promise<T> {
+  for (let attempt = 0; attempt < MAX_WATCH_STATE_CAS_ATTEMPTS; attempt += 1) {
+    const snapshot = await store.read();
+    const state = cloneWatchState(snapshot.state);
+    const result = mutate(state);
+    if (!result.changed) return result.value;
+    state.updatedAt = new Date().toISOString();
+    if (await store.compareAndSet(snapshot.revision, state)) return result.value;
+  }
+  throw new Error('Durable watch state changed too many times; retry the request');
+}
+
+async function claimDueWatch(
+  store: WatchStateStore,
+  watchId: string,
+  now: Date,
+  claimId: string,
+): Promise<WatchDefinition | undefined> {
+  return mutateWatchState(store, (state) => {
+    const watch = state.watches.find((candidate) => candidate.id === watchId);
+    if (!watch || !watchIsDue(watch, now)) {
+      return { changed: false, value: undefined };
+    }
+    if (watch.runClaim && !claimIsExpired(watch.runClaim, now)) {
+      return { changed: false, value: undefined };
+    }
+    watch.runClaim = { id: claimId, claimedAt: now.toISOString() };
+    return { changed: true, value: cloneWatch(watch) };
   });
+}
+
+async function finalizeWatchRun(
+  store: WatchStateStore,
+  claimedWatch: WatchDefinition,
+  observedIds: string[],
+  now: Date,
+  fetchedAt?: string,
+): Promise<void> {
+  const claimId = claimedWatch.runClaim?.id;
+  if (!claimId) throw new Error('Cannot finalize a watch run without a claim');
+  const finalized = await mutateWatchState(store, (state) => {
+    const watch = state.watches.find((candidate) => candidate.id === claimedWatch.id);
+    if (!watch || watch.runClaim?.id !== claimId) {
+      return { changed: false, value: false };
+    }
+    watch.seenIds = unique([...observedIds, ...watch.seenIds]).slice(0, MAX_SEEN_IDS);
+    watch.lastRunAt = now.toISOString();
+    watch.lastFetchedAt = fetchedAt;
+    delete watch.runClaim;
+    return { changed: true, value: true };
+  });
+  if (!finalized) {
+    throw new Error('Watch delivery could not be committed because its claim changed');
+  }
+}
+
+async function releaseWatchClaim(
+  store: WatchStateStore,
+  watchId: string,
+  claimId?: string,
+): Promise<void> {
+  if (!claimId) return;
+  await mutateWatchState(store, (state) => {
+    const watch = state.watches.find((candidate) => candidate.id === watchId);
+    if (!watch || watch.runClaim?.id !== claimId) {
+      return { changed: false, value: undefined };
+    }
+    delete watch.runClaim;
+    return { changed: true, value: undefined };
+  });
+}
+
+function claimIsExpired(claim: NonNullable<WatchDefinition['runClaim']>, now: Date): boolean {
+  const claimedAt = new Date(claim.claimedAt).getTime();
+  return !Number.isFinite(claimedAt) || now.getTime() - claimedAt >= WATCH_CLAIM_LEASE_MS;
+}
+
+function parseWatchState(content: string): WatchState | undefined {
+  try {
+    const value = JSON.parse(content) as unknown;
+    return validWatchState(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function cloneWatchState(state: WatchState): WatchState {
+  return {
+    ...state,
+    watches: state.watches.map(cloneWatch),
+  };
+}
+
+function cloneWatch(watch: WatchDefinition): WatchDefinition {
+  return {
+    ...watch,
+    seenIds: [...watch.seenIds],
+    ...(watch.runClaim ? { runClaim: { ...watch.runClaim } } : {}),
+  };
 }
 
 function emptyWatchState(): WatchState {
@@ -447,7 +639,25 @@ function validWatchState(value: unknown): value is WatchState {
   return value.kind === 'askable-gtm watch state'
     && value.version === 1
     && typeof value.updatedAt === 'string'
-    && Array.isArray(value.watches);
+    && Array.isArray(value.watches)
+    && value.watches.every(validWatchDefinition);
+}
+
+function validWatchDefinition(value: unknown): value is WatchDefinition {
+  if (!isRecord(value)) return false;
+  if (typeof value.id !== 'string'
+    || typeof value.query !== 'string'
+    || typeof value.cadence !== 'string'
+    || typeof value.owner !== 'string'
+    || typeof value.createdAt !== 'string'
+    || !Array.isArray(value.seenIds)
+    || !value.seenIds.every((id) => typeof id === 'string')) {
+    return false;
+  }
+  if (value.runClaim === undefined) return true;
+  return isRecord(value.runClaim)
+    && typeof value.runClaim.id === 'string'
+    && typeof value.runClaim.claimedAt === 'string';
 }
 
 function relayText(event: AgentEvent, expanded: unknown): string | undefined {
@@ -499,6 +709,9 @@ function safeGatewayErrorCode(error: unknown): ListenGatewayErrorCode {
 }
 
 function renderGatewayFailure(code: ListenGatewayErrorCode): string {
+  if (code === 'invalid-query') {
+    return 'Query must contain between 2 and 500 characters.';
+  }
   if (code === 'connection-required') {
     return 'Revternal access is not connected. Add the credential and endpoint in Workspace Integrations.';
   }
@@ -509,6 +722,18 @@ function renderGatewayFailure(code: ListenGatewayErrorCode): string {
     return 'The Revternal allowance for this workspace is exhausted. No provider request was made.';
   }
   return `Revternal query failed safely (${code}). No provider response detail was logged.`;
+}
+
+export function normalizeListenQuery(query: string, label = 'Query'): string {
+  const cleaned = query.replace(/\s+/gu, ' ').trim();
+  const characterCount = [...cleaned].length;
+  if (characterCount < 2 || characterCount > 500) {
+    throw new ListenGatewayError(
+      'invalid-query',
+      `${label} must contain between 2 and 500 characters`,
+    );
+  }
+  return cleaned;
 }
 
 function cadenceMs(cadence: WatchCadence): number {

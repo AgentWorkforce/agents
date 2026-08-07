@@ -120,12 +120,16 @@ It does not persist raw result bodies merely to make later chat possible.
 Historical trend questions are a separate, opt-in product capability with an
 explicit retention policy.
 
-The built prototype stores a versioned full-state snapshot in workspace memory
-with the persona's 90-day TTL. That proves the conversation-to-state path, but
-it is not a transactional watch database: concurrent updates have no
-compare-and-set protection, and a watch that is never refreshed can expire.
-A first-class watch table or Relayfile control record with concurrency control
-is a production gate.
+The built prototype stores one versioned Relayfile control record under the
+Revternal provider root. Every create, remove, claim, and sweep update uses the
+revision returned by Relayfile and writes with `If-Match`; conflicts reread and
+reapply the mutation. A sweep claims a due work unit before querying, delivers
+fresh evidence, and only then commits `seenIds` and run timestamps. A failed
+delivery releases the claim without consuming results, so the next sweep
+retries. The Relay DM API has no idempotency-key input, so one crash window
+remains: a process that dies after a successful DM but before the final CAS can
+cause a duplicate when the claim lease is recovered. Closing that window needs
+an idempotent Relay delivery key or a transactional outbox shared with Relay.
 
 ## User-directed scheduling, end to end
 
@@ -146,12 +150,13 @@ The conversational flow is:
 ```text
 relay DM: "watch Acme migration pain every 6h"
   -> handler validates query and cadence
-  -> handler persists a WatchDefinition in workspace memory
+  -> handler CAS-writes a WatchDefinition to revisioned Relayfile state
   -> reply includes watch id and the shared 15-minute sweep limitation
   -> next static Relaycron tick loads all watch definitions
-  -> due watches become Listen requests
+  -> a due watch is CAS-claimed before its Listen request
   -> source ids are diffed against per-watch seen ids
   -> only new evidence is DMed to the requesting relay identity
+  -> seen ids and run timestamps commit only after successful delivery
 ```
 
 This turns an utterance into a durable recurring **query definition** evaluated
@@ -277,15 +282,19 @@ The future persona declaration is:
 
 ```ts
 integrations: {
-  revternal: { source: { kind: 'workspace' } }
+  revternal: {
+    source: { kind: 'workspace' },
+    scope: { paths: '/revternal/_agents/askable-gtm/**' }
+  }
 }
 ```
 
 Persona-kit already defines `source` as the connection resolver, and Cloud's
 normalizer accepts `workspace`
 ([resolver contract](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/lib/integrations/persona-integration-config.ts#L1-L35)).
-The prototype deliberately does **not** declare this yet: deployment cannot
-resolve a provider that Cloud has not registered.
+The prototype declares this future connection shape so its endpoint/credential
+pair and narrow Relayfile state authority remain one integration boundary.
+Deployment still cannot resolve it until Cloud registers the provider.
 
 Existing personas prove only the safe half of this shape. `neon-monitor`
 declares a Neon integration, reads Relayfile VFS data, and receives no token
@@ -392,8 +401,8 @@ upstream allowance for every tenant. “Paid” display metadata is not enforcem
   the documented response.
 - Historical trends, repeat-author analysis, or exactly-once alerts without
   explicit Askable-owned retention/dedupe state.
-- Transaction-safe concurrent watch edits or indefinite watch retention from
-  the prototype's 90-day workspace-memory snapshot.
+- Exactly-once alert delivery across a process crash after Relay accepts a DM
+  but before the watch-state final CAS; Relay has no idempotency-key input.
 - Safe Boolean query grammar or known Listen credit cost; neither is documented.
 - BYOK Revternal deployment through today's Cloud integration registry.
 - Adding a Revternal credential or endpoint through today's `/integrations`

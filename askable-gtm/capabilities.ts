@@ -111,7 +111,8 @@ export const ASKABLE_GTM_CAPABILITY = {
     'Only Reddit is documented as currently registered.',
     'No full comments, contact data, employer/title, or qualification evidence.',
     'Per-watch recurrence is evaluated by one deploy-time sweep, not a dynamic Relaycron recurrence.',
-    'Prototype watch state uses a 90-day workspace-memory snapshot without compare-and-set updates.',
+    'Watch definitions use Relayfile revision compare-and-set updates and a pre-delivery run claim.',
+    'Relay DM has no idempotency-key input, so a process crash after delivery but before final state commit can cause a duplicate after claim-lease recovery.',
   ],
 } as const;
 

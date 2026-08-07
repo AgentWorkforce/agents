@@ -265,11 +265,9 @@ The required user path is concrete:
 2. Cloud requests a server-issued, provider-restricted Nango Connect session;
    the existing UI already does this for registered providers
    ([session request and hosted UI](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/app/integrations/IntegrationConnectionControls.tsx#L103-L185)).
-3. In Nango's hosted form, paste the Revternal API key. For the standard hosted
-   service, the user confirms a visible default host rather than pasting it. A
-   supported self-hosted or staging connection must enter its host in the same
-   form. An arbitrary host must not be accepted without HTTPS and allowlist or
-   administrator validation.
+3. In Nango's hosted form, paste the Revternal API key. The user does **not**
+   supply a base URL: the hosted Revternal endpoint is visibly shown and stored
+   with the connection rather than silently compiled into the persona.
 4. Nango stores the secret credential and the endpoint connection config as one
    connection. Cloud stores only the returned `connectionId` and
    `providerConfigKey`
@@ -311,15 +309,21 @@ managed fallback:   { REVTERNAL_API_KEY, REVTERNAL_BASE_URL } from Nango environ
 action output:       { results, credentialSource, endpointHost } (no secret)
 ```
 
-This prevents a production credential from drifting onto a staging or
-attacker-controlled host. Sending a valid key to the wrong host is credential
-exposure, not merely configuration failure. Existing PostHog integration code
+This prevents a production credential from drifting onto a different host.
+Sending a valid key to the wrong host is credential exposure, not merely
+configuration failure. Existing PostHog integration code
 can read `host`/`baseUrl` from Nango connection config, but falls back to a
 hard-coded default
 ([implementation](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/nango-integrations/posthog-relay/shared.ts#L212-L222)).
 Revternal should reuse the endpoint-bearing connection shape, not that fallback:
 the agent bundle must contain neither an endpoint constant nor a default URL.
-The agent's capability response and every result disclose the selected host.
+Every successful result discloses the selected host; the future gateway must
+also expose normalized, non-secret connection metadata so “which host are you
+using?” can be answered without making a provider request.
+This is an Askable-agent class invariant for every external API: the connection
+supplies the credential and endpoint together; the persona hardcodes neither.
+Self-hosting is deferred, and the endpoint-bearing connection means supporting
+it later is a connection-configuration change rather than an agent rewrite.
 
 ### One resolver, two secret sources
 

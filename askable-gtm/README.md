@@ -11,11 +11,11 @@ key or provider base URL to `persona.ts`, `agent.ts`, a fixture, a README
 command, or Relayfile.
 
 The required product flow is Workspace Integrations (`/integrations`) → Connect
-Revternal. Standard hosted users paste their API key and confirm the visible
-provider host; a supported self-hosted deployment also supplies its host. Nango
-stores a user-owned credential and endpoint together. Managed access uses the
-same Nango action but a gated environment-held pair. This UI is a design target
-today: Revternal is not yet registered in Cloud's provider catalog.
+Revternal. Hosted users paste their API key and confirm the visible hosted
+provider endpoint; they do not supply a base URL. Nango stores the user-owned
+credential and endpoint together. Managed access uses the same Nango action but
+a gated environment-held pair. This UI is a design target today: Revternal is
+not yet registered in Cloud's provider catalog.
 
 ## Conversation contract
 

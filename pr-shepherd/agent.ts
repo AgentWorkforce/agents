@@ -124,9 +124,11 @@ export default defineAgent({
       { on: 'pull_request.opened' },
       { on: 'pull_request.edited' },       // trajectory pointer back-annotated via PATCH /pulls/{number}
       { on: 'pull_request.closed' },
+      { on: 'pull_request.reopened' },
       { on: 'pull_request.synchronize' },
-      { on: 'pull_request.converted_to_draft' },
-      { on: 'pull_request.ready_for_review' },
+      // pull_request.converted_to_draft and pull_request.ready_for_review are not
+      // in the known-trigger registry — omitted. Draft state is read from the
+      // pull_request payload on opened/edited/synchronize events instead.
       { on: 'pull_request_review.submitted' },
       { on: 'pull_request_review_comment.created' },
       { on: 'check_run.completed' },

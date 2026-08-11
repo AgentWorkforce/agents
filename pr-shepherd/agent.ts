@@ -37,6 +37,13 @@ import {
   type WorkforceCtx
 } from '@agentworkforce/runtime';
 import { slackClient } from '@relayfile/relay-helpers';
+import {
+  bareChannelId,
+  defaultSlack,
+  postReply,
+  readSlackMessage,
+  skipReason
+} from '../shared/slack.js';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -741,30 +748,20 @@ export async function handleSlackMessage(
   ctx: WorkforceCtx,
   event: AgentEvent
 ): Promise<void> {
-  const data = ((await event.expand('full').catch(() => undefined)) as { data?: Record<string, unknown> } | undefined)?.data ?? {};
-  const channel = typeof data.channel === 'string' ? data.channel : undefined;
-  const ts = typeof data.ts === 'string' ? data.ts : undefined;
-  if (!channel || !ts) {
+  const payload = await event.expand('full').catch(() => undefined);
+  const msg = readSlackMessage((payload as { data?: unknown } | undefined)?.data ?? payload);
+  if (!msg) {
     ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'missing channel or ts' });
     return;
   }
 
-  // Channel guard: only reply in the configured channel.
-  const want = resolveInput(ctx, 'SLACK_CHANNEL')?.split('__')[0];
-  const chanId = channel.split('__')[0];
-  if (!want || chanId !== want) {
-    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'wrong-channel', chanId, want });
+  // Channel guard + bot filter via shared skipReason.
+  const configuredChannel = resolveInput(ctx, 'SLACK_CHANNEL');
+  const skip = skipReason(msg, configuredChannel);
+  if (skip) {
+    ctx.log('info', 'pr-shepherd.slack.skip', { reason: skip });
     return;
   }
-
-  // Ignore bot messages.
-  if (data.is_bot === true || data.bot_id || (typeof data.subtype === 'string' && data.subtype)) {
-    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'bot-message' });
-    return;
-  }
-
-  const rawText = typeof data.text === 'string' ? data.text : '';
-  const threadTs = typeof data.thread_ts === 'string' && data.thread_ts ? data.thread_ts : ts;
 
   // Fail closed on missing SLACK_BOT_USER_ID — without it we cannot confirm
   // the message is directed at this bot, so we would answer every message in
@@ -776,11 +773,12 @@ export async function handleSlackMessage(
     return;
   }
   const botMention = `<@${botUserId}>`;
-  if (!rawText.includes(botMention)) {
+  if (!msg.text.includes(botMention)) {
     ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'no-mention', botMention });
     return;
   }
   // Strip the leading bot mention; preserve any other mentions in the text.
+  const rawText = msg.text;
   const leading = rawText.trimStart();
   const question = (leading.startsWith(botMention)
     ? leading.slice(botMention.length)
@@ -817,12 +815,9 @@ export async function handleSlackMessage(
     answer = `I couldn't generate an answer right now. The ledger has ${openEntries.length} open PR(s).`;
   }
 
-  const result = await slackClient({ writebackTimeoutMs: 45_000 }).post(chanId, answer, { replyTo: threadTs });
-  if (!result.ts) {
-    ctx.log('warn', 'pr-shepherd.slack.no-receipt', { channel: chanId });
-  } else {
-    ctx.log('info', 'pr-shepherd.slack.replied', { channel: chanId, ts: result.ts });
-  }
+  const slack = defaultSlack();
+  await postReply(ctx, slack, msg, answer);
+  ctx.log('info', 'pr-shepherd.slack.replied', { channel: bareChannelId(msg.channel) });
 }
 
 // ── Backfill ──────────────────────────────────────────────────────────────────

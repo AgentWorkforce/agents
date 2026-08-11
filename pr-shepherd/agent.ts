@@ -79,6 +79,12 @@ export interface PrLedgerEntry {
   /** Last timestamp from any automated actor (CI, bot push). */
   lastBotActivityAt: string | null;
   ciStatus: 'pending' | 'passing' | 'failing' | null;
+  /**
+   * Per-check-run statuses keyed by check name. Aggregated into ciStatus.
+   * Required to avoid a later successful unrelated check overwriting a failing
+   * required check (Codex P1: each check_run.completed overwrote ciStatus).
+   */
+  ciChecks?: Record<string, 'passing' | 'failing' | 'pending'>;
   reviewState: 'awaiting-review' | 'changes-requested' | 'approved' | null;
   /** ISO; null until the PR is merged or closed. */
   closedAt: string | null;
@@ -224,6 +230,14 @@ export async function updateLedger(
     // silently excluded from staleness evaluation.
   }
 
+  if (eventType === 'github.pull_request.reopened') {
+    // Codex P2: closedAt was never reset on reopen — the PR stayed
+    // permanently excluded from staleness evaluation after any close cycle.
+    entry.closedAt = null;
+    entry.reviewState = 'awaiting-review';
+    if (!isBot) entry.lastHumanActivityAt = now;
+  }
+
   if (eventType === 'github.pull_request.synchronize') {
     // New commit pushed to the PR branch.
     if (!isBot) {
@@ -269,13 +283,28 @@ export async function updateLedger(
   if (eventType === 'github.check_run.completed') {
     const checkRun = d.check_run as Record<string, unknown> | undefined;
     const conclusion = checkRun?.conclusion as string | undefined;
+    const checkName = (checkRun?.name as string | undefined) ?? 'unknown';
     entry.lastBotActivityAt = now;
+
+    // Codex P1: a single check_run.completed was overwriting the whole ciStatus.
+    // A later successful unrelated check could mask a failing required check.
+    // Track per-check status and aggregate: any failing check → ciStatus=failing.
+    if (!entry.ciChecks) entry.ciChecks = {};
     if (conclusion === 'success' || conclusion === 'skipped' || conclusion === 'neutral') {
-      entry.ciStatus = 'passing';
+      entry.ciChecks[checkName] = 'passing';
     } else if (conclusion === 'failure' || conclusion === 'timed_out' || conclusion === 'action_required') {
-      entry.ciStatus = 'failing';
+      entry.ciChecks[checkName] = 'failing';
     } else {
+      entry.ciChecks[checkName] = 'pending';
+    }
+
+    const statuses = Object.values(entry.ciChecks);
+    if (statuses.some(s => s === 'failing')) {
+      entry.ciStatus = 'failing';
+    } else if (statuses.some(s => s === 'pending')) {
       entry.ciStatus = 'pending';
+    } else {
+      entry.ciStatus = 'passing';
     }
   }
 
@@ -327,10 +356,12 @@ export async function evaluateLedger(ctx: WorkforceCtx): Promise<void> {
 
   // Backfill: seed the ledger from the GitHub REST API on the first tick.
   // Only open, non-draft PRs are backfilled. Closed/merged PRs are excluded.
+  // Codex P1: markBackfillDone was unconditional — a failed crawl permanently
+  // disabled retries. Now only marks done when the crawl succeeds.
   const backfillDone = await isBackfillDone(ctx);
   if (!backfillDone) {
-    await backfillLedger(ctx);
-    await markBackfillDone(ctx);
+    const ok = await backfillLedger(ctx);
+    if (ok) await markBackfillDone(ctx);
   }
 
   const entries = await loadAllLedgerEntries(ctx);
@@ -378,9 +409,17 @@ export async function evaluateLedger(ctx: WorkforceCtx): Promise<void> {
       escalated++;
     }
 
-    // Rung 3 is a Chief DM — escalate() handles it for rung 3. Not time-gated
-    // further here; rung 2 fires it on the first evaluation after rung 2 fires.
-    // (Intentionally simple for V1 — revisit after measuring rung-2 traffic.)
+    // Rung 3: Chief DM — fires on the first evaluation after rung 2 is recorded.
+    // Codex P1: rung 3 was referenced in the comment but never dispatched —
+    // the loop fell through to evaluated++ without calling escalate(..., 3, ...).
+    if (rung2Record) {
+      const rung3Key = escalationKey(entry.owner, entry.repo, entry.prNumber, staleness.bin, 3);
+      const rung3Record = await loadEscalationRecord(ctx, rung3Key);
+      if (!rung3Record) {
+        await escalate(ctx, entry, staleness, 3, channel, isDryRun);
+        escalated++;
+      }
+    }
 
     evaluated++;
   }
@@ -787,7 +826,7 @@ export async function handleSlackMessage(
  * At 137 repos with ~240 open PRs, this completes in a single invocation
  * within the 1800s harness timeout.
  */
-async function backfillLedger(ctx: WorkforceCtx): Promise<void> {
+async function backfillLedger(ctx: WorkforceCtx): Promise<boolean> {
   const org = resolveInput(ctx, 'ORG') ?? 'AgentWorkforce';
   ctx.log('info', 'pr-shepherd.backfill.start', { org });
 
@@ -847,11 +886,30 @@ async function backfillLedger(ctx: WorkforceCtx): Promise<void> {
     }
 
     ctx.log('info', 'pr-shepherd.backfill.done', { seeded, skipped });
+    return true;
   } catch (err) {
     ctx.log('error', 'pr-shepherd.backfill.error', { error: String(err) });
-    // Non-fatal: the ledger fills from webhook events going forward.
-    // Log loudly so the operator knows the backfill needs a retry.
+    // Return false so evaluateLedger does NOT mark backfill done —
+    // the next cron tick will retry the crawl (Codex P1 fix).
+    return false;
   }
+}
+
+/**
+ * Build authenticated GitHub API headers.
+ * Codex P1: the original fetch calls were unauthenticated — private repos got
+ * 404 and the 60 req/hr unauthenticated rate limit can't cover 137 repos.
+ * The platform injects GITHUB_TOKEN (or GITHUB_APP_TOKEN) for the declared
+ * GitHub integration. We pass it as a Bearer token to get 5 000 req/hr.
+ */
+function githubHeaders(): Record<string, string> {
+  const token = process.env.GITHUB_TOKEN ?? process.env.GITHUB_APP_TOKEN;
+  const h: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28'
+  };
+  if (token) h.Authorization = `Bearer ${token}`;
+  return h;
 }
 
 /**
@@ -865,7 +923,7 @@ async function listOrgRepos(org: string): Promise<string[]> {
   while (true) {
     const res = await fetch(
       `https://api.github.com/orgs/${org}/repos?type=all&per_page=100&page=${page}`,
-      { headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } }
+      { headers: githubHeaders() }
     );
     if (!res.ok) throw new Error(`listOrgRepos: GitHub API ${res.status} for ${org} page ${page}`);
     const data = (await res.json()) as Array<{ name: string }>;
@@ -898,7 +956,7 @@ async function listOpenPrs(owner: string, repo: string): Promise<GhPr[]> {
   while (true) {
     const res = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=100&page=${page}`,
-      { headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } }
+      { headers: githubHeaders() }
     );
     if (res.status === 404) break;  // repo exists but no PRs or no access
     if (!res.ok) throw new Error(`listOpenPrs: GitHub API ${res.status} for ${owner}/${repo} page ${page}`);
@@ -922,16 +980,22 @@ function escalationKey(owner: string, repo: string, prNumber: number, bin: Stale
 }
 
 async function loadLedgerEntry(ctx: WorkforceCtx, key: string): Promise<PrLedgerEntry | null> {
+  // Codex P1: recall limit:1 doesn't guarantee the newest item is returned —
+  // semantic recall ranks by relevance, not recency. Recall several and pick
+  // the one with the highest ledgerUpdatedAt so a webhook never applies to a
+  // stale snapshot (which could resurrect closedAt or revert review state).
   const items = await ctx.memory.recall(`pr ledger ${key}`, {
     tags: [LEDGER_TAG, `pr-shepherd:key:${key}`],
-    limit: 1
+    limit: 10
   });
   if (!items.length) return null;
-  try {
-    return JSON.parse(items[0].content) as PrLedgerEntry;
-  } catch {
-    return null;
-  }
+  const parsed = items.flatMap(item => {
+    try { return [JSON.parse(item.content) as PrLedgerEntry]; } catch { return []; }
+  });
+  if (!parsed.length) return null;
+  return parsed.reduce((best, cur) =>
+    cur.ledgerUpdatedAt > best.ledgerUpdatedAt ? cur : best
+  );
 }
 
 async function saveLedgerEntry(ctx: WorkforceCtx, key: string, entry: PrLedgerEntry): Promise<void> {
@@ -947,15 +1011,26 @@ async function loadAllLedgerEntries(ctx: WorkforceCtx): Promise<PrLedgerEntry[]>
     scope: 'workspace',
     limit: 500  // Cap: revisit if org grows past ~500 open PRs
   });
-  const entries: PrLedgerEntry[] = [];
+
+  // Codex P1: ctx.memory.save is append-only, so every webhook creates another
+  // item for the same ledger key. Without dedup, a PR appears N times —
+  // its older open snapshots survive after close, and the 500-item cap gets
+  // consumed by repeat entries. Deduplicate by {owner/repo/prNumber}, keeping
+  // the snapshot with the most recent ledgerUpdatedAt.
+  const byKey = new Map<string, PrLedgerEntry>();
   for (const item of items) {
     try {
-      entries.push(JSON.parse(item.content) as PrLedgerEntry);
+      const entry = JSON.parse(item.content) as PrLedgerEntry;
+      const k = ledgerKey(entry.owner, entry.repo, entry.prNumber);
+      const existing = byKey.get(k);
+      if (!existing || entry.ledgerUpdatedAt > existing.ledgerUpdatedAt) {
+        byKey.set(k, entry);
+      }
     } catch {
       // Skip malformed records
     }
   }
-  return entries;
+  return Array.from(byKey.values());
 }
 
 async function loadEscalationRecord(ctx: WorkforceCtx, key: string): Promise<EscalationRecord | null> {

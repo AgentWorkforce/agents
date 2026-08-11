@@ -133,7 +133,8 @@ export default defineAgent({
       { on: 'pull_request_review_comment.created' },
       { on: 'check_run.completed' },
       { on: 'issue_comment.created' }
-    ]
+    ],
+    slack: [{ on: 'message.created', paths: ['/slack/channels/${SLACK_CHANNEL}/**'], match: '@mention' }]
   },
 
   handler: async (ctx, event) => {
@@ -145,6 +146,11 @@ export default defineAgent({
     // Relay DM: answer questions about PR state grounded in the ledger.
     if (isRelaycastMessageEvent(event)) {
       return handleInboxMessage(ctx, event);
+    }
+
+    // Slack @mention: answer PR state questions in-channel.
+    if (typeof event.type === 'string' && event.type.startsWith('slack.')) {
+      return handleSlackMessage(ctx, event);
     }
 
     // GitHub webhook: update ledger entry.
@@ -669,6 +675,98 @@ export async function handleInboxMessage(
 
   // Path 3: dry-run / no channel — answer is in the log.
   ctx.log('info', 'pr-shepherd.inbox.no-delivery', { reason: 'sender unresolved and no SLACK_CHANNEL configured' });
+}
+
+// ── Slack @mention Q&A ────────────────────────────────────────────────────────
+
+/**
+ * Answer a Slack @mention in-thread, grounded in the ledger. Never invents data.
+ *
+ * Channel guard mirrors the pattern from joke-bot's handleSlackMention —
+ * the trigger `match` gate is not enforced cloud-side, so without this the
+ * agent would answer in any channel where the Slack scope matches.
+ *
+ * SLACK_BOT_USER_ID is optional. When set, only responds to @mentions of
+ * that specific bot. When unset, responds to any non-bot message in the
+ * configured channel.
+ */
+export async function handleSlackMessage(
+  ctx: WorkforceCtx,
+  event: AgentEvent
+): Promise<void> {
+  const data = ((await event.expand('full').catch(() => undefined)) as { data?: Record<string, unknown> } | undefined)?.data ?? {};
+  const channel = typeof data.channel === 'string' ? data.channel : undefined;
+  const ts = typeof data.ts === 'string' ? data.ts : undefined;
+  if (!channel || !ts) {
+    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'missing channel or ts' });
+    return;
+  }
+
+  // Channel guard: only reply in the configured channel.
+  const want = resolveInput(ctx, 'SLACK_CHANNEL')?.split('__')[0];
+  const chanId = channel.split('__')[0];
+  if (!want || chanId !== want) {
+    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'wrong-channel', chanId, want });
+    return;
+  }
+
+  // Ignore bot messages.
+  if (data.is_bot === true || data.bot_id || (typeof data.subtype === 'string' && data.subtype)) {
+    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'bot-message' });
+    return;
+  }
+
+  const rawText = typeof data.text === 'string' ? data.text : '';
+  const threadTs = typeof data.thread_ts === 'string' && data.thread_ts ? data.thread_ts : ts;
+
+  // Strip bot mention if present (SLACK_BOT_USER_ID is optional).
+  const botUserId = resolveInput(ctx, 'SLACK_BOT_USER_ID')?.split('__')[0];
+  let question = rawText;
+  if (botUserId) {
+    const mention = `<@${botUserId}>`;
+    if (!rawText.includes(mention)) {
+      ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'no-mention' });
+      return;
+    }
+    question = rawText.replace(mention, '').trim();
+  }
+  if (!question.trim()) {
+    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'empty-question' });
+    return;
+  }
+
+  const entries = await loadAllLedgerEntries(ctx);
+  const openEntries = entries.filter(e => !e.closedAt);
+  const context = openEntries.length
+    ? openEntries.map(e => formatLedgerSummary(e)).join('\n')
+    : 'The ledger is empty — no open PRs tracked yet.';
+
+  const prompt = [
+    'You are PR Shepherd. Answer the question using ONLY the ledger data below.',
+    'Do not invent PR numbers, titles, or states not present in the ledger.',
+    'If the ledger does not cover the question, say so. Use Slack mrkdwn formatting.',
+    '',
+    '## Open PR ledger',
+    context,
+    '',
+    '## Question',
+    question.trim()
+  ].join('\n');
+
+  let answer: string;
+  try {
+    answer = await withTimeout(ctx.llm.complete(prompt, { maxTokens: 1024 }), 45_000, 'ctx.llm.complete');
+  } catch (err) {
+    ctx.log('warn', 'pr-shepherd.slack.llm-fallback', { error: String(err) });
+    answer = `I couldn't generate an answer right now. The ledger has ${openEntries.length} open PR(s).`;
+  }
+
+  const result = await slackClient({ writebackTimeoutMs: 45_000 }).post(chanId, answer, { replyTo: threadTs });
+  if (!result.ts) {
+    ctx.log('warn', 'pr-shepherd.slack.no-receipt', { channel: chanId });
+  } else {
+    ctx.log('info', 'pr-shepherd.slack.replied', { channel: chanId, ts: result.ts });
+  }
 }
 
 // ── Backfill ──────────────────────────────────────────────────────────────────

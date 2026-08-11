@@ -105,6 +105,11 @@ export default definePersona({
       optional: true,
       picker: { provider: 'slack', resource: 'channels' }
     },
+    SLACK_BOT_USER_ID: {
+      description: 'Slack bot user ID (e.g. U0XXXXXXX). When set, only responds to @mentions of this bot. When unset, responds to any non-bot message in SLACK_CHANNEL. Find it in your Slack app settings.',
+      env: 'SLACK_BOT_USER_ID',
+      optional: true
+    },
     DRY_RUN: {
       description: 'Set to "true" to log what the escalation ladder would post without writing to Slack or recording escalation entries. Use for the initial read-only proof against real PRs.',
       env: 'DRY_RUN',

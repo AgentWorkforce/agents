@@ -358,7 +358,12 @@ export async function evaluateLedger(ctx: WorkforceCtx): Promise<void> {
   // Only open, non-draft PRs are backfilled. Closed/merged PRs are excluded.
   // Codex P1: markBackfillDone was unconditional — a failed crawl permanently
   // disabled retries. Now only marks done when the crawl succeeds.
-  const backfillDone = await isBackfillDone(ctx);
+  //
+  // FORCE_BACKFILL=true: clears the done marker and re-runs the crawl. Use
+  // this when the first backfill ran unauthenticated (partial results) and you
+  // want to re-seed with the authenticated GitHub token now available.
+  const forceBackfill = resolveInput(ctx, 'FORCE_BACKFILL') === 'true';
+  const backfillDone = forceBackfill ? false : await isBackfillDone(ctx);
   if (!backfillDone) {
     const ok = await backfillLedger(ctx);
     if (ok) await markBackfillDone(ctx);

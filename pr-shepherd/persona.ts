@@ -149,6 +149,11 @@ export default definePersona({
       description: 'GitHub org to watch (default: AgentWorkforce).',
       env: 'ORG',
       default: 'AgentWorkforce'
+    },
+    FORCE_BACKFILL: {
+      description: 'Set to "true" to clear the backfill-done marker and re-run the full org crawl on the next cron tick. Use when the first backfill ran unauthenticated (partial results). Reset to "false" after one tick.',
+      env: 'FORCE_BACKFILL',
+      default: 'false'
     }
   }
 });

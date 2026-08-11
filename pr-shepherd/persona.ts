@@ -110,11 +110,6 @@ export default definePersona({
       env: 'DRY_RUN',
       default: 'false'
     },
-    LOCAL_READ_ONLY: {
-      description: 'Set to "true" when running a local instance. Disables the cron escalation path and Slack writes so the local instance never double-pings. Memory reads and relay DM Q&A continue to work.',
-      env: 'LOCAL_READ_ONLY',
-      default: 'false'
-    },
     STALE_AWAITING_REVIEW_DAYS: {
       description: 'Days without a reviewer action before a PR is classified awaiting-review.',
       env: 'STALE_AWAITING_REVIEW_DAYS',

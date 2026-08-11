@@ -314,11 +314,6 @@ export async function updateLedger(
  * set LOCAL_READ_ONLY=true and never run evaluateLedger() locally.
  */
 export async function evaluateLedger(ctx: WorkforceCtx): Promise<void> {
-  const isLocalReadOnly = resolveInput(ctx, 'LOCAL_READ_ONLY') === 'true';
-  if (isLocalReadOnly) {
-    ctx.log('info', 'pr-shepherd.evaluate.skip', { reason: 'LOCAL_READ_ONLY=true — local instance, cron path disabled' });
-    return;
-  }
   const isDryRun = resolveInput(ctx, 'DRY_RUN') === 'true';
   const channel = resolveInput(ctx, 'SLACK_CHANNEL');
 

@@ -545,9 +545,55 @@ export async function escalate(
 // ── Inbox Q&A (relay DM path) ─────────────────────────────────────────────────
 
 /**
+ * Resolve the sender of an inbound relay DM so we can reply back to them
+ * directly rather than posting to a fixed Slack channel.
+ *
+ * The cloud envelope-builder normalises the relaycast `from` to
+ * `event.summary.actor`. We probe that first, then the full expansion's
+ * `actor`/`from` fields as fallback. Pattern lifted from hn-monitor's
+ * resolveRelaySender, verified against the live relay.
+ */
+function asRecord(v: unknown): Record<string, unknown> | undefined {
+  return v && typeof v === 'object' && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : undefined;
+}
+function str(v: unknown): string | undefined {
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+}
+async function resolveRelaySender(
+  event: AgentEvent,
+  expandedFull: unknown
+): Promise<string | undefined> {
+  const actorFrom = (obj: unknown): Record<string, unknown> | undefined => {
+    const r = asRecord(obj);
+    if (!r) return undefined;
+    return (
+      asRecord(r.actor) ??
+      asRecord(asRecord(r.summary)?.actor) ??
+      asRecord(asRecord(r.data)?.actor) ??
+      asRecord(asRecord(r.data)?.from) ??
+      asRecord(r.from) ??
+      undefined
+    );
+  };
+  const actor =
+    actorFrom((event as { summary?: unknown }).summary) ??
+    actorFrom(await event.expand('summary').catch(() => undefined)) ??
+    actorFrom(expandedFull);
+  return str(actor?.id) ?? str(actor?.name) ?? str(actor?.displayName);
+}
+
+/**
  * Answer a relay DM about PR state, grounded in the ledger. Never invents data.
- * The ledger is the agent's memory of what it knows — if it's not in the ledger,
- * the agent says so rather than querying GitHub live.
+ *
+ * Reply path (in priority order):
+ * 1. ctx.relay.dm(sender) — replies directly in the terminal or agent DM thread.
+ *    This is the right path for `workforce agent pr-shepherd` local runs and for
+ *    agent-to-agent queries from chief/trajectory-lead.
+ * 2. SLACK_CHANNEL fallback — if the sender can't be resolved, post to the
+ *    configured Slack channel so the answer doesn't vanish silently.
+ * 3. Log-only — if neither is available (dry-run, no channel), log the answer.
  */
 export async function handleInboxMessage(
   ctx: WorkforceCtx,
@@ -594,20 +640,38 @@ export async function handleInboxMessage(
         .join('\n');
   }
 
-  const channel = resolveInput(ctx, 'SLACK_CHANNEL');
-  ctx.log('info', 'pr-shepherd.inbox.answered', { question: question.slice(0, 80), answerLength: answer.length, channel: channel ?? 'none' });
+  ctx.log('info', 'pr-shepherd.inbox.answered', { question: question.slice(0, 80), answerLength: answer.length });
 
-  if (!channel) {
-    ctx.log('info', 'pr-shepherd.inbox.no-channel');
+  // Path 1: reply directly back to the relay sender (terminal / agent-to-agent).
+  const sender = await resolveRelaySender(event, payload);
+  if (sender && ctx.relay) {
+    try {
+      const res = await ctx.relay.dm(sender, answer);
+      if (res.ok) {
+        ctx.log('info', 'pr-shepherd.inbox.relay-replied', { to: sender });
+        return;
+      }
+      ctx.log('warn', 'pr-shepherd.inbox.relay-reply-no-receipt', { to: sender });
+    } catch (err) {
+      ctx.log('warn', 'pr-shepherd.inbox.relay-reply-failed', { to: sender, error: String(err) });
+    }
+    // fall through to Slack fallback
+  }
+
+  // Path 2: Slack fallback — sender unresolved or relay DM failed.
+  const channel = resolveInput(ctx, 'SLACK_CHANNEL');
+  if (channel) {
+    const result = await slackClient({ writebackTimeoutMs: 45_000 }).post(channel, answer);
+    if (!result.ts) {
+      ctx.log('warn', 'pr-shepherd.inbox.slack-no-receipt', { channel });
+    } else {
+      ctx.log('info', 'pr-shepherd.inbox.slack-posted', { ts: result.ts, channel });
+    }
     return;
   }
 
-  const result = await slackClient({ writebackTimeoutMs: 45_000 }).post(channel, answer);
-  if (!result.ts) {
-    ctx.log('warn', 'pr-shepherd.inbox.slack-no-receipt', { channel });
-  } else {
-    ctx.log('info', 'pr-shepherd.inbox.posted', { ts: result.ts });
-  }
+  // Path 3: dry-run / no channel — answer is in the log.
+  ctx.log('info', 'pr-shepherd.inbox.no-delivery', { reason: 'sender unresolved and no SLACK_CHANNEL configured' });
 }
 
 // ── Backfill ──────────────────────────────────────────────────────────────────

@@ -149,14 +149,17 @@ export default defineAgent({
       return evaluateLedger(ctx);
     }
 
+    // Slack @mention: must be checked BEFORE isRelaycastMessageEvent — Slack
+    // events arrive through the relay and would satisfy that check, routing
+    // them to handleInboxMessage where they silently drop on "no-text".
+    // Pattern matches joke-bot's handler ordering (confirmed working).
+    if (typeof event.type === 'string' && event.type.startsWith('slack.')) {
+      return handleSlackMessage(ctx, event);
+    }
+
     // Relay DM: answer questions about PR state grounded in the ledger.
     if (isRelaycastMessageEvent(event)) {
       return handleInboxMessage(ctx, event);
-    }
-
-    // Slack @mention: answer PR state questions in-channel.
-    if (typeof event.type === 'string' && event.type.startsWith('slack.')) {
-      return handleSlackMessage(ctx, event);
     }
 
     // GitHub webhook: update ledger entry.
@@ -763,19 +766,28 @@ export async function handleSlackMessage(
   const rawText = typeof data.text === 'string' ? data.text : '';
   const threadTs = typeof data.thread_ts === 'string' && data.thread_ts ? data.thread_ts : ts;
 
-  // Strip bot mention if present (SLACK_BOT_USER_ID is optional).
+  // Fail closed on missing SLACK_BOT_USER_ID — without it we cannot confirm
+  // the message is directed at this bot, so we would answer every message in
+  // the channel. Pattern from joke-bot (confirmed working). Set it in the
+  // persona inputs to enable Slack Q&A.
   const botUserId = resolveInput(ctx, 'SLACK_BOT_USER_ID')?.split('__')[0];
-  let question = rawText;
-  if (botUserId) {
-    const mention = `<@${botUserId}>`;
-    if (!rawText.includes(mention)) {
-      ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'no-mention' });
-      return;
-    }
-    question = rawText.replace(mention, '').trim();
+  if (!botUserId) {
+    ctx.log('warn', 'pr-shepherd.slack.skip', { reason: 'no-bot-user-id-configured' });
+    return;
   }
-  if (!question.trim()) {
-    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'empty-question' });
+  const botMention = `<@${botUserId}>`;
+  if (!rawText.includes(botMention)) {
+    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'no-mention', botMention });
+    return;
+  }
+  // Strip the leading bot mention; preserve any other mentions in the text.
+  const leading = rawText.trimStart();
+  const question = (leading.startsWith(botMention)
+    ? leading.slice(botMention.length)
+    : rawText
+  ).trim();
+  if (!question) {
+    ctx.log('info', 'pr-shepherd.slack.skip', { reason: 'empty-after-mention' });
     return;
   }
 

@@ -23,7 +23,7 @@
     "@agentworkforce/persona-kit": "4.1.43",
     "@agentworkforce/runtime": "4.1.43",
     "@relayfile/adapter-daytona": "^0.1.1",
-    "@relayfile/relay-helpers": "0.4.6",
+    "@relayfile/relay-helpers": "0.4.11",
     "@relayflows/core": "^1.0.6"
   },
   "devDependencies": {
@@ -38,7 +38,7 @@
     "@agentworkforce/local-surface": "4.1.43",
     "@agentworkforce/persona-kit": "4.1.43",
     "@agentworkforce/runtime": "4.1.43",
-    "@relayfile/adapter-linear": "0.3.11",
+    "@relayfile/adapter-linear": "0.4.12",
     "@opentelemetry/otlp-transformer": {
       "protobufjs": "^8.5.0"
     }

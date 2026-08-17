@@ -512,8 +512,14 @@ function splitAliases(value: string | undefined): string[] {
   return (value ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
 }
 
-function aliasVariants(value: string | undefined): string[] {
-  const trimmed = value?.trim();
+// Takes `unknown` on purpose. These values come off `ctx.persona`/`ctx.agent`, and
+// `WorkforcePersonaContext extends Omit<PersonaSpec, 'inputs'>` while `PersonaSpec`
+// carries `[key: string]: unknown` for consumer-defined fields — so `Omit` collapses
+// every declared field, including `id`, to `unknown` (persona-kit 4.1.43). Narrowing
+// here is also strictly safer than the previous signature, which would have thrown on
+// `.trim()` had a non-string ever arrived at runtime.
+function aliasVariants(value: unknown): string[] {
+  const trimmed = typeof value === 'string' ? value.trim() : undefined;
   if (!trimmed) return [];
   const withoutAt = trimmed.replace(/^@+/u, '');
   const spaced = withoutAt.replace(/[-_]+/gu, ' ');

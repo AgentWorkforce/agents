@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { workflow } from '@agent-relay/sdk/workflows';
+import { workflow } from '@relayflows/core';
 
 const WORKFLOW_NAME = 'linear-chat-lead';
 const REPO_DIR = './repo';

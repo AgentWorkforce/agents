@@ -175,7 +175,81 @@ test('resolvePersonaInputs reports required inputs that resolve to nothing', () 
 });
 
 test('resolvePersonaInputs on a persona with no declared inputs is a no-op', () => {
-  assert.deepEqual(resolvePersonaInputs({}, { env: {} }), { resolved: {}, missing: [] });
+  assert.deepEqual(resolvePersonaInputs({}, { env: {} }), { resolved: {}, sources: {}, missing: [] });
+});
+
+// --- inherited tenant identifiers -------------------------------------------
+
+const TENANT_SPECS = { GCP_PROJECT_ID: { env: 'GCP_PROJECT_ID', default: 'someone-elses-project' } };
+
+test('resolvePersonaInputs refuses to inherit a persona default listed in requireExplicit', () => {
+  // Without this, a fork deploying gcp-watcher silently monitors the ORIGINAL
+  // owner's project, because the persona ships that project id as its default.
+  const { resolved, missing } = resolvePersonaInputs(TENANT_SPECS, {
+    env: {},
+    requireExplicit: ['GCP_PROJECT_ID'],
+  });
+  assert.deepEqual(resolved, {}, 'the persona default must not be inherited');
+  assert.equal(missing.length, 1);
+  assert.equal(missing[0].explicitOnly, true);
+  const message = formatMissingInputs('gcp-watcher', missing);
+  assert.match(message, /identifies YOUR account or project/u);
+});
+
+test('requireExplicit still accepts a value the deployer actually supplied', () => {
+  for (const [label, options] of [
+    ['--input', { overrides: { GCP_PROJECT_ID: 'my-project' }, env: {} }],
+    ['bundle', { bundle: { GCP_PROJECT_ID: 'my-project' }, env: {} }],
+    ['env', { env: { GCP_PROJECT_ID: 'my-project' } }],
+  ]) {
+    const { resolved, missing } = resolvePersonaInputs(TENANT_SPECS, {
+      ...options,
+      requireExplicit: ['GCP_PROJECT_ID'],
+    });
+    assert.deepEqual(missing, [], `${label} should satisfy requireExplicit`);
+    assert.equal(resolved.GCP_PROJECT_ID, 'my-project');
+  }
+});
+
+test('requireExplicit overrides `optional`, so an unset tenant id is never skipped', () => {
+  const { missing } = resolvePersonaInputs(
+    { ORG: { env: 'ORG', optional: true, default: 'theirs' } },
+    { env: {}, requireExplicit: ['ORG'] },
+  );
+  assert.deepEqual(missing.map((entry) => entry.name), ['ORG']);
+});
+
+test('resolvePersonaInputs reports where each value came from', () => {
+  const { sources } = resolvePersonaInputs(SPECS, {
+    overrides: { SLACK_CHANNEL: 'C0FROMFLAG' },
+    env: { A_DIFFERENT_ENV_NAME: 'x' },
+  });
+  assert.deepEqual(sources, {
+    SLACK_CHANNEL: '--input',
+    TOPICS: 'persona default',
+    RENAMED: 'env A_DIFFERENT_ENV_NAME',
+  });
+});
+
+test('every persona default that names a specific account or org is in requireExplicit', () => {
+  // The root fix belongs in the personas — but until it lands, a default that
+  // looks like a tenant identifier must be listed so the deploy cannot inherit
+  // it. This fails when a NEW one appears, rather than silently shipping it.
+  const tenantish = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|org-[a-z0-9-]+|[a-z0-9-]+-(?:production|prod|staging))$/u;
+  for (const agent of registry.agents) {
+    const source = readFileSync(personaPaths(agent).personaTs, 'utf8');
+    const declared = new Set(agent.requireExplicit ?? []);
+    for (const [, name, value] of source.matchAll(
+      /(\w+):\s*\{[^{}]*?default:\s*'([^']*)'/gsu,
+    )) {
+      if (!tenantish.test(value)) continue;
+      assert.ok(
+        declared.has(name),
+        `${agent.name}: persona default ${name}='${value}' looks like a specific account/org — `
+          + 'add it to requireExplicit in scripts/deploy/agents.json so a fork cannot inherit it',
+      );
+    }
+  }
 });
 
 // --- deploy invocation ------------------------------------------------------

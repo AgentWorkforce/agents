@@ -179,6 +179,35 @@ Rules the deploy script applies:
 - **Empty is unset.** A secret that exists but holds `""` counts as missing, so
   a mis-pasted secret fails loudly instead of deploying a misconfigured agent.
 
+### Inputs that identify *you*, not a setting
+
+A few agents watch a specific account: `daytona-monitor` (`DAYTONA_ORG_ID`),
+`gcp-watcher` (`GCP_PROJECT_ID`), `neon-monitor` (`NEON_ORG_ID`). Their personas
+ship a default for these — and that default is **this repo's owner's** org or
+project, not yours.
+
+Inheriting it would point your agent at someone else's infrastructure: at best
+an authorisation error, at worst a monitor reporting on a tenant that isn't
+yours. So `scripts/deploy/agents.json` lists those input names under
+`requireExplicit`, and the deploy refuses to fall back to the persona default
+for them:
+
+```
+✗ gcp-watcher: 1 required input(s) unresolved:
+  GCP_PROJECT_ID — GCP project id to monitor.
+    set env GCP_PROJECT_ID=<value>, or pass --input GCP_PROJECT_ID=<value>
+    (this one identifies YOUR account or project. Its persona default points at
+     someone else's, so this deploy will not inherit it.)
+```
+
+Set your own value and it deploys. If you add an agent whose persona defaults to
+an org, project, or account id, add that input name to `requireExplicit` too — a
+test fails if you don't.
+
+Every input the deploy resolves is printed with **where it came from**
+(`--input`, `AGENT_INPUTS`, `env NAME`, or `persona default`), so you can see at
+a glance in a dry run whether anything is being inherited that shouldn't be.
+
 ### Three places to put them
 
 They stack in this order, each overriding the one before:

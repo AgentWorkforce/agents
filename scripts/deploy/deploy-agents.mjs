@@ -154,28 +154,51 @@ export function readPersonaInputSpecs(personaJsonPath) {
  * A declared input with no value is fatal unless the persona marked it
  * `optional` — an optional input left unset is simply not passed, which is how
  * personas gate a transport off (no SLACK_CHANNEL, no Slack delivery).
+ *
+ * `requireExplicit` names inputs whose persona `default` must NOT be inherited
+ * (see `requireExplicit` in scripts/deploy/agents.json). Those resolve from the
+ * first three sources only, so a fork that does not set one is told to, instead
+ * of silently deploying against whoever's id the default happens to hold.
  */
-export function resolvePersonaInputs(specs, { overrides = {}, bundle = {}, env = process.env } = {}) {
+export function resolvePersonaInputs(
+  specs,
+  { overrides = {}, bundle = {}, env = process.env, requireExplicit = [] } = {},
+) {
+  const mustBeExplicit = new Set(requireExplicit);
   const resolved = {};
+  const sources = {};
   const missing = [];
   for (const [name, spec = {}] of Object.entries(specs)) {
     const envName = spec.env ?? name;
-    const candidates = [overrides[name], bundle[name], env[envName], spec.default];
-    const value = candidates.find((candidate) => typeof candidate === 'string' && candidate.trim() !== '');
-    if (value === undefined) {
-      if (!spec.optional) missing.push({ name, envName, description: spec.description });
+    const explicitOnly = mustBeExplicit.has(name);
+    const candidates = [
+      ['--input', overrides[name]],
+      [INPUT_BUNDLE_ENV, bundle[name]],
+      [`env ${envName}`, env[envName]],
+      ...(explicitOnly ? [] : [['persona default', spec.default]]),
+    ];
+    const hit = candidates.find(([, value]) => typeof value === 'string' && value.trim() !== '');
+    if (!hit) {
+      if (!spec.optional || explicitOnly) {
+        missing.push({ name, envName, description: spec.description, explicitOnly });
+      }
       continue;
     }
-    resolved[name] = value;
+    [sources[name]] = hit;
+    resolved[name] = hit[1];
   }
-  return { resolved, missing };
+  return { resolved, sources, missing };
 }
 
 export function formatMissingInputs(agentName, missing) {
   const lines = missing.map(
-    ({ name, envName, description }) =>
+    ({ name, envName, description, explicitOnly }) =>
       `  ${name}${description ? ` — ${description}` : ''}\n`
-      + `    set env ${envName}=<value>, or pass --input ${name}=<value>`,
+      + `    set env ${envName}=<value>, or pass --input ${name}=<value>`
+      + (explicitOnly
+        ? `\n    (this one identifies YOUR account or project. Its persona default points at\n`
+          + `     someone else's, so this deploy will not inherit it.)`
+        : ''),
   );
   return `${agentName}: ${missing.length} required input(s) unresolved:\n${lines.join('\n')}`;
 }
@@ -237,11 +260,18 @@ export function deployAgents({
     }
 
     let inputs;
+    let sources = {};
     try {
       const specs = readPersonaInputSpecs(personaJson);
-      const { resolved, missing } = resolvePersonaInputs(specs, { overrides: args.inputs, bundle, env });
+      const { resolved, sources: resolvedFrom, missing } = resolvePersonaInputs(specs, {
+        overrides: args.inputs,
+        bundle,
+        env,
+        requireExplicit: agent.requireExplicit ?? [],
+      });
       if (missing.length) throw new Error(formatMissingInputs(agent.name, missing));
       inputs = resolved;
+      sources = resolvedFrom;
     } catch (err) {
       // `--dry-run --skip-compile` on a fresh clone has no persona.json to read
       // (it is a gitignored build artifact). Report what would happen rather
@@ -265,9 +295,12 @@ export function deployAgents({
       log.log(
         args.skipCompile ? '  compile: skipped (--skip-compile)' : '  compile: ok',
       );
-      // Input NAMES only. A value can be a Spotify token or a private channel
-      // id, and a dry run is the one mode people paste into issues.
-      log.log(`  inputs:  ${Object.keys(inputs).join(', ') || '(none declared)'}`);
+      // Input NAMES and where each was resolved FROM — never the value. A value
+      // can be a Spotify token or a private channel id, and a dry run is the one
+      // mode people paste into issues. Showing the source is what makes an
+      // inherited persona default visible before it reaches a real deploy.
+      const shown = Object.keys(inputs).map((name) => `${name} (${sources[name]})`);
+      log.log(`  inputs:  ${shown.join(', ') || '(none declared)'}`);
       log.log(`  deploy:  agentworkforce ${redactDeployArgs(deployArgs).join(' ')}`);
       continue;
     }

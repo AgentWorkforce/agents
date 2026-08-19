@@ -1,5 +1,5 @@
 {
-  "_comment": "Deploy allowlist for scripts/deploy/deploy-agents.mjs and the deploy-agent workflow. One entry per deployable agent: its name (what you dispatch) and its persona source. Per-agent inputs are deliberately NOT listed here — every persona.ts already declares its own `inputs` with an `env` name, a `default`, and whether it is `optional`, and the deploy script reads those from the compiled persona.json. That keeps this file free of channel ids, org ids, and tokens, which matters because this repo is public. Adding an agent: create <name>/persona.ts, then add it here.",
+  "_comment": "Deploy allowlist for scripts/deploy/deploy-agents.mjs and the deploy-agent workflow. One entry per deployable agent: its name (what you dispatch) and its persona source. Per-agent input VALUES are deliberately not listed here \u2014 every persona.ts already declares its own `inputs` with an `env` name, a `default`, and whether it is `optional`, and the deploy script reads those from the compiled persona.json. That keeps this file free of channel ids, org ids, and tokens, which matters because this repo is public. `requireExplicit` lists input NAMES whose persona default must not be inherited: they identify a specific account, project, or org, so a deploy that does not set one is failed rather than pointed at whoever's id the default holds. Adding an agent: create <name>/persona.ts, then add it here.",
   "mode": "cloud",
   "agents": [
     {
@@ -20,11 +20,17 @@
     },
     {
       "name": "daytona-monitor",
-      "persona": "daytona-monitor/persona.ts"
+      "persona": "daytona-monitor/persona.ts",
+      "requireExplicit": [
+        "DAYTONA_ORG_ID"
+      ]
     },
     {
       "name": "gcp-watcher",
-      "persona": "gcp-watcher/persona.ts"
+      "persona": "gcp-watcher/persona.ts",
+      "requireExplicit": [
+        "GCP_PROJECT_ID"
+      ]
     },
     {
       "name": "granola",
@@ -52,7 +58,10 @@
     },
     {
       "name": "neon-monitor",
-      "persona": "neon-monitor/persona.ts"
+      "persona": "neon-monitor/persona.ts",
+      "requireExplicit": [
+        "NEON_ORG_ID"
+      ]
     },
     {
       "name": "pr-shepherd",

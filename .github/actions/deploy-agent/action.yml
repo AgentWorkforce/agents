@@ -1,0 +1,93 @@
+name: Deploy agent
+description: >-
+  Test, typecheck, and idempotently deploy ONE agent from scripts/deploy/agents.json
+  to an Agent Workforce workspace. A COMPOSITE ACTION rather than a reusable
+  workflow: it runs inside the caller's own job, which is the only place that can
+  declare `environment:` and therefore the only place environment secrets resolve.
+
+inputs:
+  agent:
+    description: Agent name as listed in scripts/deploy/agents.json
+    required: true
+  workspace-id:
+    description: WORKFORCE_WORKSPACE_ID, from the caller job's environment secrets
+    required: true
+  workspace-token:
+    description: WORKFORCE_WORKSPACE_TOKEN, from the caller job's environment secrets
+    required: true
+  agent-inputs:
+    description: >-
+      Newline-separated KEY=VALUE persona inputs (e.g. SLACK_CHANNEL=C0123ABCD).
+      Later lines win, so the caller can stack repository variables, then
+      secrets, then per-run dispatch values. Optional.
+    required: false
+    default: ''
+  dry-run:
+    description: When 'true', print what would be deployed and stop before any deploy.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+    - name: Install dependencies
+      shell: bash
+      run: npm ci
+    - name: Test
+      shell: bash
+      run: npm test
+    - name: Typecheck
+      shell: bash
+      run: npm run typecheck
+
+    # Fail on the real cause rather than 60s later inside the deploy, and never
+    # echo the values. An empty secret here almost always means the CALLING JOB
+    # is missing `environment:` — that is the only thing that resolves them.
+    - name: Verify workspace secrets are present
+      if: inputs.dry-run != 'true'
+      shell: bash
+      env:
+        WORKFORCE_WORKSPACE_ID: ${{ inputs.workspace-id }}
+        WORKFORCE_WORKSPACE_TOKEN: ${{ inputs.workspace-token }}
+      run: |
+        missing=()
+        # Strip whitespace before testing: a secret holding only spaces is unset
+        # as far as the deploy is concerned, and this must agree with
+        # missingWorkspaceSecrets() in the deploy script, which trims too.
+        [ -n "${WORKFORCE_WORKSPACE_ID//[[:space:]]/}" ] || missing+=(WORKFORCE_WORKSPACE_ID)
+        [ -n "${WORKFORCE_WORKSPACE_TOKEN//[[:space:]]/}" ] || missing+=(WORKFORCE_WORKSPACE_TOKEN)
+        if [ ${#missing[@]} -ne 0 ]; then
+          echo "::error::${missing[*]} empty. Confirm they exist under Settings ->" \
+               "Environments -> workforce -> Environment secrets, AND that the calling job" \
+               "declares 'environment: workforce' — a job without it silently reads empty" \
+               "strings. See docs/SELF-DEPLOY.md."
+          exit 1
+        fi
+
+    # User-controlled values (the agent name and the input bundle) reach the
+    # script through `env:`, never interpolated into the run script itself —
+    # `${{ }}` inside `run:` is shell injection. The script validates the agent
+    # name against the registry allowlist and parses the bundle in Node.
+    - name: Deploy
+      shell: bash
+      env:
+        DEPLOY_AGENT: ${{ inputs.agent }}
+        # NOT `DRY_RUN`: the deploy script resolves persona inputs from the
+        # environment, and pr-shepherd declares an input called DRY_RUN. A bare
+        # name here would configure that agent from this CI switch.
+        DEPLOY_DRY_RUN: ${{ inputs.dry-run }}
+        AGENT_INPUTS: ${{ inputs.agent-inputs }}
+        WORKFORCE_WORKSPACE_ID: ${{ inputs.workspace-id }}
+        WORKFORCE_WORKSPACE_TOKEN: ${{ inputs.workspace-token }}
+      # `if ...; then` rather than `[ ... ] && ...`: the default shell runs with
+      # `-e`, so a bare false `&&` list would exit the step with status 1.
+      run: |
+        extra=()
+        if [ "$DEPLOY_DRY_RUN" = "true" ]; then
+          extra+=(--dry-run)
+        fi
+        node scripts/deploy/deploy-agents.mjs --agent "$DEPLOY_AGENT" "${extra[@]}"

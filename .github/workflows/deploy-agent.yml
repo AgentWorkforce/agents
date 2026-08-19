@@ -1,0 +1,80 @@
+name: Deploy agent
+
+# Deploy one agent from this repo to YOUR Agent Workforce workspace.
+# Full setup instructions: docs/SELF-DEPLOY.md
+#
+# Required config (Settings -> Environments -> New environment named "workforce"
+# -> Environment secrets):
+#   WORKFORCE_WORKSPACE_ID     your workspace id
+#   WORKFORCE_WORKSPACE_TOKEN  that workspace's token
+#
+# --- Why `workflow_dispatch` ONLY -------------------------------------------
+# This repo is PUBLIC, so anyone can open a pull request from a fork. Do NOT add
+# `pull_request_target`, and do NOT add any trigger that runs a fork's code with
+# access to these secrets: a fork PR could then edit the deploy script (or any
+# file it runs) and read WORKFORCE_WORKSPACE_TOKEN straight out of the job. That
+# is a workspace takeover, not a CI inconvenience. `workflow_dispatch` can only
+# be started by someone with write access to the repo, from a ref in the repo.
+# If you fork this and want deploy-on-merge, add `push:` on your OWN default
+# branch — never a pull_request* trigger.
+#
+# --- Why a composite action and not a reusable workflow ---------------------
+# The steps live in .github/actions/deploy-agent (a composite action) rather
+# than in a `workflow_call` workflow. A job in a called workflow does not
+# resolve environment secrets even when it declares `environment:` itself, and
+# the caller cannot declare one alongside `uses:` — so the secrets arrive empty.
+# A composite action runs inside THIS job, so `environment: workforce` below
+# applies and the secrets resolve. Do not convert this into a reusable workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent:
+        description: Agent to deploy (must be listed in scripts/deploy/agents.json)
+        required: true
+        type: string
+      agent-inputs:
+        description: >-
+          Optional persona inputs, one KEY=VALUE per line (e.g. SLACK_CHANNEL=C0123ABCD).
+          Values typed here appear in the run log — for anything sensitive use the
+          AGENT_INPUTS secret instead.
+        required: false
+        type: string
+      dry-run:
+        description: Print what would be deployed without deploying it
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-agent-${{ inputs.agent }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # `environment:` MUST be on this job — it is what resolves the secrets below.
+    environment: workforce
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This job only reads the tree; it never pushes. Don't leave the
+          # checkout token in .git/config where any later step could read it.
+          persist-credentials: false
+      - uses: ./.github/actions/deploy-agent
+        with:
+          agent: ${{ inputs.agent }}
+          dry-run: ${{ inputs.dry-run }}
+          workspace-id: ${{ secrets.WORKFORCE_WORKSPACE_ID }}
+          workspace-token: ${{ secrets.WORKFORCE_WORKSPACE_TOKEN }}
+          # Stacked lowest-precedence first; the deploy script lets later lines
+          # win. So: AGENT_INPUTS variable = your standing defaults, AGENT_INPUTS
+          # secret = the ones that must stay masked in logs, dispatch box = a
+          # per-run override. All three are optional.
+          agent-inputs: |
+            ${{ vars.AGENT_INPUTS }}
+            ${{ secrets.AGENT_INPUTS }}
+            ${{ inputs.agent-inputs }}

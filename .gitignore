@@ -2,6 +2,7 @@
 node_modules/
 */.workforce/build/
 */persona.json
+*/agent-card.json
 .claude/
 
 # Local agent CLI/tooling state + build output — never commit

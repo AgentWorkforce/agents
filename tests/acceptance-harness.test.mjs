@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -341,9 +341,16 @@ test('acceptance package source mode rejects unknown values', () => {
   );
 });
 
-test('required Workforce package closure covers the installed invoke path', () => {
+// These two proofs compare this repo against a SIBLING checkout of the
+// workforce monorepo. That checkout only exists on a developer machine — on a
+// CI runner (and in a plain clone) there is nothing at ../workforce, so they
+// skip rather than fail. Everything else in the suite is self-contained.
+const workforceRoot = fileURLToPath(new URL('../../workforce/', import.meta.url));
+const noWorkforceCheckout = !existsSync(join(workforceRoot, 'packages', 'runtime', 'package.json'))
+  && 'no sibling ../workforce checkout';
+
+test('required Workforce package closure covers the installed invoke path', { skip: noWorkforceCheckout }, () => {
   const agentsPkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-  const workforceRoot = fileURLToPath(new URL('../../workforce/', import.meta.url));
   const required = resolveRequiredWorkforcePackageNames({
     workforceRoot,
     agentsPackage: agentsPkg,
@@ -365,9 +372,8 @@ test('required Workforce package closure covers the installed invoke path', () =
   }
 });
 
-test('published package proof derives exact versions from the producer manifests', () => {
+test('published package proof derives exact versions from the producer manifests', { skip: noWorkforceCheckout }, () => {
   const agentsPkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-  const workforceRoot = fileURLToPath(new URL('../../workforce/', import.meta.url));
   const expected = resolveExpectedPublishedVersions({
     workforceRoot,
     agentsPackage: agentsPkg,

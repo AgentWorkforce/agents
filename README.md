@@ -42,3 +42,51 @@ npm run typecheck                                   # tsc over every agent
 agentworkforce persona compile ./hn-monitor/persona.ts
 agentworkforce deploy ./hn-monitor/persona.json --mode cloud --input SLACK_CHANNEL=C0123ABCD
 ```
+
+## Deploy one to your own workspace
+
+Every agent here is deployable into **your** Agent Workforce workspace, from a
+fork, with no interactive login and no terminal — set two secrets and dispatch a
+workflow.
+
+```
+Fork  →  Settings ▸ Environments ▸ "workforce"  →  Actions ▸ Deploy agent ▸ Run workflow
+              WORKFORCE_WORKSPACE_ID
+              WORKFORCE_WORKSPACE_TOKEN
+```
+
+1. **Get the two secrets.** `npm install && npx agentworkforce login` logs you in
+   through the browser and writes the workspace and its token to
+   `~/.agentworkforce/relay/workspaces.json`. Read them back with:
+
+   ```sh
+   jq -r '.active' ~/.agentworkforce/relay/workspaces.json                 # WORKFORCE_WORKSPACE_ID
+   jq -r '.workspaces[.active].key' ~/.agentworkforce/relay/workspaces.json # WORKFORCE_WORKSPACE_TOKEN
+   ```
+
+2. **Add them to your fork** under Settings → Environments → new environment
+   named `workforce` → Environment secrets. The name matters: the deploy job
+   declares `environment: workforce`, and that is what resolves them.
+
+3. **Dispatch it.** Actions → *Deploy agent* → Run workflow → pick an agent from
+   [`scripts/deploy/agents.json`](scripts/deploy/agents.json). Tick **dry-run**
+   first for a rehearsal that needs no secrets.
+
+Or from your own shell, with the same two variables exported:
+
+```sh
+node scripts/deploy/deploy-agents.mjs --list
+node scripts/deploy/deploy-agents.mjs --agent hn-monitor --dry-run
+node scripts/deploy/deploy-agents.mjs --agent hn-monitor --input SLACK_CHANNEL=C0123ABCD
+```
+
+Agent configuration (a Slack channel, a threshold, a topic list) comes from the
+`inputs` each `persona.ts` declares; the deploy script resolves them from the
+environment, so nothing workspace-specific is committed here. The deploy reuses
+integrations your workspace has already connected and fails loudly if one is
+missing, rather than prompting.
+
+**→ [docs/SELF-DEPLOY.md](docs/SELF-DEPLOY.md)** covers all of it in full: where
+each secret comes from, how to pass per-agent inputs (including ones that must
+stay masked in logs), what each failure message means, and why the workflow is
+`workflow_dispatch`-only in a public repo.

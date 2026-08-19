@@ -65,7 +65,10 @@
     },
     {
       "name": "pr-shepherd",
-      "persona": "pr-shepherd/persona.ts"
+      "persona": "pr-shepherd/persona.ts",
+      "requireExplicit": [
+        "ORG"
+      ]
     },
     {
       "name": "repo-hygiene",

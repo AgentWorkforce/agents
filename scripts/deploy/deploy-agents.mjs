@@ -96,11 +96,18 @@ function assignInput(target, raw, flag) {
 export function parseInputBundle(raw) {
   const out = {};
   if (!raw) return out;
-  for (const line of raw.split(/\r?\n/)) {
+  const lines = raw.split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
     const eq = trimmed.indexOf('=');
-    if (eq < 1) throw new UsageError(`${INPUT_BUNDLE_ENV}: expected <key>=<value> per line; got "${trimmed}"`);
+    // Report the line NUMBER, never the line. This bundle carries persona
+    // inputs, which may be secrets, and this error lands in the workflow log.
+    if (eq < 1) {
+      throw new UsageError(
+        `${INPUT_BUNDLE_ENV}: line ${index + 1} is not <key>=<value> (content withheld: it may be a secret)`,
+      );
+    }
     out[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1);
   }
   return out;

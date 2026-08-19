@@ -111,6 +111,21 @@ test('parseInputBundle reads KEY=VALUE lines, ignoring blanks and comments', () 
   assert.throws(() => parseInputBundle('JUST_A_NAME'), UsageError);
 });
 
+test('a malformed AGENT_INPUTS line is reported by number, never by content', () => {
+  // The bundle carries persona inputs, which may be secrets, and this error is
+  // printed into the workflow log.
+  const sentinel = 'sk-live-do-not-log-this';
+  assert.throws(
+    () => parseInputBundle(`SLACK_CHANNEL=C0123ABCD\n${sentinel}`),
+    (err) => {
+      assert.ok(err instanceof UsageError);
+      assert.equal(err.message.includes(sentinel), false, 'the error must not quote the line');
+      assert.match(err.message, /line 2 is not <key>=<value>/u);
+      return true;
+    },
+  );
+});
+
 test('parseInputBundle lets later lines win, which is what stacks vars < secrets < dispatch', () => {
   // The workflow concatenates vars.AGENT_INPUTS, secrets.AGENT_INPUTS and the
   // dispatch box in that order, so this ordering IS the documented precedence.
@@ -231,22 +246,102 @@ test('resolvePersonaInputs reports where each value came from', () => {
   });
 });
 
-test('every persona default that names a specific account or org is in requireExplicit', () => {
-  // The root fix belongs in the personas — but until it lands, a default that
-  // looks like a tenant identifier must be listed so the deploy cannot inherit
-  // it. This fails when a NEW one appears, rather than silently shipping it.
-  const tenantish = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|org-[a-z0-9-]+|[a-z0-9-]+-(?:production|prod|staging))$/u;
+/**
+ * The `inputs: { ... }` block of a persona, as name -> default. Scoped to that
+ * block (so unrelated fields called `default` elsewhere are ignored) and
+ * anchored on a property position (so `description: '... (default: Foo)'` is not
+ * mistaken for one).
+ */
+function personaInputDefaults(source) {
+  const marker = source.indexOf('inputs:');
+  if (marker === -1) return {};
+  const open = source.indexOf('{', marker);
+  if (open === -1) return {};
+  let depth = 0;
+  let close = open;
+  for (; close < source.length; close++) {
+    if (source[close] === '{') depth++;
+    else if (source[close] === '}' && --depth === 0) break;
+  }
+  const block = source.slice(open + 1, close);
+
+  const defaults = {};
+  const entry = /(\w+)\s*:\s*\{/gu;
+  for (let match = entry.exec(block); match; match = entry.exec(block)) {
+    let inner = 1;
+    let i = match.index + match[0].length;
+    for (; i < block.length && inner > 0; i++) {
+      if (block[i] === '{') inner++;
+      else if (block[i] === '}') inner--;
+    }
+    const body = block.slice(match.index + match[0].length, i - 1);
+    const value = /(?:^|[{,])\s*default\s*:\s*'([^']*)'/u.exec(body);
+    if (value) defaults[match[1]] = value[1];
+    entry.lastIndex = i;
+  }
+  return defaults;
+}
+
+test('personaInputDefaults reads only real input defaults', () => {
+  // Guards the guard: an earlier version of this scan matched `default:` inside
+  // a description string, and fields named `default` outside the inputs block.
+  const defaults = personaInputDefaults(`definePersona({
+  sandbox: { materialization: 'lazy' },
+  inputs: {
+    ORG: {
+      description: 'GitHub org to watch (default: TheirOrg).',
+      env: 'ORG',
+      default: 'RealValue'
+    },
+    CHANNEL: { env: 'CHANNEL', optional: true, picker: { provider: 'slack', resource: 'channels' } }
+  },
+});`);
+  assert.deepEqual(defaults, { ORG: 'RealValue' });
+});
+
+test('no persona default that looks like this repo owner is inheritable', () => {
+  // A HEURISTIC net, not a proof: it catches identifiers shaped like an org,
+  // project, or account, plus anything naming this repo's own org. Review is
+  // still what catches a default this cannot recognise — a bare account name in
+  // an unfamiliar shape will slip through. What it does guarantee is that the
+  // four known cases stay listed and that an obvious new one fails CI.
+  const ownerish = [
+    [/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u, 'a UUID'],
+    [/^org-[a-z0-9-]+$/u, 'an org id'],
+    [/^[a-z0-9-]+-(?:production|prod|staging)$/u, 'an environment-specific project id'],
+    [/agentworkforce/iu, "this repo's own GitHub org"],
+  ];
+  const found = [];
   for (const agent of registry.agents) {
-    const source = readFileSync(personaPaths(agent).personaTs, 'utf8');
+    const defaults = personaInputDefaults(readFileSync(personaPaths(agent).personaTs, 'utf8'));
     const declared = new Set(agent.requireExplicit ?? []);
-    for (const [, name, value] of source.matchAll(
-      /(\w+):\s*\{[^{}]*?default:\s*'([^']*)'/gsu,
-    )) {
-      if (!tenantish.test(value)) continue;
+    for (const [name, value] of Object.entries(defaults)) {
+      const hit = ownerish.find(([pattern]) => pattern.test(value));
+      if (!hit) continue;
+      found.push(`${agent.name}.${name}`);
       assert.ok(
         declared.has(name),
-        `${agent.name}: persona default ${name}='${value}' looks like a specific account/org — `
-          + 'add it to requireExplicit in scripts/deploy/agents.json so a fork cannot inherit it',
+        `${agent.name}: persona default ${name}='${value}' looks like ${hit[1]} belonging to this `
+          + "repo's owner — add it to requireExplicit in scripts/deploy/agents.json so a fork "
+          + 'cannot inherit it',
+      );
+    }
+  }
+  // Non-vacuity: if this stops finding the known cases, the scan broke.
+  assert.deepEqual(
+    found.sort(),
+    ['daytona-monitor.DAYTONA_ORG_ID', 'gcp-watcher.GCP_PROJECT_ID', 'neon-monitor.NEON_ORG_ID', 'pr-shepherd.ORG'],
+  );
+});
+
+test('every requireExplicit entry names an input the persona actually declares', () => {
+  for (const agent of registry.agents) {
+    const defaults = personaInputDefaults(readFileSync(personaPaths(agent).personaTs, 'utf8'));
+    for (const name of agent.requireExplicit ?? []) {
+      assert.ok(
+        name in defaults,
+        `${agent.name}: requireExplicit lists ${name}, but its persona declares no default for it — `
+          + 'the entry is stale or misspelled',
       );
     }
   }

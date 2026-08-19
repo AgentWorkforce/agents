@@ -60,6 +60,10 @@ jobs:
     environment: workforce
     steps:
       - uses: actions/checkout@v4
+        with:
+          # This job only reads the tree; it never pushes. Don't leave the
+          # checkout token in .git/config where any later step could read it.
+          persist-credentials: false
       - uses: ./.github/actions/deploy-agent
         with:
           agent: ${{ inputs.agent }}

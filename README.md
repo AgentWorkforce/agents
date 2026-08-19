@@ -82,9 +82,11 @@ node scripts/deploy/deploy-agents.mjs --agent hn-monitor --input SLACK_CHANNEL=C
 
 Agent configuration (a Slack channel, a threshold, a topic list) comes from the
 `inputs` each `persona.ts` declares; the deploy script resolves them from the
-environment, so nothing workspace-specific is committed here. The deploy reuses
-integrations your workspace has already connected and fails loudly if one is
-missing, rather than prompting.
+environment, so the self-deploy path itself commits nothing workspace-specific.
+A few personas do still carry the original owner's org or project id as an input
+*default* — the deploy refuses to inherit those, and tells you to set your own.
+It also reuses integrations your workspace has already connected and fails
+loudly if one is missing, rather than prompting.
 
 **→ [docs/SELF-DEPLOY.md](docs/SELF-DEPLOY.md)** covers all of it in full: where
 each secret comes from, how to pass per-agent inputs (including ones that must

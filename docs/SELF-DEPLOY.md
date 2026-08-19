@@ -1,8 +1,10 @@
 # Deploy these agents to your own workspace
 
-Every folder in this repo with a `persona.ts` is a deployable agent. This guide
-takes you from a fork to a running agent in **your** Agent Workforce workspace,
-without an interactive login and without a terminal if you don't want one.
+Every agent listed in [`scripts/deploy/agents.json`](../scripts/deploy/agents.json)
+can be deployed through this path — today that is every folder in the repo with a
+`persona.ts`, and a test keeps the two in step. This guide takes you from a fork
+to a running agent in **your** Agent Workforce workspace, without an interactive
+login and without a terminal if you don't want one.
 
 You need two secrets. The rest is a form in the Actions tab.
 
@@ -113,10 +115,11 @@ this.
 An environment also gets you the optional extras: required reviewers before a
 deploy runs, and a branch rule limiting which refs can deploy.
 
-> **Repository secrets work too** if you'd rather not use an environment — but
-> then you must delete the `environment: workforce` line from
-> `.github/workflows/deploy-agent.yml`, or the job will look for environment
-> secrets that don't exist. Pick one.
+> **Repository secrets work too.** A job that references an environment can still
+> read repository secrets, so you may put the two secrets at the repository level
+> and leave the workflow alone; an environment secret of the same name simply
+> takes precedence. Keep the `environment: workforce` line either way — deleting
+> it also gives up the required-reviewer and branch protections above.
 
 ---
 
@@ -182,9 +185,9 @@ Rules the deploy script applies:
 ### Inputs that identify *you*, not a setting
 
 A few agents watch a specific account: `daytona-monitor` (`DAYTONA_ORG_ID`),
-`gcp-watcher` (`GCP_PROJECT_ID`), `neon-monitor` (`NEON_ORG_ID`). Their personas
-ship a default for these — and that default is **this repo's owner's** org or
-project, not yours.
+`gcp-watcher` (`GCP_PROJECT_ID`), `neon-monitor` (`NEON_ORG_ID`), and
+`pr-shepherd` (`ORG`). Their personas ship a default for these — and that
+default is **this repo's owner's** org, project, or account, not yours.
 
 Inheriting it would point your agent at someone else's infrastructure: at best
 an authorisation error, at worst a monitor reporting on a tenant that isn't

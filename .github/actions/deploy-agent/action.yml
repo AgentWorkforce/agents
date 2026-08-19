@@ -55,8 +55,11 @@ runs:
         WORKFORCE_WORKSPACE_TOKEN: ${{ inputs.workspace-token }}
       run: |
         missing=()
-        [ -n "$WORKFORCE_WORKSPACE_ID" ] || missing+=(WORKFORCE_WORKSPACE_ID)
-        [ -n "$WORKFORCE_WORKSPACE_TOKEN" ] || missing+=(WORKFORCE_WORKSPACE_TOKEN)
+        # Strip whitespace before testing: a secret holding only spaces is unset
+        # as far as the deploy is concerned, and this must agree with
+        # missingWorkspaceSecrets() in the deploy script, which trims too.
+        [ -n "${WORKFORCE_WORKSPACE_ID//[[:space:]]/}" ] || missing+=(WORKFORCE_WORKSPACE_ID)
+        [ -n "${WORKFORCE_WORKSPACE_TOKEN//[[:space:]]/}" ] || missing+=(WORKFORCE_WORKSPACE_TOKEN)
         if [ ${#missing[@]} -ne 0 ]; then
           echo "::error::${missing[*]} empty. Confirm they exist under Settings ->" \
                "Environments -> workforce -> Environment secrets, AND that the calling job" \
@@ -73,7 +76,10 @@ runs:
       shell: bash
       env:
         DEPLOY_AGENT: ${{ inputs.agent }}
-        DRY_RUN: ${{ inputs.dry-run }}
+        # NOT `DRY_RUN`: the deploy script resolves persona inputs from the
+        # environment, and pr-shepherd declares an input called DRY_RUN. A bare
+        # name here would configure that agent from this CI switch.
+        DEPLOY_DRY_RUN: ${{ inputs.dry-run }}
         AGENT_INPUTS: ${{ inputs.agent-inputs }}
         WORKFORCE_WORKSPACE_ID: ${{ inputs.workspace-id }}
         WORKFORCE_WORKSPACE_TOKEN: ${{ inputs.workspace-token }}
@@ -81,7 +87,7 @@ runs:
       # `-e`, so a bare false `&&` list would exit the step with status 1.
       run: |
         extra=()
-        if [ "$DRY_RUN" = "true" ]; then
+        if [ "$DEPLOY_DRY_RUN" = "true" ]; then
           extra+=(--dry-run)
         fi
         node scripts/deploy/deploy-agents.mjs --agent "$DEPLOY_AGENT" "${extra[@]}"

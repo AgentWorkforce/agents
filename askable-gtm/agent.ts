@@ -6,16 +6,28 @@ import {
   type WorkforceCtx,
 } from '@agentworkforce/runtime';
 import { randomUUID } from 'node:crypto';
+import { slackClient } from '@relayfile/relay-helpers';
 import {
   BLOCKED_CLOUD_INTEGRATION_ACTION_CLIENT_REASON,
   CloudIntegrationActionError,
   createCloudIntegrationActionClient,
 } from '../shared/cloud-integration-actions.js';
+import {
+  defaultSlack,
+  postReply,
+  readSlackMessage,
+  skipReason as slackSkipReason,
+  stripLeadingMention,
+  type SlackPoster,
+} from '../shared/slack.js';
 import { ASKABLE_GTM_CAPABILITY } from './capabilities.js';
 
 const MAX_SEEN_IDS = 500;
 const MAX_WATCH_STATE_CAS_ATTEMPTS = 8;
 const WATCH_CLAIM_LEASE_MS = 30 * 60 * 1000;
+const SLACK_WRITEBACK_TIMEOUT_MS = 15_000;
+const RELAY_OWNER_PREFIX = 'relay:';
+const SLACK_OWNER_PREFIX = 'slack:';
 
 export const WATCH_STATE_PATH = '/revternal/_agents/askable-gtm/watch-state.json';
 
@@ -53,6 +65,16 @@ export interface WatchStateSnapshot {
 export interface WatchStateStore {
   read(): Promise<WatchStateSnapshot>;
   compareAndSet(expectedRevision: string, state: WatchState): Promise<boolean>;
+}
+
+interface InteractiveActor {
+  ownerKey: string;
+  reply(text: string): Promise<void>;
+  owns(watchOwner: string): boolean;
+}
+
+interface SlackDirectMessenger {
+  dm(user: string, text: string): Promise<{ ts?: string } | undefined>;
 }
 
 export interface ListenResult {
@@ -391,9 +413,19 @@ export default defineAgent({
   // deploy-time Relaycron schedule evaluates which definitions are due every
   // 15 minutes.
   schedules: [{ name: 'watch-sweep', cron: WATCH_SWEEP_CRON, tz: 'UTC' }],
+  triggers: {
+    // Human chat runs through Slack, not the relay inbox. Match the configured
+    // channel and require an @mention so the agent does not wake on every
+    // ordinary message in the channel.
+    slack: [{ on: 'message.created', paths: ['/slack/channels/${SLACK_CHANNEL}/**'], match: '@mention' }],
+  },
 
   handler: async (ctx, event) => {
     const gateway = createCloudApiListenGateway(ctx);
+    if (event.type.startsWith('slack.')) {
+      await handleSlackMessage(ctx, event, gateway);
+      return;
+    }
     if (isRelaycastMessageEvent(event)) {
       await handleRelayMessage(ctx, event, gateway);
       return;
@@ -447,9 +479,71 @@ export async function handleRelayMessage(
     return;
   }
 
+  await handleInteractiveCommand(
+    ctx,
+    {
+      ownerKey: relayOwnerKey(sender),
+      owns: (owner) => owner === sender || owner === relayOwnerKey(sender),
+      reply: (message) => replyRelay(ctx, sender, message),
+    },
+    text,
+    gateway,
+    stateStore,
+  );
+}
+
+export async function handleSlackMessage(
+  ctx: WorkforceCtx,
+  event: AgentEvent,
+  gateway: ListenGateway = BLOCKED_CLOUD_GATEWAY,
+  stateStore?: WatchStateStore,
+  deps: { slack?: SlackPoster } = {},
+): Promise<void> {
+  const full = await event.expand('full').catch(() => undefined);
+  const payload = isRecord(full) ? (full.data ?? full) : full;
+  const message = readSlackMessage(payload);
+  if (!message) {
+    ctx.log('warn', 'askable-gtm.unreplyable-slack-message', { reason: 'unparseable-payload' });
+    return;
+  }
+  const configuredChannel = input(ctx, 'SLACK_CHANNEL');
+  const skip = slackSkipReason(message, configuredChannel);
+  if (skip) {
+    ctx.log('info', 'askable-gtm.slack-skipped', {
+      reason: skip,
+      channel: message.channel,
+      configuredChannel: configuredChannel ?? null,
+    });
+    return;
+  }
+  if (!message.user) {
+    ctx.log('warn', 'askable-gtm.unreplyable-slack-message', { reason: 'missing-user-id' });
+    return;
+  }
+
+  await handleInteractiveCommand(
+    ctx,
+    {
+      ownerKey: slackOwnerKey(message.user),
+      owns: (owner) => owner === slackOwnerKey(message.user!),
+      reply: (text) => postReply(ctx, deps.slack ?? defaultSlack(), message, text),
+    },
+    stripLeadingMention(message.text).trim(),
+    gateway,
+    stateStore,
+  );
+}
+
+async function handleInteractiveCommand(
+  ctx: WorkforceCtx,
+  actor: InteractiveActor,
+  text: string,
+  gateway: ListenGateway,
+  stateStore?: WatchStateStore,
+): Promise<void> {
   const command = parseCommand(text);
   if (command.kind === 'capabilities-json') {
-    await reply(ctx, sender, JSON.stringify({
+    await actor.reply(JSON.stringify({
       type: 'askable.capabilities',
       capability: ASKABLE_GTM_CAPABILITY,
       runtimeDataAccess: gateway.status === 'configured'
@@ -459,12 +553,12 @@ export async function handleRelayMessage(
     return;
   }
   if (command.kind === 'capabilities-human') {
-    await reply(ctx, sender, renderCapabilities(gateway.status));
+    await actor.reply(renderCapabilities(gateway.status));
     return;
   }
   if (command.kind === 'list-watches') {
     const state = (await resolveWatchStateStore(ctx, stateStore).read()).state;
-    await reply(ctx, sender, renderWatches(state.watches.filter((watch) => watch.owner === sender)));
+    await actor.reply(renderWatches(state.watches.filter((watch) => actor.owns(watch.owner))));
     return;
   }
   if (command.kind === 'remove-watch') {
@@ -472,7 +566,7 @@ export async function handleRelayMessage(
       resolveWatchStateStore(ctx, stateStore),
       (state) => {
         const remaining = state.watches.filter(
-          (watch) => !(watch.id === command.id && watch.owner === sender),
+          (watch) => !(watch.id === command.id && actor.owns(watch.owner)),
         );
         if (remaining.length === state.watches.length) {
           return { changed: false, value: false };
@@ -482,33 +576,31 @@ export async function handleRelayMessage(
       },
     );
     if (!removed) {
-      await reply(ctx, sender, `I could not find watch ${command.id} owned by you.`);
+      await actor.reply(`I could not find watch ${command.id} owned by you.`);
       return;
     }
-    await reply(ctx, sender, `Removed watch ${command.id}.`);
+    await actor.reply(`Removed watch ${command.id}.`);
     return;
   }
   if (command.kind === 'create-watch') {
     let watch: WatchDefinition;
     try {
-      watch = createWatch(command.query, command.cadence, sender, new Date());
+      watch = createWatch(command.query, command.cadence, actor.ownerKey, new Date());
     } catch (error) {
-      await reply(ctx, sender, error instanceof Error ? error.message : 'Invalid watch request.');
+      await actor.reply(error instanceof Error ? error.message : 'Invalid watch request.');
       return;
     }
     await mutateWatchState(
       resolveWatchStateStore(ctx, stateStore),
       (state) => {
         const withoutDuplicate = state.watches.filter(
-          (candidate) => !(candidate.owner === sender && candidate.query === watch.query),
+          (candidate) => !(candidate.owner === watch.owner && candidate.query === watch.query),
         );
         state.watches = [...withoutDuplicate, watch];
         return { changed: true, value: undefined };
       },
     );
-    await reply(
-      ctx,
-      sender,
+    await actor.reply(
         `Saved ${watch.id}: “${watch.query}” every ${watch.cadence}. `
         + 'It is evaluated by the agent’s shared 15-minute recurring sweep; '
         + 'this did not create a per-watch Relaycron schedule. '
@@ -519,7 +611,7 @@ export async function handleRelayMessage(
     return;
   }
 
-  await answerQuestion(ctx, sender, command.query, gateway);
+  await answerQuestion(ctx, actor.reply.bind(actor), command.query, gateway);
 }
 
 export function createWatch(
@@ -591,7 +683,7 @@ export async function runWatchSweep(
         return Boolean(id && !previous.has(id));
       });
       if (fresh.length > 0) {
-        await reply(ctx, watch.owner, renderListenAnswer(watch.query, response, fresh, result.access));
+        await deliverToOwner(ctx, watch.owner, renderListenAnswer(watch.query, response, fresh, result.access));
       }
       await finalizeWatchRun(
         store,
@@ -612,7 +704,7 @@ export async function runWatchSweep(
 
 async function answerQuestion(
   ctx: WorkforceCtx,
-  sender: string,
+  reply: (text: string) => Promise<void>,
   query: string,
   gateway: ListenGateway,
 ): Promise<void> {
@@ -620,13 +712,11 @@ async function answerQuestion(
   try {
     normalizedQuery = normalizeListenQuery(query, 'Query');
   } catch (error) {
-    await reply(ctx, sender, error instanceof Error ? error.message : 'Invalid query.');
+    await reply(error instanceof Error ? error.message : 'Invalid query.');
     return;
   }
   if (gateway.status === 'blocked') {
     await reply(
-      ctx,
-      sender,
       'Live public-signal search is unavailable in this runtime. Deploy the persona in Cloud '
         + 'and connect Revternal from Workspace Integrations. I can still describe my manifest '
         + 'and manage watch definitions. '
@@ -637,14 +727,12 @@ async function answerQuestion(
   try {
     const result = await queryListen(normalizedQuery, gateway);
     await reply(
-      ctx,
-      sender,
       renderListenAnswer(normalizedQuery, result.data, result.data.results ?? [], result.access),
     );
   } catch (error) {
     const errorCode = safeGatewayErrorCode(error);
     ctx.log('error', 'askable-gtm.question-failed', { errorCode });
-    await reply(ctx, sender, renderGatewayFailure(errorCode));
+    await reply(renderGatewayFailure(errorCode));
   }
 }
 
@@ -930,9 +1018,53 @@ function relaySender(event: AgentEvent, expanded: unknown): string | undefined {
   return candidates.find((value) => Boolean(value?.trim()))?.trim();
 }
 
-async function reply(ctx: WorkforceCtx, to: string, text: string): Promise<void> {
+function relayOwnerKey(sender: string): string {
+  return `${RELAY_OWNER_PREFIX}${sender}`;
+}
+
+function slackOwnerKey(user: string): string {
+  return `${SLACK_OWNER_PREFIX}${user}`;
+}
+
+function decodeOwner(owner: string): { transport: 'relay' | 'slack'; id: string } {
+  if (owner.startsWith(SLACK_OWNER_PREFIX)) {
+    return { transport: 'slack', id: owner.slice(SLACK_OWNER_PREFIX.length) };
+  }
+  if (owner.startsWith(RELAY_OWNER_PREFIX)) {
+    return { transport: 'relay', id: owner.slice(RELAY_OWNER_PREFIX.length) };
+  }
+  return { transport: 'relay', id: owner };
+}
+
+function input(ctx: WorkforceCtx, key: string): string | undefined {
+  const value = (ctx as { persona?: { inputs?: Record<string, unknown> } }).persona?.inputs?.[key];
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function defaultSlackDirectMessenger(): SlackDirectMessenger {
+  return slackClient({ writebackTimeoutMs: SLACK_WRITEBACK_TIMEOUT_MS }) as SlackDirectMessenger;
+}
+
+async function replyRelay(ctx: WorkforceCtx, to: string, text: string): Promise<void> {
   const result = await ctx.relay.dm(to, text);
   if (!result.ok) throw new Error(`Relay DM delivery failed for ${to}`);
+}
+
+export async function deliverToOwner(
+  ctx: WorkforceCtx,
+  owner: string,
+  text: string,
+  deps: { slack?: SlackDirectMessenger } = {},
+): Promise<void> {
+  const target = decodeOwner(owner);
+  if (target.transport === 'slack') {
+    const result = await (deps.slack ?? defaultSlackDirectMessenger()).dm(target.id, text);
+    if (!result?.ts) {
+      ctx.log('warn', 'askable-gtm.slack-watch-delivery-no-receipt', { user: target.id });
+    }
+    return;
+  }
+  await replyRelay(ctx, target.id, text);
 }
 
 function renderAccessDisclosure(access: ListenGatewayResult['access']): string {

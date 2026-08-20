@@ -1,8 +1,9 @@
 # GTM Signal Scout
 
-An askable proactive-agent prototype for public GTM signals. It has a relay
-conversation surface, a machine-readable capability manifest, durable user
-watch definitions, and a real deploy-time 15-minute sweep.
+An askable proactive-agent prototype for public GTM signals. It has a Slack
+chat surface, a relay inbox for agent-to-agent traffic, a machine-readable
+capability manifest, durable user watch definitions, and a real deploy-time
+15-minute sweep.
 
 It intentionally fails closed for live Revternal access. The current Cloud
 runtime has no Revternal provider or persona-to-Nango action bridge, so this
@@ -27,6 +28,11 @@ watches
 unwatch <watch-id>
 <any GTM signal question>
 ```
+
+Human chat runs through Slack `@mention` in the configured channel. The relay
+inbox remains available for agent-to-agent usage, not as the primary human
+entry point. Saved watches created from Slack deliver later updates by Slack DM
+to the requesting user; relay-created watches continue to deliver over relay.
 
 Watch requests are durable query definitions evaluated by the shared static
 sweep. They do not create one dynamic Relaycron recurrence per utterance.

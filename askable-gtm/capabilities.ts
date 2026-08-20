@@ -10,8 +10,8 @@ export const ASKABLE_GTM_CAPABILITY = {
   kind: 'gtm-signal-scout',
   status: 'prototype-gated',
   discovery: {
-    human: 'Send “what can you tell me?” over relay.',
-    machine: 'Send “capabilities --json” over relay.',
+    human: 'Send “what can you tell me?” in Slack or over relay.',
+    machine: 'Send “capabilities --json” in Slack or over relay.',
   },
   operations: [
     {

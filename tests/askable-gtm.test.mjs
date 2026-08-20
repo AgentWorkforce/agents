@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { parseIntegrations } from '@agentworkforce/persona-kit';
 import {
   WATCH_SWEEP_CRON,
   WATCH_STATE_PATH,
@@ -8,7 +9,9 @@ import {
   createCloudApiListenGateway,
   createWatch,
   createRelayfileWatchStateStore,
+  deliverToOwner,
   handleRelayMessage,
+  handleSlackMessage,
   parseCommand,
   queryListen,
   renderCapabilities,
@@ -16,6 +19,7 @@ import {
   runWatchSweep,
   watchIsDue,
 } from '../.test-build/askable-gtm/agent.js';
+import askableGtmAgent from '../.test-build/askable-gtm/agent.js';
 import { ASKABLE_GTM_CAPABILITY } from '../.test-build/askable-gtm/capabilities.js';
 import askableGtmPersona from '../.test-build/askable-gtm/persona.js';
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
@@ -58,6 +62,20 @@ function relayEvent(id, text, sender = 'requester') {
     occurredAt: '2026-08-07T10:00:00Z',
     summary: { actor: { id: sender } },
     resource: { text },
+  });
+  assert.ok(event);
+  return event;
+}
+
+function slackEvent(id, text, { channel = 'C_CHAT', user = 'U_HUMAN', ts = '100.1', threadTs } = {}) {
+  const resource = { channel, ts, text, user };
+  if (threadTs) resource.thread_ts = threadTs;
+  const event = envelopeToAgentEvent({
+    id,
+    workspace: 'workspace-test',
+    type: 'slack.message.created',
+    occurredAt: '2026-08-07T10:00:00Z',
+    resource,
   });
   assert.ok(event);
   return event;
@@ -116,6 +134,18 @@ test('configured capability advertisement uses workspace integration wording', (
   assert.doesNotMatch(rendered, /Nango gateway configured/);
 });
 
+test('persona and agent expose a gated Slack chat surface', () => {
+  const parsed = parseIntegrations(askableGtmPersona.integrations, 'integrations');
+  const slack = parsed?.slack;
+  assert.equal(slack?.optional, true);
+  assert.equal(slack?.enabledByInput, 'SLACK_CHANNEL');
+  assert.deepEqual(slack?.scope, { paths: '/slack/channels/**' });
+  assert.equal(askableGtmPersona.inputs?.SLACK_CHANNEL?.picker?.provider, 'slack');
+  assert.equal(askableGtmAgent.triggers?.slack?.[0]?.on, 'message.created');
+  assert.equal(askableGtmAgent.triggers?.slack?.[0]?.match, '@mention');
+  assert.deepEqual(askableGtmAgent.triggers?.slack?.[0]?.paths, ['/slack/channels/${SLACK_CHANNEL}/**']);
+});
+
 test('persona prompt includes the full public-post evidence contract', () => {
   const prompt = askableGtmPersona.systemPrompt;
   assert.match(prompt, /source URL/);
@@ -158,13 +188,148 @@ test('relay watch utterance persists durable state and returns the scheduling tr
   assert.equal(state.watches.length, 1);
   assert.equal(state.watches[0].query, 'Acme migration pain');
   assert.equal(state.watches[0].cadence, '6h');
-  assert.equal(state.watches[0].owner, 'requester');
+  assert.equal(state.watches[0].owner, 'relay:requester');
   assert.equal(sent.length, 1);
   assert.equal(sent[0].to, 'requester');
   assert.match(sent[0].text, /shared 15-minute recurring sweep/);
   assert.match(sent[0].text, /did not create a per-watch Relaycron schedule/);
   assert.match(sent[0].text, /Live execution is unavailable in this runtime/);
   assert.match(sent[0].text, /connected Revternal integration/);
+});
+
+test('relay list-watches still sees legacy unprefixed owners', async () => {
+  const sent = [];
+  const cas = createCasStore(emptyWatchState([
+    createWatch('legacy query', '6h', 'requester', new Date('2026-08-07T10:00:00.000Z')),
+  ]));
+  const ctx = {
+    log() {},
+    relay: {
+      async dm(to, text) { sent.push({ to, text }); return { ok: true, messageId: 'message-test' }; },
+    },
+  };
+
+  await handleRelayMessage(ctx, relayEvent('evt-watches', 'watches'), undefined, cas.store);
+
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /legacy query/);
+});
+
+test('slack question replies in Slack and never falls back to relay dm', async () => {
+  let relayDmCalls = 0;
+  const slackCalls = [];
+  const ctx = {
+    persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' } },
+    log() {},
+    relay: {
+      async dm() {
+        relayDmCalls += 1;
+        return { ok: true, messageId: 'relay-should-not-be-used' };
+      },
+    },
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      return {
+        data: {
+          meta: { fetched_at: '2026-08-07T12:00:00Z' },
+          results: [{
+            source_id: 'post-1',
+            title: 'Acme migration complaints',
+            url: 'https://example.invalid/post-1',
+            score_count: 12,
+            comment_count: 4,
+            community: { name: 'sales' },
+          }],
+          source_status: { reddit: { status: 'ok', count: 1 } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+      };
+    },
+  };
+  const slack = {
+    async post(channel, text) {
+      slackCalls.push({ kind: 'post', channel, text });
+      return { channel, ts: '200.1' };
+    },
+    async reply(channel, threadTs, text) {
+      slackCalls.push({ kind: 'reply', channel, threadTs, text });
+      return { channel, ts: '200.2' };
+    },
+  };
+
+  await handleSlackMessage(
+    ctx,
+    slackEvent('evt-slack-question', '<@U_BOT> what are developers saying about Acme?', {
+      channel: 'C_CHAT',
+      user: 'U_HUMAN',
+    }),
+    gateway,
+    undefined,
+    { slack },
+  );
+
+  assert.equal(relayDmCalls, 0);
+  assert.equal(slackCalls.length, 1);
+  assert.deepEqual(slackCalls[0].kind, 'post');
+  assert.match(slackCalls[0].text, /Public-signal evidence for “what are developers saying about Acme\?”/);
+  assert.match(slackCalls[0].text, /https:\/\/example\.invalid\/post-1/);
+});
+
+test('slack-created watches persist a Slack owner and future deliveries use Slack dm', async () => {
+  const cas = createCasStore();
+  const slackReplies = [];
+  const ctx = {
+    persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' } },
+    log() {},
+    relay: {
+      async dm() {
+        throw new Error('relay dm must not be used for Slack watch delivery');
+      },
+    },
+  };
+  const slack = {
+    async post(channel, text) {
+      slackReplies.push({ kind: 'post', channel, text });
+      return { channel, ts: '300.1' };
+    },
+    async reply(channel, threadTs, text) {
+      slackReplies.push({ kind: 'reply', channel, threadTs, text });
+      return { channel, ts: '300.2' };
+    },
+  };
+
+  await handleSlackMessage(
+    ctx,
+    slackEvent('evt-slack-watch', '<@U_BOT> watch Acme migration pain every 6h', {
+      channel: 'C_CHAT',
+      user: 'U_WATCHER',
+    }),
+    { status: 'blocked', async listen() { throw new Error('not used'); } },
+    cas.store,
+    { slack },
+  );
+
+  const persisted = cas.state().watches[0];
+  assert.equal(persisted.owner, 'slack:U_WATCHER');
+
+  const slackDmCalls = [];
+  await deliverToOwner(
+    ctx,
+    persisted.owner,
+    'watch update',
+    {
+      slack: {
+        async dm(user, text) {
+          slackDmCalls.push({ user, text });
+          return { ts: '300.3' };
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(slackDmCalls, [{ user: 'U_WATCHER', text: 'watch update' }]);
 });
 
 test('cloud API listen gateway calls the workspace integration action route with cloud credentials', async () => {

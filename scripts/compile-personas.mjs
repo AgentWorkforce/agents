@@ -28,8 +28,9 @@
  * outlived the agents that PR #91 deleted. Only files this script wrote are ever
  * removed; personas put there by `agentworkforce install` are left alone.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { basename, join, relative, resolve, sep } from 'node:path';
 
 import { repoRoot, runAgentworkforce } from './agentworkforce-cli.mjs';
 
@@ -38,9 +39,12 @@ const PERSONAS_DIR = join(repoRoot, '.agentworkforce', 'workforce', 'personas');
 // Deliberately NOT inside PERSONAS_DIR: the CLI scans that directory for
 // `*.json` and would report a manifest as a persona missing its `id`.
 const MANIFEST = join(repoRoot, '.agentworkforce', 'workforce', 'personas.compiled.json');
+const MANIFEST_OWNER = 'compile-personas.mjs';
 
 /** `./x` and `../x` are filesystem paths; `@scope/pkg` and `https://…` are not. */
 const RELATIVE_PATH = /^\.\.?[/\\]/u;
+const SAFE_PERSONA_ID = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+const SHA256_HEX = /^[a-f0-9]{64}$/u;
 
 /** Agent directories, i.e. every top-level directory holding a `persona.ts`. */
 function findPersonaSources() {
@@ -52,8 +56,77 @@ function findPersonaSources() {
 }
 
 function rebase(agentDir, value) {
-  const rel = relative(PERSONAS_DIR, resolve(agentDir, value)).split(sep).join('/');
+  const nativePath = value.split(/[\\/]/u).join(sep);
+  const rel = relative(PERSONAS_DIR, resolve(agentDir, nativePath)).split(sep).join('/');
   return rel.startsWith('.') ? rel : `./${rel}`;
+}
+
+function registrationFile(id) {
+  const normalized = typeof id === 'string' ? id.trim() : '';
+  if (!SAFE_PERSONA_ID.test(normalized)) {
+    throw new Error(`invalid persona id for flat registration: ${String(id)}`);
+  }
+  return `${normalized}.json`;
+}
+
+function assertOwnedRegistrationFile(file) {
+  const normalized = typeof file === 'string' ? file.trim() : '';
+  if (normalized !== basename(normalized) || !normalized.endsWith('.json')) {
+    throw new Error(`invalid compiled-persona manifest entry: ${String(file)}`);
+  }
+  registrationFile(normalized.slice(0, -'.json'.length));
+  return normalized;
+}
+
+function normalizeManifestEntry(entry) {
+  if (typeof entry === 'string') {
+    return { file: assertOwnedRegistrationFile(entry) };
+  }
+  if (!entry || typeof entry !== 'object') {
+    throw new Error(`invalid compiled-persona manifest entry: ${String(entry)}`);
+  }
+  const file = assertOwnedRegistrationFile(entry.file);
+  const sha256 = entry.sha256;
+  if (sha256 === undefined) {
+    return { file };
+  }
+  if (typeof sha256 !== 'string' || !SHA256_HEX.test(sha256)) {
+    throw new Error(`invalid compiled-persona manifest digest for ${file}`);
+  }
+  return { file, sha256 };
+}
+
+function parseManifestData(raw) {
+  if (Array.isArray(raw?.entries)) {
+    return raw.entries.map(normalizeManifestEntry);
+  }
+  if (Array.isArray(raw?.files)) {
+    return raw.files.map(normalizeManifestEntry);
+  }
+  throw new Error('compiled-persona manifest must contain an entries[] or files[] array');
+}
+
+function digestText(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function manifestEntryFor(file, body) {
+  return { file, sha256: digestText(body) };
+}
+
+function writeManifest(entries) {
+  const sorted = [...entries]
+    .map(normalizeManifestEntry)
+    .sort((a, b) => a.file.localeCompare(b.file));
+  writeFileSync(MANIFEST, `${JSON.stringify({
+    managedBy: MANIFEST_OWNER,
+    entries: sorted,
+    files: sorted.map((entry) => entry.file),
+  }, null, 2)}\n`, 'utf8');
+}
+
+function currentDigest(file) {
+  return digestText(readFileSync(join(PERSONAS_DIR, file), 'utf8'));
 }
 
 function rebaseRelativePaths(persona, agentDir) {
@@ -77,12 +150,20 @@ function rebaseRelativePaths(persona, agentDir) {
 }
 
 function readManifest() {
-  try {
-    const parsed = JSON.parse(readFileSync(MANIFEST, 'utf8'));
-    return Array.isArray(parsed?.files) ? parsed.files : [];
-  } catch {
+  if (!existsSync(MANIFEST)) {
     return [];
   }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(MANIFEST, 'utf8'));
+  } catch (error) {
+    throw new Error(
+      `malformed compiled-persona manifest at ${MANIFEST}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  return parseManifestData(parsed);
 }
 
 export function compilePersonas({ log = console.log } = {}) {
@@ -91,6 +172,8 @@ export function compilePersonas({ log = console.log } = {}) {
 
   mkdirSync(PERSONAS_DIR, { recursive: true });
 
+  const previousEntries = new Map(readManifest().map((entry) => [entry.file, entry]));
+  const currentEntries = new Map(previousEntries);
   const registered = new Map();
   const skipped = [];
 
@@ -108,6 +191,8 @@ export function compilePersonas({ log = console.log } = {}) {
     if (typeof persona.id !== 'string' || !persona.id.trim()) {
       throw new Error(`${compiledPath}: compiled persona has no id`);
     }
+    const personaId = persona.id.trim();
+    const file = registrationFile(personaId);
 
     // The local CLI's only use for a registered persona is `agentworkforce agent
     // <id>`, which drops into an interactive harness session. A persona that
@@ -119,33 +204,57 @@ export function compilePersonas({ log = console.log } = {}) {
     // name them, because for the rest it looks like an oversight rather than a
     // decision.
     if (typeof persona.harness !== 'string' || !persona.harness.trim()) {
-      skipped.push({ dir, id: persona.id });
+      skipped.push({ dir, id: personaId, file });
       continue;
     }
 
-    const clash = registered.get(persona.id);
+    const clash = registered.get(personaId);
     if (clash) {
       // The personas directory is a flat namespace, so this would silently
       // publish whichever agent happened to compile second.
-      throw new Error(`duplicate persona id "${persona.id}": ${clash} and ${dir} both claim it`);
+      throw new Error(`duplicate persona id "${personaId}": ${clash} and ${dir} both claim it`);
     }
-    registered.set(persona.id, dir);
+    registered.set(personaId, dir);
 
-    const file = `${persona.id}.json`;
-    const body = rebaseRelativePaths(persona, join(repoRoot, dir));
-    writeFileSync(join(PERSONAS_DIR, file), `${JSON.stringify(body, null, 2)}\n`, 'utf8');
+    const target = join(PERSONAS_DIR, file);
+    const previous = previousEntries.get(file);
+    if (existsSync(target) && !previous) {
+      throw new Error(`refusing to overwrite unmanaged persona registration ${file}`);
+    }
+
+    const body = `${JSON.stringify(rebaseRelativePaths(persona, join(repoRoot, dir)), null, 2)}\n`;
+    writeFileSync(target, body, 'utf8');
+    currentEntries.set(file, manifestEntryFor(file, body));
+    writeManifest(currentEntries.values());
   }
 
-  const files = [...registered.keys()].sort().map((id) => `${id}.json`);
-  const skippedFiles = new Set(skipped.map(({ id }) => `${id}.json`));
-  const stale = readManifest().filter((file) => !files.includes(file));
-  for (const file of stale) {
-    rmSync(join(PERSONAS_DIR, file), { force: true });
+  const files = [...registered.keys()].sort().map(registrationFile);
+  const skippedFiles = new Set(skipped.map(({ file }) => file));
+  const finalEntries = new Map(files.map((file) => [file, currentEntries.get(file)]));
+  const stale = [...previousEntries.values()].filter((entry) => !finalEntries.has(entry.file));
+  for (const entry of stale) {
+    const file = entry.file;
+    const target = join(PERSONAS_DIR, file);
+    if (!existsSync(target)) {
+      continue;
+    }
+
+    if (entry.sha256 && currentDigest(file) !== entry.sha256) {
+      log(`Preserved ${file} — it no longer matches the registration previously written by ${MANIFEST_OWNER}`);
+      continue;
+    }
+
+    if (!entry.sha256) {
+      log(`Preserved ${file} — legacy manifest entry has no ownership fingerprint`);
+      continue;
+    }
+
+    rmSync(target, { force: true });
     const reason = skippedFiles.has(file) ? 'it no longer declares a harness' : 'no agent publishes it any more';
     log(`Unregistered ${file} — ${reason}`);
   }
 
-  writeFileSync(MANIFEST, `${JSON.stringify({ files }, null, 2)}\n`, 'utf8');
+  writeManifest(finalEntries.values());
 
   for (const { dir, id } of skipped) {
     log(`Not registered: ${id} (${dir}) declares no harness, so there is no interactive session to run`);
@@ -160,4 +269,12 @@ if (invokedDirectly) {
   console.log(`Compiled and registered ${registered.size} persona(s) -> ${PERSONAS_DIR}`);
 }
 
-export { PERSONAS_DIR, MANIFEST, findPersonaSources, rebaseRelativePaths };
+export {
+  MANIFEST,
+  PERSONAS_DIR,
+  assertOwnedRegistrationFile,
+  findPersonaSources,
+  parseManifestData,
+  rebaseRelativePaths,
+  registrationFile,
+};

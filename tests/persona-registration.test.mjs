@@ -7,8 +7,11 @@ import test from 'node:test';
 import {
   MANIFEST,
   PERSONAS_DIR,
+  assertOwnedRegistrationFile,
   findPersonaSources,
+  parseManifestData,
   rebaseRelativePaths,
+  registrationFile,
 } from '../scripts/compile-personas.mjs';
 
 /**
@@ -109,6 +112,17 @@ test('relative paths are rebased so they still resolve from the personas directo
   assert.notEqual(rebased.onEvent, './agent.ts', 'a straight copy would point at a handler that is not there');
 });
 
+test('Windows-style relative paths are normalized before rebasing', () => {
+  const agentDir = join(repoRoot, 'hn-monitor');
+  const rebased = rebaseRelativePaths(
+    { onEvent: '.\\agent.ts', skills: [{ id: 'local', source: '..\\shared\\voice.md' }] },
+    agentDir,
+  );
+
+  assert.equal(resolve(PERSONAS_DIR, rebased.onEvent), join(agentDir, 'agent.ts'));
+  assert.equal(resolve(PERSONAS_DIR, rebased.skills[0].source), join(repoRoot, 'shared', 'voice.md'));
+});
+
 test('package specs and URLs are left alone by the rebase', () => {
   const skills = [
     { id: 'a', source: '@agent-relay/gtm-context' },
@@ -123,4 +137,23 @@ test('the manifest lives outside the personas directory', () => {
   // `id` as a broken persona — which is the warning this whole change removes.
   const inside = relative(PERSONAS_DIR, MANIFEST);
   assert.ok(inside.startsWith('..') || isAbsolute(inside), `${MANIFEST} would be scanned as a persona`);
+});
+
+test('registration filenames are constrained to the flat personas directory', () => {
+  assert.equal(registrationFile('hn-monitor'), 'hn-monitor.json');
+  assert.throws(() => registrationFile('team/foo'), /invalid persona id/);
+  assert.throws(() => registrationFile('..'), /invalid persona id/);
+  assert.throws(() => registrationFile('persona*name'), /invalid persona id/);
+  assert.equal(assertOwnedRegistrationFile('hn-monitor.json'), 'hn-monitor.json');
+  assert.throws(() => assertOwnedRegistrationFile('../hn-monitor.json'), /invalid compiled-persona manifest entry/);
+});
+
+test('manifest parsing rejects malformed or escaping entries', () => {
+  assert.deepEqual(parseManifestData({ files: ['hn-monitor.json'] }), [{ file: 'hn-monitor.json' }]);
+  assert.deepEqual(parseManifestData({
+    entries: [{ file: 'hn-monitor.json', sha256: 'a'.repeat(64) }],
+  }), [{ file: 'hn-monitor.json', sha256: 'a'.repeat(64) }]);
+  assert.throws(() => parseManifestData({ files: ['../hn-monitor.json'] }), /invalid compiled-persona manifest entry/);
+  assert.throws(() => parseManifestData({ entries: [{ file: 'hn-monitor.json', sha256: 'not-a-digest' }] }), /invalid compiled-persona manifest digest/);
+  assert.throws(() => parseManifestData({ nope: [] }), /compiled-persona manifest must contain an entries\[\] or files\[\] array/);
 });

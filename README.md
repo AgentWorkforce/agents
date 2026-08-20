@@ -39,7 +39,7 @@ it does). The persona compiles to `persona.json`; deploy with
 ```sh
 npm install
 npm run typecheck                                   # tsc over every agent
-npm run compile                                     # every persona.ts -> persona.json, and registered with the CLI
+npm run compile                                     # every persona.ts -> persona.json; harness-backed personas are registered with the CLI
 agentworkforce deploy ./hn-monitor/persona.json --mode cloud --input SLACK_CHANNEL=C0123ABCD
 ```
 
@@ -49,17 +49,16 @@ unrunnable. The CLI resolves personas from
 sitting in `<agent>/` is invisible to it — `agentworkforce agent hn-monitor`
 answers `Unknown persona` next to a list that omits it. The compile step copies
 each persona into that directory, keyed on its **id** rather than its directory
-(`granola/` publishes `granola-prospect`, `linear/` publishes `linear-chat-lead`,
-`review/` publishes `pr-reviewer`), rebasing the relative paths inside so they
-still resolve from their new home. Once compiled, you can sit in a persona's
-seat without deploying anything:
+(`granola/` publishes `granola-prospect`, `review/` publishes `pr-reviewer`),
+rebasing the relative paths inside so they still resolve from their new home.
+Once compiled, you can sit in a persona's seat without deploying anything:
 
 ```sh
 agentworkforce agent hn-monitor      # interactive session: its prompt, model, and skills
 agentworkforce list                  # every persona this repo publishes
 ```
 
-An agent that runs no model is not registered — `spotify-releases` and
+A persona without a harness is not registered — `spotify-releases` and
 `vendor-monitor` are pure fetch-and-deliver handlers with no harness to sit in,
 and `npm run compile` names each one it skips.
 

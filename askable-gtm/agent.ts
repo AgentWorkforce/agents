@@ -213,7 +213,7 @@ function isRateLimitedError(error: CloudIntegrationActionError): boolean {
 
   const type = error.details.upstream?.type?.toLowerCase();
   const code = error.details.upstream?.code?.toLowerCase();
-  const message = (error.details.upstream?.message ?? error.message).toLowerCase();
+  const message = error.details.upstream?.message?.toLowerCase() ?? '';
   return type === 'rate_limited'
     || code === 'rate_limited'
     || message.includes('rate limit');
@@ -223,7 +223,7 @@ function isProviderAuthFailure(error: CloudIntegrationActionError): boolean {
   const status = error.details.upstream?.status;
   const type = error.details.upstream?.type?.toLowerCase() ?? '';
   const code = error.details.upstream?.code?.toLowerCase() ?? '';
-  const message = (error.details.upstream?.message ?? error.message).toLowerCase();
+  const message = error.details.upstream?.message?.toLowerCase() ?? '';
   return status === 401
     || status === 403
     || type.includes('auth')
@@ -670,7 +670,7 @@ export function renderCapabilities(gatewayStatus: ListenGateway['status']): stri
   return [
     'I am GTM Signal Scout, an askable proactive-agent prototype.',
     'Verified here: machine-readable self-description and durable watch-definition management.',
-    `Live Revternal search: ${gatewayStatus === 'configured' ? 'Nango gateway configured; credential and entitlement are checked per request, and result quality remains unverified' : 'available only in a cloud runtime with a connected Revternal workspace integration'}.`,
+    `Live Revternal search: ${gatewayStatus === 'configured' ? 'a connected Revternal workspace integration is configured; credential and entitlement are checked per request, and result quality remains unverified' : 'available only in a cloud runtime with a connected Revternal workspace integration'}.`,
     `Designed questions: ${designedQuestions}`,
     `Watch syntax: ${watchSyntax}.`,
     `Scheduling: ${watchOperation?.recurrence.mechanism ?? 'not advertised'} at ${watchOperation?.recurrence.sweepCron ?? 'not advertised'}; per-watch Relaycron schedule: ${String(watchOperation?.recurrence.perWatchRelaycronSchedule ?? false)}.`,

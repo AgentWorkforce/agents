@@ -41,6 +41,7 @@ export interface CloudIntegrationActionClient {
 
 export const BLOCKED_CLOUD_INTEGRATION_ACTION_CLIENT_REASON =
   'Cloud API credentials or Relayfile workspace context are unavailable in this runtime';
+export const CLOUD_INTEGRATION_ACTION_TIMEOUT_MS = 30_000;
 
 export class CloudIntegrationActionError extends Error {
   constructor(
@@ -178,6 +179,7 @@ export function createCloudIntegrationActionClient(
             'content-type': 'application/json',
           },
           body: JSON.stringify(body),
+          signal: AbortSignal.timeout(CLOUD_INTEGRATION_ACTION_TIMEOUT_MS),
         });
       } catch {
         throw new CloudIntegrationActionError(

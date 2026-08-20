@@ -106,6 +106,12 @@ test('human capability advertisement is rendered from the machine manifest', () 
   }
 });
 
+test('configured capability advertisement uses workspace integration wording', () => {
+  const rendered = renderCapabilities('configured');
+  assert.match(rendered, /connected Revternal workspace integration is configured/);
+  assert.doesNotMatch(rendered, /Nango gateway configured/);
+});
+
 test('persona prompt includes the full public-post evidence contract', () => {
   const prompt = askableGtmPersona.systemPrompt;
   assert.match(prompt, /source URL/);
@@ -159,6 +165,7 @@ test('relay watch utterance persists durable state and returns the scheduling tr
 
 test('cloud API listen gateway calls the workspace integration action route with cloud credentials', async () => {
   const requests = [];
+  let seenSignal;
   const gateway = createCloudApiListenGateway({
     credentials: {
       tryRequire() {
@@ -176,6 +183,7 @@ test('cloud API listen gateway calls the workspace integration action route with
       },
     },
   }, async (input, init) => {
+    seenSignal = init?.signal;
     requests.push(new Request(input, init));
     return Response.json({
       ok: true,
@@ -207,6 +215,8 @@ test('cloud API listen gateway calls the workspace integration action route with
   );
   assert.equal(requests[0].method, 'POST');
   assert.equal(requests[0].headers.get('authorization'), 'Bearer cloud-token-test');
+  assert.equal(typeof seenSignal?.addEventListener, 'function');
+  assert.equal(seenSignal?.aborted, false);
   assert.deepEqual(await requests[0].json(), {
     input: {
       query: 'developer tool migration pain',
@@ -219,6 +229,48 @@ test('cloud API listen gateway calls the workspace integration action route with
   });
   assert.equal(result.access.endpointHost, 'api.revternal.com');
   assert.equal(result.data.meta.query, 'developer tool migration pain');
+});
+
+test('cloud API listen gateway does not misclassify cloud auth failures as provider auth failures', async () => {
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+          cloudApi: {
+            url: 'https://cloud.example',
+            token: 'cloud-token-test',
+          },
+        };
+      },
+    },
+  }, async () => new Response(JSON.stringify({
+    ok: false,
+    code: 'unauthorized',
+    error: 'Unauthorized',
+  }), {
+    status: 401,
+    headers: { 'content-type': 'application/json' },
+  }));
+
+  await assert.rejects(
+    () => gateway.listen({
+      query: 'developer tool migration pain',
+      sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+      filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+      sort_by: 'relevance_score',
+      page: 1,
+      per_page: 20,
+    }),
+    (error) =>
+      error instanceof ListenGatewayError
+      && error.code === 'request-failed'
+      && error.message === 'Unauthorized',
+  );
 });
 
 test('cloud API listen gateway maps allowlisted route errors into gateway errors', async () => {

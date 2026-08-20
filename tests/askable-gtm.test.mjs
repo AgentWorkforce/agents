@@ -70,6 +70,10 @@ test('machine-readable capability manifest is versioned and honest about live ac
   assert.equal(ASKABLE_GTM_CAPABILITY.credentials.canonicalStore, 'nango');
   assert.equal(ASKABLE_GTM_CAPABILITY.credentials.retrieval, 'single-nango-action');
   assert.equal(ASKABLE_GTM_CAPABILITY.provider.endpointSource, 'nango-connection');
+  assert.equal(
+    ASKABLE_GTM_CAPABILITY.provider.operation,
+    'POST /api/v1/workspaces/:workspaceId/integrations/revternal/actions/social-listen',
+  );
   assert.equal(ASKABLE_GTM_CAPABILITY.operations[2].availability, 'implemented_unverified');
   assert.equal(ASKABLE_GTM_CAPABILITY.provider.liveResultVerification, 'not-yet-live-verified');
   assert.equal(WATCH_SWEEP_CRON, '*/15 * * * *');
@@ -108,7 +112,7 @@ test('human capability advertisement is rendered from the machine manifest', () 
 
 test('configured capability advertisement uses workspace integration wording', () => {
   const rendered = renderCapabilities('configured');
-  assert.match(rendered, /connected Revternal workspace integration is configured/);
+  assert.match(rendered, /Cloud integration action gateway is configured/);
   assert.doesNotMatch(rendered, /Nango gateway configured/);
 });
 
@@ -227,6 +231,7 @@ test('cloud API listen gateway calls the workspace integration action route with
       per_page: 20,
     },
   });
+  assert.equal(result.access.credentialSource, 'workspace');
   assert.equal(result.access.endpointHost, 'api.revternal.com');
   assert.equal(result.data.meta.query, 'developer tool migration pain');
 });
@@ -273,6 +278,97 @@ test('cloud API listen gateway does not misclassify cloud auth failures as provi
   );
 });
 
+test('cloud API listen gateway maps upstream rate limits into provider rate limits', async () => {
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+          cloudApi: {
+            url: 'https://cloud.example',
+            token: 'cloud-token-test',
+          },
+        };
+      },
+    },
+  }, async () => new Response(JSON.stringify({
+    ok: false,
+    code: 'action_rate_limited',
+    error: 'Rate limited',
+    upstream: {
+      status: 429,
+      message: 'rate limit exceeded',
+    },
+  }), {
+    status: 429,
+    headers: { 'content-type': 'application/json' },
+  }));
+
+  await assert.rejects(
+    () => gateway.listen({
+      query: 'developer tool migration pain',
+      sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+      filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+      sort_by: 'relevance_score',
+      page: 1,
+      per_page: 20,
+    }),
+    (error) =>
+      error instanceof ListenGatewayError
+      && error.code === 'provider-rate-limited',
+  );
+});
+
+test('cloud API listen gateway maps upstream auth failures into provider auth failures', async () => {
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+          cloudApi: {
+            url: 'https://cloud.example',
+            token: 'cloud-token-test',
+          },
+        };
+      },
+    },
+  }, async () => new Response(JSON.stringify({
+    ok: false,
+    code: 'action_failed',
+    error: 'Forbidden',
+    upstream: {
+      status: 401,
+      type: 'authentication_error',
+      message: 'unauthorized upstream',
+    },
+  }), {
+    status: 502,
+    headers: { 'content-type': 'application/json' },
+  }));
+
+  await assert.rejects(
+    () => gateway.listen({
+      query: 'developer tool migration pain',
+      sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+      filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+      sort_by: 'relevance_score',
+      page: 1,
+      per_page: 20,
+    }),
+    (error) =>
+      error instanceof ListenGatewayError
+      && error.code === 'provider-auth-failed',
+  );
+});
+
 test('cloud API listen gateway rejects malformed success payloads', async () => {
   const gateway = createCloudApiListenGateway({
     credentials: {
@@ -313,6 +409,35 @@ test('cloud API listen gateway rejects malformed success payloads', async () => 
     (error) =>
       error instanceof ListenGatewayError
       && error.code === 'invalid-response',
+  );
+});
+
+test('cloud API listen gateway stays blocked without cloud runtime credentials', async () => {
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+        };
+      },
+    },
+  });
+
+  assert.equal(gateway.status, 'blocked');
+  await assert.rejects(
+    () => gateway.listen({
+      query: 'developer tool migration pain',
+      sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+      filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+      sort_by: 'relevance_score',
+      page: 1,
+      per_page: 20,
+    }),
+    /Cloud API credentials or Relayfile workspace context are unavailable in this runtime/,
   );
 });
 
@@ -373,7 +498,7 @@ test('Listen gateway receives one bounded request with no credential or endpoint
           results: [],
           source_status: { reddit: { status: 'ok', count: 0 } },
         },
-        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
       };
     },
   });
@@ -397,7 +522,7 @@ test('interactive queries are normalized and validated before the gateway is cal
       requests.push(request);
       return {
         data: { results: [] },
-        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
       };
     },
   };
@@ -494,7 +619,7 @@ test('failed watch delivery does not consume results and the next sweep retries 
           results: [{ platform: 'reddit', source_id: 'post-1', title: 'Result' }],
           source_status: { reddit: { status: 'ok', count: 1 } },
         },
-        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
       };
     },
   };
@@ -542,7 +667,7 @@ test('CAS preserves concurrent create, remove, and sweep mutations without dupli
           results: [{ platform: 'reddit', source_id: 'post-2', title: 'Concurrent result' }],
           source_status: { reddit: { status: 'ok', count: 1 } },
         },
-        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
       };
     },
   };
@@ -594,7 +719,7 @@ test('a CAS run claim fences concurrent sweeps for the same work unit', async ()
       await gatewayBarrier;
       return {
         data: { results: [{ platform: 'reddit', source_id: 'post-3' }] },
-        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
       };
     },
   };
@@ -644,7 +769,7 @@ test('answers disclose managed fallback and the connection-provided host', () =>
 
 test('answers suppress unsafe host metadata', () => {
   const answer = renderListenAnswer('query', { results: [] }, [], {
-    credentialSource: 'user',
+    credentialSource: 'workspace',
     endpointHost: 'user:secret@internal.example/path?token=value',
   });
 

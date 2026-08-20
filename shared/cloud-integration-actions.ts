@@ -10,6 +10,11 @@ export interface CloudIntegrationActionRequest {
   requestedBackend?: CloudIntegrationActionBackend;
 }
 
+export interface CloudIntegrationActionAccess {
+  credentialSource?: 'workspace' | 'managed';
+  endpointHost?: string;
+}
+
 export interface CloudIntegrationActionSuccess<T = unknown> {
   ok: true;
   provider: string;
@@ -17,6 +22,7 @@ export interface CloudIntegrationActionSuccess<T = unknown> {
   backend: CloudIntegrationActionBackend;
   result: T;
   integrationName?: string | null;
+  access?: CloudIntegrationActionAccess;
 }
 
 export interface CloudIntegrationActionUpstreamError {
@@ -77,6 +83,28 @@ function asInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) ? value : undefined;
 }
 
+function readAccessMetadata(value: unknown): CloudIntegrationActionAccess | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const credentialSource = asString(value.credentialSource);
+  const endpointHost = asString(value.endpointHost);
+  if (
+    credentialSource !== undefined
+    && credentialSource !== 'workspace'
+    && credentialSource !== 'managed'
+  ) {
+    return undefined;
+  }
+
+  const access = {
+    ...(credentialSource ? { credentialSource } : {}),
+    ...(endpointHost ? { endpointHost } : {}),
+  };
+  return Object.keys(access).length > 0 ? access : undefined;
+}
+
 function readSuccessBody<T>(value: unknown): CloudIntegrationActionSuccess<T> | null {
   if (!isRecord(value) || value.ok !== true || !('result' in value)) {
     return null;
@@ -86,6 +114,7 @@ function readSuccessBody<T>(value: unknown): CloudIntegrationActionSuccess<T> | 
   const action = asString(value.action);
   const backend = asString(value.backend);
   const integrationName = value.integrationName;
+  const access = readAccessMetadata(value.access);
   if (
     !provider
     || !action
@@ -102,6 +131,7 @@ function readSuccessBody<T>(value: unknown): CloudIntegrationActionSuccess<T> | 
     backend,
     result: value.result as T,
     ...(integrationName !== undefined ? { integrationName } : {}),
+    ...(access ? { access } : {}),
   };
 }
 

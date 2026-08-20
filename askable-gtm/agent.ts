@@ -97,13 +97,13 @@ export interface ListenRequest {
   per_page: number;
 }
 
-export type CredentialSource = 'user' | 'managed';
+export type CredentialSource = 'workspace' | 'managed';
 
 export interface ListenGatewayResult {
   data: ListenResponse;
   access: {
     credentialSource: CredentialSource;
-    /** Normalized, allowlisted host for the documented provider endpoint or local fallback. */
+    /** Normalized, allowlisted host for the documented provider endpoint. */
     endpointHost: string;
   };
 }
@@ -131,9 +131,9 @@ export class ListenGatewayError extends Error {
   }
 }
 
-const REVTERNAL_ENDPOINT_HOST = 'api.revternal.com';
+const DOCUMENTED_REVTERNAL_ENDPOINT_HOST = 'api.revternal.com';
 
-const BLOCKED_NANGO_GATEWAY: ListenGateway = {
+const BLOCKED_CLOUD_GATEWAY: ListenGateway = {
   status: 'blocked',
   async listen() {
     throw new Error(BLOCKED_CLOUD_INTEGRATION_ACTION_CLIENT_REASON);
@@ -146,7 +146,7 @@ export function createCloudApiListenGateway(
 ): ListenGateway {
   const actionClient = createCloudIntegrationActionClient(ctx, fetchImpl);
   if (actionClient.status === 'blocked') {
-    return BLOCKED_NANGO_GATEWAY;
+    return BLOCKED_CLOUD_GATEWAY;
   }
 
   return {
@@ -160,10 +160,7 @@ export function createCloudApiListenGateway(
         });
         return {
           data: normalizeListenResponse(result.result),
-          access: {
-            credentialSource: 'user',
-            endpointHost: REVTERNAL_ENDPOINT_HOST,
-          },
+          access: normalizeGatewayAccess(result.access),
         };
       } catch (error) {
         if (error instanceof ListenGatewayError) {
@@ -187,11 +184,11 @@ function mapCloudActionError(error: unknown): ListenGatewayError {
     );
   }
 
-  if (error.code === 'action_rate_limited' || isRateLimitedError(error)) {
+  if (error.details.upstream && (error.code === 'action_rate_limited' || isRateLimitedError(error))) {
     return new ListenGatewayError('provider-rate-limited', error.message);
   }
 
-  if (isProviderAuthFailure(error)) {
+  if (error.details.upstream && isProviderAuthFailure(error)) {
     return new ListenGatewayError('provider-auth-failed', error.message);
   }
 
@@ -204,6 +201,17 @@ function mapCloudActionError(error: unknown): ListenGatewayError {
   }
 
   return new ListenGatewayError('request-failed', error.message);
+}
+
+function normalizeGatewayAccess(
+  access: { credentialSource?: string; endpointHost?: string } | undefined,
+): ListenGatewayResult['access'] {
+  return {
+    credentialSource: access?.credentialSource === 'managed' ? 'managed' : 'workspace',
+    endpointHost: typeof access?.endpointHost === 'string' && access.endpointHost.trim().length > 0
+      ? access.endpointHost.trim()
+      : DOCUMENTED_REVTERNAL_ENDPOINT_HOST,
+  };
 }
 
 function isRateLimitedError(error: CloudIntegrationActionError): boolean {
@@ -420,7 +428,7 @@ export function parseCommand(text: string): ParsedCommand {
 export async function handleRelayMessage(
   ctx: WorkforceCtx,
   event: AgentEvent,
-  gateway: ListenGateway = BLOCKED_NANGO_GATEWAY,
+  gateway: ListenGateway = BLOCKED_CLOUD_GATEWAY,
   stateStore?: WatchStateStore,
 ): Promise<void> {
   const full = await event.expand('full').catch(() => undefined);
@@ -440,7 +448,7 @@ export async function handleRelayMessage(
       type: 'askable.capabilities',
       capability: ASKABLE_GTM_CAPABILITY,
       runtimeDataAccess: gateway.status === 'configured'
-        ? 'nango-gateway-configured-authorization-checked-per-request'
+        ? 'cloud-integration-action-gateway-configured-authorization-checked-per-request'
         : 'blocked-missing-cloud-runtime-credentials',
     }));
     return;
@@ -500,7 +508,7 @@ export async function handleRelayMessage(
         + 'It is evaluated by the agent’s shared 15-minute recurring sweep; '
         + 'this did not create a per-watch Relaycron schedule. '
         + (gateway.status === 'configured'
-          ? 'The Nango query gateway is configured; credential and entitlement are checked on each run.'
+          ? 'The Cloud integration action gateway is configured; Revternal connection, credential, and entitlement are checked on each run.'
           : 'Live execution is unavailable in this runtime until the persona is deployed in Cloud with a connected Revternal integration.'),
     );
     return;
@@ -551,7 +559,7 @@ export async function queryListen(
 export async function runWatchSweep(
   ctx: WorkforceCtx,
   now: Date,
-  gateway: ListenGateway = BLOCKED_NANGO_GATEWAY,
+  gateway: ListenGateway = BLOCKED_CLOUD_GATEWAY,
   stateStore?: WatchStateStore,
   claimIdFactory: () => string = () => `claim-${randomUUID()}`,
 ): Promise<void> {
@@ -673,7 +681,7 @@ export function renderCapabilities(gatewayStatus: ListenGateway['status']): stri
   return [
     'I am GTM Signal Scout, an askable proactive-agent prototype.',
     'Verified here: machine-readable self-description and durable watch-definition management.',
-    `Live Revternal search: ${gatewayStatus === 'configured' ? 'a connected Revternal workspace integration is configured; credential and entitlement are checked per request, and result quality remains unverified' : 'available only in a cloud runtime with a connected Revternal workspace integration'}.`,
+    `Live Revternal search: ${gatewayStatus === 'configured' ? 'the Cloud integration action gateway is configured; Revternal connection, credential, and entitlement are checked per request, and result quality remains unverified' : 'available only in a cloud runtime with a connected Revternal workspace integration'}.`,
     `Designed questions: ${designedQuestions}`,
     `Watch syntax: ${watchSyntax}.`,
     `Scheduling: ${watchOperation?.recurrence.mechanism ?? 'not advertised'} at ${watchOperation?.recurrence.sweepCron ?? 'not advertised'}; per-watch Relaycron schedule: ${String(watchOperation?.recurrence.perWatchRelaycronSchedule ?? false)}.`,
@@ -926,7 +934,7 @@ function renderAccessDisclosure(access: ListenGatewayResult['access']): string {
   const host = safeDisplayHost(access.endpointHost);
   return access.credentialSource === 'managed'
     ? `Access: Agent Workforce managed Revternal access; usage counts against your paid allowance. Documented endpoint: ${host}.`
-    : `Access: your Nango-connected Revternal credential. Documented endpoint: ${host}.`;
+    : `Access: your workspace-connected Revternal credential. Documented endpoint: ${host}.`;
 }
 
 function safeDisplayHost(value: string): string {

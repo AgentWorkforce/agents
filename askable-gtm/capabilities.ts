@@ -74,7 +74,7 @@ export const ASKABLE_GTM_CAPABILITY = {
   provider: {
     id: 'revternal.listen',
     availability: 'implemented_unverified',
-    operation: 'POST /social/listen through Nango',
+    operation: 'POST /api/v1/workspaces/:workspaceId/integrations/revternal/actions/social-listen',
     endpointSource: 'nango-connection',
     authentication: 'required-observed',
     documentedRegisteredSources: ['reddit'],

@@ -8,7 +8,7 @@ export const ASKABLE_GTM_CAPABILITY = {
   enabled: true,
   schema: 'agentrelay.askable.v1',
   kind: 'gtm-signal-scout',
-  status: 'prototype-blocked',
+  status: 'prototype-gated',
   discovery: {
     human: 'Send “what can you tell me?” over relay.',
     machine: 'Send “capabilities --json” over relay.',
@@ -35,9 +35,9 @@ export const ASKABLE_GTM_CAPABILITY = {
     },
     {
       id: 'query-public-social-signals',
-      availability: 'blocked',
-      requires: ['Revternal Nango provider/action bridge', 'authenticated live-result gate'],
-      implementedPieces: ['bounded query planner', 'evidence renderer', 'secretless gateway contract'],
+      availability: 'implemented_unverified',
+      requires: ['Connected Revternal workspace integration', 'cloud runtime credentials'],
+      implementedPieces: ['bounded query planner', 'evidence renderer', 'cloud-backed secretless gateway contract'],
       evidence: [
         'source URL',
         'source timestamp',
@@ -73,25 +73,25 @@ export const ASKABLE_GTM_CAPABILITY = {
   ],
   provider: {
     id: 'revternal.listen',
-    availability: 'blocked-provider-not-registered',
-    operation: 'POST /social/listen through Nango',
+    availability: 'implemented_unverified',
+    operation: 'POST /api/v1/workspaces/:workspaceId/integrations/revternal/actions/social-listen',
     endpointSource: 'nango-connection',
     authentication: 'required-observed',
     documentedRegisteredSources: ['reddit'],
     identicalRequestCache: '15m-documented-unverified',
-    liveResultVerification: 'blocked-op-cli-unavailable',
+    liveResultVerification: 'not-yet-live-verified',
   },
   credentials: {
     personaInput: false,
     canonicalStore: 'nango',
     retrieval: 'single-nango-action',
     userKey: {
-      availability: 'blocked-provider-not-registered',
+      availability: 'implemented_unverified',
       source: 'nango-connection-credential',
       setupPath: '/integrations',
     },
     endpoint: {
-      availability: 'blocked-provider-not-registered',
+      availability: 'implemented_unverified',
       source: 'nango-connection-config',
       disclosedToUser: true,
     },
@@ -105,8 +105,8 @@ export const ASKABLE_GTM_CAPABILITY = {
     selection: 'user connection first; managed fallback only after trusted entitlement and quota authorization; otherwise fail closed',
   },
   limitations: [
-    'No successful keyed Listen response was observed during this investigation.',
-    'Cloud has no Revternal provider, Nango action, or persona action bridge today.',
+    'Live result quality with a real keyed workspace connection is not yet verified in this repo.',
+    'Live search depends on a connected Revternal workspace integration and cloud runtime credentials.',
     'Managed fallback has no Revternal entitlement, per-workspace meter, or hard quota today.',
     'Only Reddit is documented as currently registered.',
     'No full comments, contact data, employer/title, or qualification evidence.',

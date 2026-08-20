@@ -6,6 +6,11 @@ import {
   type WorkforceCtx,
 } from '@agentworkforce/runtime';
 import { randomUUID } from 'node:crypto';
+import {
+  BLOCKED_CLOUD_INTEGRATION_ACTION_CLIENT_REASON,
+  CloudIntegrationActionError,
+  createCloudIntegrationActionClient,
+} from '../shared/cloud-integration-actions.js';
 import { ASKABLE_GTM_CAPABILITY } from './capabilities.js';
 
 const MAX_SEEN_IDS = 500;
@@ -92,13 +97,13 @@ export interface ListenRequest {
   per_page: number;
 }
 
-export type CredentialSource = 'user' | 'managed';
+export type CredentialSource = 'user' | 'managed' | 'unknown';
 
 export interface ListenGatewayResult {
   data: ListenResponse;
   access: {
     credentialSource: CredentialSource;
-    /** Normalized, allowlisted display host emitted by the server-side bridge. */
+    /** Normalized, allowlisted host for the documented provider endpoint. */
     endpointHost: string;
   };
 }
@@ -126,12 +131,252 @@ export class ListenGatewayError extends Error {
   }
 }
 
-const BLOCKED_NANGO_GATEWAY: ListenGateway = {
+const DOCUMENTED_REVTERNAL_ENDPOINT_HOST = 'api.revternal.com';
+
+const BLOCKED_CLOUD_GATEWAY: ListenGateway = {
   status: 'blocked',
   async listen() {
-    throw new Error('Revternal Nango action bridge is not available');
+    throw new Error(BLOCKED_CLOUD_INTEGRATION_ACTION_CLIENT_REASON);
   },
 };
+
+export function createCloudApiListenGateway(
+  ctx: WorkforceCtx,
+  fetchImpl: typeof fetch = fetch,
+): ListenGateway {
+  const actionClient = createCloudIntegrationActionClient(ctx, fetchImpl);
+  if (actionClient.status === 'blocked') {
+    return BLOCKED_CLOUD_GATEWAY;
+  }
+
+  return {
+    status: 'configured',
+    async listen(request) {
+      try {
+        const result = await actionClient.invoke({
+          provider: 'revternal',
+          action: 'social-listen',
+          input: request,
+        });
+        return {
+          data: normalizeListenResponse(result.result),
+          access: normalizeGatewayAccess(result.access),
+        };
+      } catch (error) {
+        if (error instanceof ListenGatewayError) {
+          throw error;
+        }
+        throw mapCloudActionError(error);
+      }
+    },
+  };
+}
+
+function mapCloudActionError(error: unknown): ListenGatewayError {
+  if (!(error instanceof CloudIntegrationActionError)) {
+    return new ListenGatewayError('request-failed');
+  }
+
+  if (error.code === 'integration_not_found') {
+    return new ListenGatewayError(
+      'connection-required',
+      'Revternal is not connected for this workspace.',
+    );
+  }
+
+  if (error.details.upstream && (error.code === 'action_rate_limited' || isRateLimitedError(error))) {
+    return new ListenGatewayError('provider-rate-limited', error.message);
+  }
+
+  if (error.details.upstream && isProviderAuthFailure(error)) {
+    return new ListenGatewayError('provider-auth-failed', error.message);
+  }
+
+  if (error.code === 'invalid_response') {
+    return new ListenGatewayError('invalid-response', error.message);
+  }
+
+  if ((error.details.upstream?.status ?? 0) >= 500) {
+    return new ListenGatewayError('provider-unavailable', error.message);
+  }
+
+  return new ListenGatewayError('request-failed', error.message);
+}
+
+function normalizeGatewayAccess(
+  access: { credentialSource?: string; endpointHost?: string } | undefined,
+): ListenGatewayResult['access'] {
+  return {
+    credentialSource:
+      access?.credentialSource === 'managed'
+        ? 'managed'
+        : (access?.credentialSource === 'user' || access?.credentialSource === 'workspace')
+          ? 'user'
+          : 'unknown',
+    endpointHost: typeof access?.endpointHost === 'string' && access.endpointHost.trim().length > 0
+      ? access.endpointHost.trim()
+      : DOCUMENTED_REVTERNAL_ENDPOINT_HOST,
+  };
+}
+
+function isRateLimitedError(error: CloudIntegrationActionError): boolean {
+  if (error.details.upstream?.status === 429) {
+    return true;
+  }
+
+  const type = error.details.upstream?.type?.toLowerCase();
+  const code = error.details.upstream?.code?.toLowerCase();
+  const message = error.details.upstream?.message?.toLowerCase() ?? '';
+  return type === 'rate_limited'
+    || code === 'rate_limited'
+    || message.includes('rate limit');
+}
+
+function isProviderAuthFailure(error: CloudIntegrationActionError): boolean {
+  const status = error.details.upstream?.status;
+  const type = error.details.upstream?.type?.toLowerCase() ?? '';
+  const code = error.details.upstream?.code?.toLowerCase() ?? '';
+  const message = error.details.upstream?.message?.toLowerCase() ?? '';
+  return status === 401
+    || status === 403
+    || type.includes('auth')
+    || code.includes('auth')
+    || message.includes('unauthorized')
+    || message.includes('forbidden')
+    || message.includes('authentication');
+}
+
+function readString(
+  value: Record<string, unknown> | null | undefined,
+  key: string,
+): string | undefined {
+  const candidate = value?.[key];
+  return typeof candidate === 'string' && candidate.trim().length > 0
+    ? candidate.trim()
+    : undefined;
+}
+
+function readInteger(
+  value: Record<string, unknown> | null | undefined,
+  key: string,
+): number | undefined {
+  const candidate = value?.[key];
+  return typeof candidate === 'number' && Number.isInteger(candidate)
+    ? candidate
+    : undefined;
+}
+
+function readRecord(
+  value: Record<string, unknown> | null | undefined,
+  key: string,
+): Record<string, unknown> | null {
+  const candidate = value?.[key];
+  return isRecord(candidate) ? candidate : null;
+}
+
+function normalizeListenResponse(value: unknown): ListenResponse {
+  if (!isRecord(value)) {
+    throw new ListenGatewayError('invalid-response');
+  }
+
+  const meta = readRecord(value, 'meta');
+  if (!Array.isArray(value.results)) {
+    throw new ListenGatewayError('invalid-response');
+  }
+  const rawResults = value.results;
+  const rawSourceStatus = readRecord(value, 'source_status');
+
+  return {
+    ...(meta
+      ? {
+          meta: {
+            ...(readString(meta, 'query') ? { query: readString(meta, 'query') } : {}),
+            ...(readInteger(meta, 'total_results') !== undefined
+              ? { total_results: readInteger(meta, 'total_results') }
+              : {}),
+            ...(Array.isArray(meta.sources_queried)
+              ? {
+                  sources_queried: meta.sources_queried.filter(
+                    (entry): entry is string => typeof entry === 'string' && entry.trim().length > 0,
+                  ),
+                }
+              : {}),
+            ...(readString(meta, 'fetched_at') ? { fetched_at: readString(meta, 'fetched_at') } : {}),
+            ...(readInteger(meta, 'page') !== undefined ? { page: readInteger(meta, 'page') } : {}),
+            ...(readInteger(meta, 'per_page') !== undefined
+              ? { per_page: readInteger(meta, 'per_page') }
+              : {}),
+          },
+        }
+      : {}),
+    results: rawResults.flatMap((entry) => {
+      if (!isRecord(entry)) {
+        return [];
+      }
+
+      const communityName = readString(entry, 'community_name');
+      const communityUrl = readString(entry, 'community_url');
+      const authorHandle = readString(entry, 'author_handle');
+      const authorProfile = readString(entry, 'author_profile_url');
+
+      return [{
+        ...(readString(entry, 'source_id') ? { source_id: readString(entry, 'source_id') } : {}),
+        ...(readString(entry, 'source_id') ? { id: readString(entry, 'source_id') } : {}),
+        ...(readString(entry, 'source_platform') ? { platform: readString(entry, 'source_platform') } : {}),
+        ...(readString(entry, 'source_url') ? { url: readString(entry, 'source_url') } : {}),
+        ...(readString(entry, 'permalink') ? { permalink: readString(entry, 'permalink') } : {}),
+        ...(readString(entry, 'created_at') ? { created_at: readString(entry, 'created_at') } : {}),
+        ...(readString(entry, 'title') ? { title: readString(entry, 'title') } : {}),
+        ...(readString(entry, 'body_text') ? { body_text: readString(entry, 'body_text') } : {}),
+        ...(readInteger(entry, 'score_count') !== undefined
+          ? { score_count: readInteger(entry, 'score_count') }
+          : {}),
+        ...(readInteger(entry, 'comment_count') !== undefined
+          ? { comment_count: readInteger(entry, 'comment_count') }
+          : {}),
+        ...(communityName || communityUrl
+          ? {
+              community: {
+                ...(communityName ? { name: communityName } : {}),
+                ...(communityUrl ? { url: communityUrl } : {}),
+              },
+            }
+          : {}),
+        ...(authorHandle || authorProfile
+          ? {
+              author: {
+                ...(authorHandle ? { handle: authorHandle } : {}),
+                ...(authorProfile ? { profile: authorProfile } : {}),
+              },
+            }
+          : {}),
+      }];
+    }),
+    ...(rawSourceStatus
+      ? {
+          source_status: Object.fromEntries(
+            Object.entries(rawSourceStatus)
+              .filter(([, status]) => isRecord(status))
+              .map(([source, status]) => [
+                source,
+                {
+                  ...(readString(status, 'status') ? { status: readString(status, 'status') } : {}),
+                  ...(readInteger(status, 'count') !== undefined
+                    ? { count: readInteger(status, 'count') }
+                    : {}),
+                  ...(readInteger(status, 'latency_ms') !== undefined
+                    ? { latency: readInteger(status, 'latency_ms') }
+                    : {}),
+                  ...(status.error === null || typeof status.error === 'string'
+                    ? { error: status.error as string | null }
+                    : {}),
+                },
+              ]),
+          ),
+        }
+      : {}),
+  };
+}
 
 export type ParsedCommand =
   | { kind: 'capabilities-json' }
@@ -148,12 +393,13 @@ export default defineAgent({
   schedules: [{ name: 'watch-sweep', cron: WATCH_SWEEP_CRON, tz: 'UTC' }],
 
   handler: async (ctx, event) => {
+    const gateway = createCloudApiListenGateway(ctx);
     if (isRelaycastMessageEvent(event)) {
-      await handleRelayMessage(ctx, event);
+      await handleRelayMessage(ctx, event, gateway);
       return;
     }
     if (isCronTickEvent(event)) {
-      await runWatchSweep(ctx, new Date());
+      await runWatchSweep(ctx, new Date(), gateway);
     }
   },
 });
@@ -187,7 +433,7 @@ export function parseCommand(text: string): ParsedCommand {
 export async function handleRelayMessage(
   ctx: WorkforceCtx,
   event: AgentEvent,
-  gateway: ListenGateway = BLOCKED_NANGO_GATEWAY,
+  gateway: ListenGateway = BLOCKED_CLOUD_GATEWAY,
   stateStore?: WatchStateStore,
 ): Promise<void> {
   const full = await event.expand('full').catch(() => undefined);
@@ -207,8 +453,8 @@ export async function handleRelayMessage(
       type: 'askable.capabilities',
       capability: ASKABLE_GTM_CAPABILITY,
       runtimeDataAccess: gateway.status === 'configured'
-        ? 'nango-gateway-configured-authorization-checked-per-request'
-        : 'blocked-no-nango-action-bridge',
+        ? 'cloud-integration-action-gateway-configured-authorization-checked-per-request'
+        : 'blocked-missing-cloud-runtime-credentials',
     }));
     return;
   }
@@ -263,12 +509,12 @@ export async function handleRelayMessage(
     await reply(
       ctx,
       sender,
-      `Saved ${watch.id}: “${watch.query}” every ${watch.cadence}. `
+        `Saved ${watch.id}: “${watch.query}” every ${watch.cadence}. `
         + 'It is evaluated by the agent’s shared 15-minute recurring sweep; '
         + 'this did not create a per-watch Relaycron schedule. '
         + (gateway.status === 'configured'
-          ? 'The Nango query gateway is configured; credential and entitlement are checked on each run.'
-          : 'Live execution is blocked until Cloud supplies the Revternal Nango action bridge.'),
+          ? 'The Cloud integration action gateway is configured; Revternal connection, credential, and entitlement are checked on each run.'
+          : 'Live execution is unavailable in this runtime until the persona is deployed in Cloud with a connected Revternal integration.'),
     );
     return;
   }
@@ -318,13 +564,13 @@ export async function queryListen(
 export async function runWatchSweep(
   ctx: WorkforceCtx,
   now: Date,
-  gateway: ListenGateway = BLOCKED_NANGO_GATEWAY,
+  gateway: ListenGateway = BLOCKED_CLOUD_GATEWAY,
   stateStore?: WatchStateStore,
   claimIdFactory: () => string = () => `claim-${randomUUID()}`,
 ): Promise<void> {
   if (gateway.status === 'blocked') {
     ctx.log('warn', 'askable-gtm.sweep-blocked', {
-      reason: 'Revternal Nango action bridge is not available',
+      reason: BLOCKED_CLOUD_INTEGRATION_ACTION_CLIENT_REASON,
     });
     return;
   }
@@ -381,8 +627,9 @@ async function answerQuestion(
     await reply(
       ctx,
       sender,
-      'Live public-signal search is blocked: Cloud has not supplied the Revternal Nango '
-        + 'action bridge. I can still describe my manifest and manage watch definitions. '
+      'Live public-signal search is unavailable in this runtime. Deploy the persona in Cloud '
+        + 'and connect Revternal from Workspace Integrations. I can still describe my manifest '
+        + 'and manage watch definitions. '
         + 'Send “capabilities --json” for the exact machine-readable status.',
     );
     return;
@@ -439,7 +686,7 @@ export function renderCapabilities(gatewayStatus: ListenGateway['status']): stri
   return [
     'I am GTM Signal Scout, an askable proactive-agent prototype.',
     'Verified here: machine-readable self-description and durable watch-definition management.',
-    `Live Revternal search: ${gatewayStatus === 'configured' ? 'Nango gateway configured; credential and entitlement are checked per request, and result quality remains unverified' : 'blocked until Cloud supplies the Revternal Nango action bridge'}.`,
+    `Live Revternal search: ${gatewayStatus === 'configured' ? 'the Cloud integration action gateway is configured; Revternal connection, credential, and entitlement are checked per request, and result quality remains unverified' : 'available only in a cloud runtime with a connected Revternal workspace integration'}.`,
     `Designed questions: ${designedQuestions}`,
     `Watch syntax: ${watchSyntax}.`,
     `Scheduling: ${watchOperation?.recurrence.mechanism ?? 'not advertised'} at ${watchOperation?.recurrence.sweepCron ?? 'not advertised'}; per-watch Relaycron schedule: ${String(watchOperation?.recurrence.perWatchRelaycronSchedule ?? false)}.`,
@@ -691,8 +938,10 @@ async function reply(ctx: WorkforceCtx, to: string, text: string): Promise<void>
 function renderAccessDisclosure(access: ListenGatewayResult['access']): string {
   const host = safeDisplayHost(access.endpointHost);
   return access.credentialSource === 'managed'
-    ? `Access: Agent Workforce managed Revternal access; usage counts against your paid allowance. Host: ${host}.`
-    : `Access: your Nango-connected Revternal credential. Host: ${host}.`;
+    ? `Access: Agent Workforce managed Revternal access; usage counts against your paid allowance. Documented endpoint: ${host}.`
+    : access.credentialSource === 'user'
+      ? `Access: your workspace-connected Revternal credential. Documented endpoint: ${host}.`
+      : `Access: the Cloud integration action gateway did not disclose whether this used a workspace-connected or managed Revternal credential. Documented endpoint: ${host}.`;
 }
 
 function safeDisplayHost(value: string): string {
@@ -720,6 +969,18 @@ function renderGatewayFailure(code: ListenGatewayErrorCode): string {
   }
   if (code === 'quota-exhausted') {
     return 'The Revternal allowance for this workspace is exhausted. No provider request was made.';
+  }
+  if (code === 'provider-rate-limited') {
+    return 'Revternal rate limit exceeded. Retry later.';
+  }
+  if (code === 'provider-auth-failed') {
+    return 'Revternal authentication failed for the connected workspace integration.';
+  }
+  if (code === 'provider-unavailable') {
+    return 'Revternal is temporarily unavailable. Retry later.';
+  }
+  if (code === 'invalid-response') {
+    return 'Revternal returned an invalid response. No provider response detail was logged.';
   }
   return `Revternal query failed safely (${code}). No provider response detail was logged.`;
 }

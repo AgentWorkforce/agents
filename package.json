@@ -13,7 +13,7 @@
     "acceptance:composable-runtime-closure": "node scripts/acceptance/composable-runtime-closure.mjs",
     "typecheck": "tsc --noEmit",
     "deploy": "node scripts/deploy/deploy-agents.mjs",
-    "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done",
+    "compile": "node scripts/compile-personas.mjs",
     "evals": "npm run compile && node scripts/evals/run-evals.mjs",
     "evals:hn": "node scripts/run-hn-platform-cases.mjs",
     "evals:live": "npm run compile && node scripts/evals/run-evals.mjs --live --judge"

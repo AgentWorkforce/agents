@@ -17,6 +17,7 @@ import {
   watchIsDue,
 } from '../.test-build/askable-gtm/agent.js';
 import { ASKABLE_GTM_CAPABILITY } from '../.test-build/askable-gtm/capabilities.js';
+import askableGtmPersona from '../.test-build/askable-gtm/persona.js';
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 
 function emptyWatchState(watches = []) {
@@ -103,6 +104,18 @@ test('human capability advertisement is rendered from the machine manifest', () 
   for (const question of ASKABLE_GTM_CAPABILITY.questions) {
     assert.match(rendered, new RegExp(question.example.replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
   }
+});
+
+test('persona prompt includes the full public-post evidence contract', () => {
+  const prompt = askableGtmPersona.systemPrompt;
+  assert.match(prompt, /source URL/);
+  assert.match(prompt, /source timestamp/);
+  assert.match(prompt, /fetched_at/);
+  assert.match(prompt, /source coverage/);
+  assert.match(prompt, /community/);
+  assert.match(prompt, /public author handle/);
+  assert.match(prompt, /title\/body excerpt/);
+  assert.match(prompt, /score and comment counts/);
 });
 
 test('watch definitions are stable per owner/query and evaluated at their requested cadence', () => {

@@ -103,7 +103,7 @@ export interface ListenGatewayResult {
   data: ListenResponse;
   access: {
     credentialSource: CredentialSource;
-    /** Normalized, allowlisted display host surfaced by the action gateway or local fallback. */
+    /** Normalized, allowlisted host for the documented provider endpoint or local fallback. */
     endpointHost: string;
   };
 }
@@ -267,7 +267,10 @@ function normalizeListenResponse(value: unknown): ListenResponse {
   }
 
   const meta = readRecord(value, 'meta');
-  const rawResults = Array.isArray(value.results) ? value.results : [];
+  if (!Array.isArray(value.results)) {
+    throw new ListenGatewayError('invalid-response');
+  }
+  const rawResults = value.results;
   const rawSourceStatus = readRecord(value, 'source_status');
 
   return {
@@ -922,8 +925,8 @@ async function reply(ctx: WorkforceCtx, to: string, text: string): Promise<void>
 function renderAccessDisclosure(access: ListenGatewayResult['access']): string {
   const host = safeDisplayHost(access.endpointHost);
   return access.credentialSource === 'managed'
-    ? `Access: Agent Workforce managed Revternal access; usage counts against your paid allowance. Host: ${host}.`
-    : `Access: your Nango-connected Revternal credential. Host: ${host}.`;
+    ? `Access: Agent Workforce managed Revternal access; usage counts against your paid allowance. Documented endpoint: ${host}.`
+    : `Access: your Nango-connected Revternal credential. Documented endpoint: ${host}.`;
 }
 
 function safeDisplayHost(value: string): string {

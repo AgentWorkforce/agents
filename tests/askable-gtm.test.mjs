@@ -273,6 +273,49 @@ test('cloud API listen gateway does not misclassify cloud auth failures as provi
   );
 });
 
+test('cloud API listen gateway rejects malformed success payloads', async () => {
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+          cloudApi: {
+            url: 'https://cloud.example',
+            token: 'cloud-token-test',
+          },
+        };
+      },
+    },
+  }, async () => Response.json({
+    ok: true,
+    provider: 'revternal',
+    action: 'social-listen',
+    backend: 'nango',
+    result: {
+      meta: { query: 'developer tool migration pain' },
+      results: null,
+    },
+  }));
+
+  await assert.rejects(
+    () => gateway.listen({
+      query: 'developer tool migration pain',
+      sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+      filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+      sort_by: 'relevance_score',
+      page: 1,
+      per_page: 20,
+    }),
+    (error) =>
+      error instanceof ListenGatewayError
+      && error.code === 'invalid-response',
+  );
+});
+
 test('cloud API listen gateway maps allowlisted route errors into gateway errors', async () => {
   const gateway = createCloudApiListenGateway({
     credentials: {
@@ -596,7 +639,7 @@ test('answers disclose managed fallback and the connection-provided host', () =>
 
   assert.match(answer, /Agent Workforce managed Revternal access/);
   assert.match(answer, /paid allowance/);
-  assert.match(answer, /Host: managed\.provider\.example/);
+  assert.match(answer, /Documented endpoint: managed\.provider\.example/);
 });
 
 test('answers suppress unsafe host metadata', () => {
@@ -605,7 +648,7 @@ test('answers suppress unsafe host metadata', () => {
     endpointHost: 'user:secret@internal.example/path?token=value',
   });
 
-  assert.match(answer, /Host: not disclosed/);
+  assert.match(answer, /Documented endpoint: not disclosed/);
   assert.doesNotMatch(answer, /secret|internal\.example|token=value/);
 });
 

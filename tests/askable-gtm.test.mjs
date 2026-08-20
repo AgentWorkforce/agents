@@ -5,6 +5,7 @@ import {
   WATCH_SWEEP_CRON,
   WATCH_STATE_PATH,
   ListenGatewayError,
+  createCloudApiListenGateway,
   createWatch,
   createRelayfileWatchStateStore,
   handleRelayMessage,
@@ -63,13 +64,13 @@ function relayEvent(id, text, sender = 'requester') {
 
 test('machine-readable capability manifest is versioned and honest about live access', () => {
   assert.equal(ASKABLE_GTM_CAPABILITY.schema, 'agentrelay.askable.v1');
-  assert.equal(ASKABLE_GTM_CAPABILITY.status, 'prototype-blocked');
+  assert.equal(ASKABLE_GTM_CAPABILITY.status, 'prototype-gated');
   assert.equal(ASKABLE_GTM_CAPABILITY.credentials.personaInput, false);
   assert.equal(ASKABLE_GTM_CAPABILITY.credentials.canonicalStore, 'nango');
   assert.equal(ASKABLE_GTM_CAPABILITY.credentials.retrieval, 'single-nango-action');
   assert.equal(ASKABLE_GTM_CAPABILITY.provider.endpointSource, 'nango-connection');
-  assert.equal(ASKABLE_GTM_CAPABILITY.operations[2].availability, 'blocked');
-  assert.equal(ASKABLE_GTM_CAPABILITY.provider.liveResultVerification, 'blocked-op-cli-unavailable');
+  assert.equal(ASKABLE_GTM_CAPABILITY.operations[2].availability, 'implemented_unverified');
+  assert.equal(ASKABLE_GTM_CAPABILITY.provider.liveResultVerification, 'not-yet-live-verified');
   assert.equal(WATCH_SWEEP_CRON, '*/15 * * * *');
 });
 
@@ -139,8 +140,114 @@ test('relay watch utterance persists durable state and returns the scheduling tr
   assert.equal(sent[0].to, 'requester');
   assert.match(sent[0].text, /shared 15-minute recurring sweep/);
   assert.match(sent[0].text, /did not create a per-watch Relaycron schedule/);
-  assert.match(sent[0].text, /Live execution is blocked/);
-  assert.match(sent[0].text, /Revternal Nango action bridge/);
+  assert.match(sent[0].text, /Live execution is unavailable in this runtime/);
+  assert.match(sent[0].text, /connected Revternal integration/);
+});
+
+test('cloud API listen gateway calls the workspace integration action route with cloud credentials', async () => {
+  const requests = [];
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+          cloudApi: {
+            url: 'https://cloud.example/',
+            token: 'cloud-token-test',
+          },
+        };
+      },
+    },
+  }, async (input, init) => {
+    requests.push(new Request(input, init));
+    return Response.json({
+      ok: true,
+      provider: 'revternal',
+      action: 'social-listen',
+      backend: 'nango',
+      result: {
+        meta: { query: 'developer tool migration pain' },
+        results: [],
+        source_status: { reddit: { status: 'ok', count: 0 } },
+      },
+    });
+  });
+
+  const result = await gateway.listen({
+    query: 'developer tool migration pain',
+    sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+    filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+    sort_by: 'relevance_score',
+    page: 1,
+    per_page: 20,
+  });
+
+  assert.equal(gateway.status, 'configured');
+  assert.equal(requests.length, 1);
+  assert.equal(
+    requests[0].url,
+    'https://cloud.example/api/v1/workspaces/rw_workspace/integrations/revternal/actions/social-listen',
+  );
+  assert.equal(requests[0].method, 'POST');
+  assert.equal(requests[0].headers.get('authorization'), 'Bearer cloud-token-test');
+  assert.deepEqual(await requests[0].json(), {
+    input: {
+      query: 'developer tool migration pain',
+      sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+      filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+      sort_by: 'relevance_score',
+      page: 1,
+      per_page: 20,
+    },
+  });
+  assert.equal(result.access.endpointHost, 'api.revternal.com');
+  assert.equal(result.data.meta.query, 'developer tool migration pain');
+});
+
+test('cloud API listen gateway maps allowlisted route errors into gateway errors', async () => {
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+          cloudApi: {
+            url: 'https://cloud.example',
+            token: 'cloud-token-test',
+          },
+        };
+      },
+    },
+  }, async () => new Response(JSON.stringify({
+    ok: false,
+    code: 'integration_not_found',
+    error: 'No revternal integration is connected for this workspace',
+  }), {
+    status: 404,
+    headers: { 'content-type': 'application/json' },
+  }));
+
+  await assert.rejects(
+    () => gateway.listen({
+      query: 'developer tool migration pain',
+      sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+      filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+      sort_by: 'relevance_score',
+      page: 1,
+      per_page: 20,
+    }),
+    (error) =>
+      error instanceof ListenGatewayError
+      && error.code === 'connection-required'
+      && /not connected/i.test(error.message),
+  );
 });
 
 test('Listen gateway receives one bounded request with no credential or endpoint field', async () => {

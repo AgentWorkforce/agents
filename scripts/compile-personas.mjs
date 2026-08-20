@@ -192,6 +192,7 @@ export function compilePersonas({ log = console.log } = {}) {
       throw new Error(`${compiledPath}: compiled persona has no id`);
     }
     const personaId = persona.id.trim();
+    persona.id = personaId;
     const file = registrationFile(personaId);
 
     // The local CLI's only use for a registered persona is `agentworkforce agent

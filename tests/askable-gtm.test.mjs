@@ -194,6 +194,9 @@ test('cloud API listen gateway calls the workspace integration action route with
       provider: 'revternal',
       action: 'social-listen',
       backend: 'nango',
+      access: {
+        credentialSource: 'user',
+      },
       result: {
         meta: { query: 'developer tool migration pain' },
         results: [],
@@ -231,9 +234,51 @@ test('cloud API listen gateway calls the workspace integration action route with
       per_page: 20,
     },
   });
-  assert.equal(result.access.credentialSource, 'workspace');
+  assert.equal(result.access.credentialSource, 'user');
   assert.equal(result.access.endpointHost, 'api.revternal.com');
   assert.equal(result.data.meta.query, 'developer tool migration pain');
+});
+
+test('cloud API listen gateway preserves unknown access source when the gateway omits metadata', async () => {
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+          cloudApi: {
+            url: 'https://cloud.example/',
+            token: 'cloud-token-test',
+          },
+        };
+      },
+    },
+  }, async () => Response.json({
+    ok: true,
+    provider: 'revternal',
+    action: 'social-listen',
+    backend: 'nango',
+    result: {
+      meta: { query: 'developer tool migration pain' },
+      results: [],
+      source_status: { reddit: { status: 'ok', count: 0 } },
+    },
+  }));
+
+  const result = await gateway.listen({
+    query: 'developer tool migration pain',
+    sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+    filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+    sort_by: 'relevance_score',
+    page: 1,
+    per_page: 20,
+  });
+
+  assert.equal(result.access.credentialSource, 'unknown');
+  assert.equal(result.access.endpointHost, 'api.revternal.com');
 });
 
 test('cloud API listen gateway does not misclassify cloud auth failures as provider auth failures', async () => {
@@ -498,7 +543,7 @@ test('Listen gateway receives one bounded request with no credential or endpoint
           results: [],
           source_status: { reddit: { status: 'ok', count: 0 } },
         },
-        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
       };
     },
   });
@@ -522,7 +567,7 @@ test('interactive queries are normalized and validated before the gateway is cal
       requests.push(request);
       return {
         data: { results: [] },
-        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
       };
     },
   };
@@ -619,7 +664,7 @@ test('failed watch delivery does not consume results and the next sweep retries 
           results: [{ platform: 'reddit', source_id: 'post-1', title: 'Result' }],
           source_status: { reddit: { status: 'ok', count: 1 } },
         },
-        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
       };
     },
   };
@@ -667,7 +712,7 @@ test('CAS preserves concurrent create, remove, and sweep mutations without dupli
           results: [{ platform: 'reddit', source_id: 'post-2', title: 'Concurrent result' }],
           source_status: { reddit: { status: 'ok', count: 1 } },
         },
-        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
       };
     },
   };
@@ -719,7 +764,7 @@ test('a CAS run claim fences concurrent sweeps for the same work unit', async ()
       await gatewayBarrier;
       return {
         data: { results: [{ platform: 'reddit', source_id: 'post-3' }] },
-        access: { credentialSource: 'workspace', endpointHost: 'provider.example' },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
       };
     },
   };
@@ -769,7 +814,7 @@ test('answers disclose managed fallback and the connection-provided host', () =>
 
 test('answers suppress unsafe host metadata', () => {
   const answer = renderListenAnswer('query', { results: [] }, [], {
-    credentialSource: 'workspace',
+    credentialSource: 'unknown',
     endpointHost: 'user:secret@internal.example/path?token=value',
   });
 

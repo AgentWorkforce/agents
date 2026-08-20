@@ -11,7 +11,7 @@ export interface CloudIntegrationActionRequest {
 }
 
 export interface CloudIntegrationActionAccess {
-  credentialSource?: 'workspace' | 'managed';
+  credentialSource: 'user' | 'workspace' | 'managed';
   endpointHost?: string;
 }
 
@@ -83,26 +83,26 @@ function asInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) ? value : undefined;
 }
 
-function readAccessMetadata(value: unknown): CloudIntegrationActionAccess | undefined {
+function readAccessMetadata(value: unknown): CloudIntegrationActionAccess | null {
   if (!isRecord(value)) {
-    return undefined;
+    return null;
   }
 
   const credentialSource = asString(value.credentialSource);
   const endpointHost = asString(value.endpointHost);
   if (
-    credentialSource !== undefined
+    credentialSource !== 'user'
     && credentialSource !== 'workspace'
     && credentialSource !== 'managed'
   ) {
-    return undefined;
+    return null;
   }
 
   const access = {
-    ...(credentialSource ? { credentialSource } : {}),
+    credentialSource,
     ...(endpointHost ? { endpointHost } : {}),
   };
-  return Object.keys(access).length > 0 ? access : undefined;
+  return access;
 }
 
 function readSuccessBody<T>(value: unknown): CloudIntegrationActionSuccess<T> | null {
@@ -114,7 +114,14 @@ function readSuccessBody<T>(value: unknown): CloudIntegrationActionSuccess<T> | 
   const action = asString(value.action);
   const backend = asString(value.backend);
   const integrationName = value.integrationName;
-  const access = readAccessMetadata(value.access);
+  let access: CloudIntegrationActionAccess | undefined;
+  if ('access' in value) {
+    const parsedAccess = readAccessMetadata(value.access);
+    if (!parsedAccess) {
+      return null;
+    }
+    access = parsedAccess;
+  }
   if (
     !provider
     || !action

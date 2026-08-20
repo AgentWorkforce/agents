@@ -97,7 +97,7 @@ export interface ListenRequest {
   per_page: number;
 }
 
-export type CredentialSource = 'workspace' | 'managed';
+export type CredentialSource = 'user' | 'managed' | 'unknown';
 
 export interface ListenGatewayResult {
   data: ListenResponse;
@@ -207,7 +207,12 @@ function normalizeGatewayAccess(
   access: { credentialSource?: string; endpointHost?: string } | undefined,
 ): ListenGatewayResult['access'] {
   return {
-    credentialSource: access?.credentialSource === 'managed' ? 'managed' : 'workspace',
+    credentialSource:
+      access?.credentialSource === 'managed'
+        ? 'managed'
+        : (access?.credentialSource === 'user' || access?.credentialSource === 'workspace')
+          ? 'user'
+          : 'unknown',
     endpointHost: typeof access?.endpointHost === 'string' && access.endpointHost.trim().length > 0
       ? access.endpointHost.trim()
       : DOCUMENTED_REVTERNAL_ENDPOINT_HOST,
@@ -934,7 +939,9 @@ function renderAccessDisclosure(access: ListenGatewayResult['access']): string {
   const host = safeDisplayHost(access.endpointHost);
   return access.credentialSource === 'managed'
     ? `Access: Agent Workforce managed Revternal access; usage counts against your paid allowance. Documented endpoint: ${host}.`
-    : `Access: your workspace-connected Revternal credential. Documented endpoint: ${host}.`;
+    : access.credentialSource === 'user'
+      ? `Access: your workspace-connected Revternal credential. Documented endpoint: ${host}.`
+      : `Access: the Cloud integration action gateway did not disclose whether this used a workspace-connected or managed Revternal credential. Documented endpoint: ${host}.`;
 }
 
 function safeDisplayHost(value: string): string {

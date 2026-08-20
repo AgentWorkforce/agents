@@ -281,6 +281,51 @@ test('cloud API listen gateway preserves unknown access source when the gateway 
   assert.equal(result.access.endpointHost, 'api.revternal.com');
 });
 
+test('cloud API listen gateway normalizes workspace access metadata to the user disclosure bucket', async () => {
+  const gateway = createCloudApiListenGateway({
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay-token-test',
+            workspaceId: 'rw_workspace',
+          },
+          cloudApi: {
+            url: 'https://cloud.example/',
+            token: 'cloud-token-test',
+          },
+        };
+      },
+    },
+  }, async () => Response.json({
+    ok: true,
+    provider: 'revternal',
+    action: 'social-listen',
+    backend: 'nango',
+    access: {
+      credentialSource: 'workspace',
+    },
+    result: {
+      meta: { query: 'developer tool migration pain' },
+      results: [],
+      source_status: { reddit: { status: 'ok', count: 0 } },
+    },
+  }));
+
+  const result = await gateway.listen({
+    query: 'developer tool migration pain',
+    sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
+    filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
+    sort_by: 'relevance_score',
+    page: 1,
+    per_page: 20,
+  });
+
+  assert.equal(result.access.credentialSource, 'user');
+  assert.equal(result.access.endpointHost, 'api.revternal.com');
+});
+
 test('cloud API listen gateway does not misclassify cloud auth failures as provider auth failures', async () => {
   const gateway = createCloudApiListenGateway({
     credentials: {

@@ -10,6 +10,7 @@ import {
   assertOwnedRegistrationFile,
   findPersonaSources,
   parseManifestData,
+  registrationCollisionKey,
   rebaseRelativePaths,
   registrationFile,
 } from '../scripts/compile-personas.mjs';
@@ -146,6 +147,7 @@ test('registration filenames are constrained to the flat personas directory', ()
   assert.throws(() => registrationFile('persona*name'), /invalid persona id/);
   assert.equal(assertOwnedRegistrationFile('hn-monitor.json'), 'hn-monitor.json');
   assert.throws(() => assertOwnedRegistrationFile('../hn-monitor.json'), /invalid compiled-persona manifest entry/);
+  assert.equal(registrationCollisionKey('Foo.json'), registrationCollisionKey('foo.json'));
 });
 
 test('manifest parsing rejects malformed or escaping entries', () => {

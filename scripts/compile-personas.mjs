@@ -69,6 +69,10 @@ function registrationFile(id) {
   return `${normalized}.json`;
 }
 
+function registrationCollisionKey(file) {
+  return assertOwnedRegistrationFile(file).toLowerCase();
+}
+
 function assertOwnedRegistrationFile(file) {
   const normalized = typeof file === 'string' ? file.trim() : '';
   if (normalized !== basename(normalized) || !normalized.endsWith('.json')) {
@@ -209,13 +213,14 @@ export function compilePersonas({ log = console.log } = {}) {
       continue;
     }
 
-    const clash = registered.get(personaId);
+    const registrationKey = registrationCollisionKey(file);
+    const clash = registered.get(registrationKey);
     if (clash) {
       // The personas directory is a flat namespace, so this would silently
       // publish whichever agent happened to compile second.
-      throw new Error(`duplicate persona id "${personaId}": ${clash} and ${dir} both claim it`);
+      throw new Error(`duplicate persona id "${personaId}": ${clash.personaId} (${clash.dir}) and ${dir} both claim ${file}`);
     }
-    registered.set(personaId, dir);
+    registered.set(registrationKey, { dir, file, personaId });
 
     const target = join(PERSONAS_DIR, file);
     const previous = previousEntries.get(file);
@@ -229,7 +234,7 @@ export function compilePersonas({ log = console.log } = {}) {
     writeManifest(currentEntries.values());
   }
 
-  const files = [...registered.keys()].sort().map(registrationFile);
+  const files = [...registered.values()].map(({ file }) => file).sort();
   const skippedFiles = new Set(skipped.map(({ file }) => file));
   const finalEntries = new Map(files.map((file) => [file, currentEntries.get(file)]));
   const stale = [...previousEntries.values()].filter((entry) => !finalEntries.has(entry.file));
@@ -276,6 +281,7 @@ export {
   assertOwnedRegistrationFile,
   findPersonaSources,
   parseManifestData,
+  registrationCollisionKey,
   rebaseRelativePaths,
   registrationFile,
 };

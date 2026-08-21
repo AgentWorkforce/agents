@@ -60,6 +60,7 @@ export interface Sandbox {
   state?: string;
   errorReason?: string;
   createdAt?: string;
+  lastActivityAt?: string;
   updatedAt?: string;
 }
 
@@ -243,8 +244,14 @@ function normalizeSandbox(raw: Record<string, unknown>): Sandbox {
     name: str(raw.name, nested.name),
     state: str(raw.newState, raw.new_state, raw.state, nested.state),
     errorReason: str(raw.errorReason, raw.error_reason, nested.errorReason, nested.error_reason),
-    createdAt: str(raw.createdAt, raw.created_at, nested.createdAt),
-    updatedAt: str(raw.updatedAt, raw.updated_at, nested.updatedAt)
+    createdAt: str(raw.createdAt, raw.created_at, nested.createdAt, nested.created_at),
+    lastActivityAt: str(
+      raw.lastActivityAt,
+      raw.last_activity_at,
+      nested.lastActivityAt,
+      nested.last_activity_at
+    ),
+    updatedAt: str(raw.updatedAt, raw.updated_at, nested.updatedAt, nested.updated_at)
   };
 }
 
@@ -584,14 +591,64 @@ function alertSignature(signals: readonly AlertSignal[]): string {
   return signals.map((signal) => signal.fingerprint).sort().join('\n');
 }
 function parseAlertSignature(signature: string): Set<string> {
-  return new Set(signature.split('\n').map((value) => value.trim()).filter(Boolean));
+  return new Set(
+    signature
+      .split('\n')
+      .map((value) => value.trim())
+      .filter((value) => Boolean(value) && isFingerprintEntry(value))
+  );
 }
 function newlyTriggeredSignals(
   signals: readonly AlertSignal[],
   previousSignature: string,
 ): AlertSignal[] {
-  const previous = parseAlertSignature(previousSignature);
-  return signals.filter((signal) => !previous.has(signal.fingerprint));
+  const previousFingerprints = parseAlertSignature(previousSignature);
+  const previousLegacyAliases = parseLegacyAlertAliases(previousSignature);
+  return signals.filter((signal) => {
+    if (previousFingerprints.has(signal.fingerprint)) return false;
+    return legacyAliasesForSignal(signal).every((alias) => !previousLegacyAliases.has(alias));
+  });
+}
+function isFingerprintEntry(entry: string): boolean {
+  return entry.startsWith('quota:')
+    || entry.startsWith('sandbox-error:')
+    || entry.startsWith('sandbox-stale:')
+    || entry.startsWith('allocation-jump:');
+}
+function parseLegacyAlertAliases(signature: string): Set<string> {
+  const aliases = new Set<string>();
+  for (const entry of signature.split('\n').map((value) => value.trim()).filter(Boolean)) {
+    if (isFingerprintEntry(entry)) continue;
+    for (const alias of legacyAliasesForMessage(entry)) aliases.add(alias);
+  }
+  return aliases;
+}
+function legacyAliasesForSignal(signal: AlertSignal): string[] {
+  return legacyAliasesForMessage(signal.message);
+}
+function legacyAliasesForMessage(message: string): string[] {
+  const aliases = new Set<string>([message]);
+
+  const quotaMatch = message.match(/^\:warning\: \*([^*]+) quota\* ([^:]+): \*[^*]+\* \([^)]*\)$/);
+  if (quotaMatch) {
+    aliases.add(`legacy:quota:${quotaMatch[1]?.toLowerCase()}:${quotaMatch[2]}`);
+  }
+
+  const errorMatch = message.match(/^\:rotating_light\: \*Sandbox ([A-Z_]+)\* (`[^`]+`)(?: — .*)?$/);
+  if (errorMatch) {
+    aliases.add(`legacy:sandbox-error:${errorMatch[1]}:${errorMatch[2]}`);
+  }
+
+  const staleMatch = message.match(/^\:hourglass\: \*Stale sandbox\* (`[^`]+`) running \*\d+h\* \(>= \d+h\)$/);
+  if (staleMatch) {
+    aliases.add(`legacy:sandbox-stale:${staleMatch[1]}`);
+  }
+
+  if (message.startsWith(':chart_with_upwards_trend: *Allocation jump*:')) {
+    aliases.add('legacy:allocation-jump');
+  }
+
+  return [...aliases];
 }
 function input(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona?.inputSpecs?.[name];

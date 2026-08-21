@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 import { parseIntegrations } from '@agentworkforce/persona-kit';
+import { PreviewTransport, bindPreviewTransport } from '@relayfile/relay-helpers';
 
 import agent, { evaluateSignals } from '../.test-build/daytona-monitor/agent.js';
 import persona from '../.test-build/daytona-monitor/persona.js';
@@ -67,7 +68,14 @@ function sandboxWebhookEvent(resource, type = 'daytona.sandbox.state.updated') {
   });
 }
 
-function ctx(memorySaves, inputs = {}) {
+function ctx(
+  memorySaves,
+  inputs = {},
+  snapshot = {
+    running: 1,
+    signature: ':old-alert:',
+  },
+) {
   return {
     persona: {
       inputs: {
@@ -80,14 +88,7 @@ function ctx(memorySaves, inputs = {}) {
       inputSpecs: {},
     },
     memory: {
-      recall: async () => [
-        {
-          content: JSON.stringify({
-            running: 1,
-            signature: ':old-alert:',
-          }),
-        },
-      ],
+      recall: async () => snapshot ? [{ content: JSON.stringify(snapshot) }] : [],
       save: async (content, opts) => {
         memorySaves.push({ content, opts });
         return { id: 'snapshot-1' };
@@ -265,6 +266,75 @@ test('dry-run computes Daytona signals and writes one sensible Slack alert paylo
     });
     assert.equal(JSON.parse(memorySaves[0].content).running, 6);
   } finally {
+    if (oldConfigDir === undefined) delete process.env.DAYTONA_CONFIG_DIR;
+    else process.env.DAYTONA_CONFIG_DIR = oldConfigDir;
+    if (oldMountPath === undefined) delete process.env.RELAYFILE_MOUNT_PATH;
+    else process.env.RELAYFILE_MOUNT_PATH = oldMountPath;
+    if (oldMountRoot === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+    else process.env.RELAYFILE_MOUNT_ROOT = oldMountRoot;
+    if (oldSlackChannel === undefined) delete process.env.SLACK_CHANNEL;
+    else process.env.SLACK_CHANNEL = oldSlackChannel;
+    if (oldWorkspaceRoot === undefined) delete process.env.WORKSPACE_ROOT;
+    else process.env.WORKSPACE_ROOT = oldWorkspaceRoot;
+  }
+});
+
+test('dry-run does not re-alert a stale sandbox just because its displayed hour count changed', async (t) => {
+  const oldAccessToken = process.env.DAYTONA_ACCESS_TOKEN;
+  const oldConfigDir = process.env.DAYTONA_CONFIG_DIR;
+  const oldMountPath = process.env.RELAYFILE_MOUNT_PATH;
+  const oldMountRoot = process.env.RELAYFILE_MOUNT_ROOT;
+  const oldSlackChannel = process.env.SLACK_CHANNEL;
+  const oldWorkspaceRoot = process.env.WORKSPACE_ROOT;
+  const configDir = await writeDaytonaConfig();
+  const mountRoot = await mkdtemp(path.join(os.tmpdir(), 'daytona-monitor-dedupe-'));
+  const firstSaves = [];
+  const secondSaves = [];
+  const staleAt = new Date(FIXED_NOW - 13 * 60 * 60 * 1000).toISOString();
+  let now = FIXED_NOW;
+  const preview = new PreviewTransport();
+  const restoreTransport = bindPreviewTransport(preview);
+
+  try {
+    process.env.DAYTONA_CONFIG_DIR = configDir;
+    process.env.DAYTONA_ACCESS_TOKEN = 'cached-daytona-access';
+    process.env.RELAYFILE_MOUNT_PATH = mountRoot;
+    process.env.RELAYFILE_MOUNT_ROOT = mountRoot;
+    process.env.SLACK_CHANNEL = 'C-daytona-alerts';
+    delete process.env.WORKSPACE_ROOT;
+    t.mock.method(Date, 'now', () => now);
+    t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+      const href = String(url);
+      assert.equal(init.headers.Authorization, 'Bearer cached-daytona-access');
+      assert.equal(init.headers['X-Daytona-Organization-ID'], ORG_ID);
+
+      if (href === `https://app.daytona.io/api/organizations/${ORG_ID}/usage`) {
+        return Response.json({ regionUsage: [] });
+      }
+      if (href === 'https://app.daytona.io/api/sandbox') {
+        return Response.json({
+          items: [{ id: 'stale-1', name: 'old-runner', state: 'started', lastActivityAt: staleAt }],
+        });
+      }
+      assert.fail(`unexpected fetch: ${href}`);
+    });
+
+    await agent.handler(ctx(firstSaves), cronEvent());
+    const firstWrite = preview.actions.find((action) => action.kind === 'provider.write');
+    assert.match(firstWrite?.body?.text ?? '', /Stale sandbox.*old-runner.*13h/);
+
+    const firstSnapshot = JSON.parse(firstSaves[0].content);
+
+    now = FIXED_NOW + 60 * 60 * 1000;
+    await agent.handler(ctx(secondSaves, {}, firstSnapshot), cronEvent());
+
+    const writes = preview.actions.filter((action) => action.kind === 'provider.write');
+    assert.equal(writes.length, 1);
+    assert.deepEqual(JSON.parse(secondSaves[0].content), firstSnapshot);
+  } finally {
+    if (oldAccessToken === undefined) delete process.env.DAYTONA_ACCESS_TOKEN;
+    else process.env.DAYTONA_ACCESS_TOKEN = oldAccessToken;
+    restoreTransport();
     if (oldConfigDir === undefined) delete process.env.DAYTONA_CONFIG_DIR;
     else process.env.DAYTONA_CONFIG_DIR = oldConfigDir;
     if (oldMountPath === undefined) delete process.env.RELAYFILE_MOUNT_PATH;

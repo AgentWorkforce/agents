@@ -312,21 +312,23 @@ async function handleUsageScan(ctx: WorkforceCtx): Promise<void> {
   const last = await loadSnapshot(ctx);
   const usageForSignals = usage ?? {};
   const sandboxesForSignals = sandboxes ?? [];
-  const { alerts, running } = evaluateSignals(usageForSignals, sandboxesForSignals, {
+  const { alerts, signals, running } = evaluateSignals(usageForSignals, sandboxesForSignals, {
     quotaPct,
     staleHours,
     now: Date.now(),
     lastRunning: last?.running
   });
 
-  // Dedupe: only post when the alert *set* changed since we last alerted.
-  const signature = alerts.slice().sort().join('\n');
-  if (alerts.length > 0 && signature !== last?.signature) {
+  // Dedupe on stable fingerprints so a stale sandbox's hour counter does not
+  // turn the same long-lived condition into a fresh alert every run.
+  const signature = alertSignature(signals);
+  const deltaSignals = newlyTriggeredSignals(signals, last?.signature ?? '');
+  if (deltaSignals.length > 0) {
     // Make delivery loud: post() resolves with ts:'' (no throw) when the
     // writeback gets no receipt, so an empty ts is a silent drop, not success.
     const res = await slackClient().post(
       channel,
-      `:satellite: *Daytona monitor* — org \`${orgId}\`\n${alerts.join('\n')}`
+      `:satellite: *Daytona monitor* — org \`${orgId}\`\n${deltaSignals.map((signal) => signal.message).join('\n')}`
     );
     if (!res.ts) throw new Error(`Slack post to ${channel} got no writeback receipt (silent drop)`);
   }
@@ -345,6 +347,11 @@ export interface SignalOptions {
   lastRunning?: number;
 }
 
+interface AlertSignal {
+  fingerprint: string;
+  message: string;
+}
+
 /**
  * Pure signal evaluation — given a usage payload and the full sandbox list,
  * return the Slack alert lines plus the current running count. No IO, no clock
@@ -357,9 +364,9 @@ export function evaluateSignals(
   usage: UsageResponse,
   sandboxes: Sandbox[],
   opts: SignalOptions
-): { alerts: string[]; running: number } {
+): { alerts: string[]; signals: AlertSignal[]; running: number } {
   const { quotaPct, staleHours, now } = opts;
-  const alerts: string[] = [];
+  const signals: AlertSignal[] = [];
 
   // (a) quota nearing limit, per region/class, per resource.
   for (const r of usage.regionUsage ?? []) {
@@ -372,7 +379,10 @@ export function evaluateSignals(
       if (!total || used == null) continue;
       const pct = Math.round((used / total) * 100);
       if (pct >= quotaPct) {
-        alerts.push(`:warning: *${name} quota* ${where}: *${pct}%* (${used}/${total})`);
+        signals.push({
+          fingerprint: `quota:${where}:${name.toLowerCase()}`,
+          message: `:warning: *${name} quota* ${where}: *${pct}%* (${used}/${total})`,
+        });
       }
     }
   }
@@ -383,27 +393,36 @@ export function evaluateSignals(
     const state = (s.state ?? '').toUpperCase();
     if (!ERROR_STATES.has(state)) continue;
     const why = s.errorReason ? ` — ${s.errorReason}` : '';
-    alerts.push(`:rotating_light: *Sandbox ${state}* ${label(s)}${why}`);
+    signals.push({
+      fingerprint: `sandbox-error:${state}:${sandboxIdentity(s)}`,
+      message: `:rotating_light: *Sandbox ${state}* ${label(s)}${why}`,
+    });
   }
 
   // (c) stale running: STARTED longer than STALE_HOURS.
   const staleMs = staleHours * 3_600_000;
   for (const s of sandboxes) {
     if ((s.state ?? '').toUpperCase() !== 'STARTED') continue;
-    const started = Date.parse(s.createdAt ?? s.updatedAt ?? '');
+    const started = Date.parse(s.lastActivityAt ?? s.createdAt ?? s.updatedAt ?? '');
     if (!Number.isNaN(started) && now - started >= staleMs) {
       const hrs = Math.floor((now - started) / 3_600_000);
-      alerts.push(`:hourglass: *Stale sandbox* ${label(s)} running *${hrs}h* (>= ${staleHours}h)`);
+      signals.push({
+        fingerprint: `sandbox-stale:${sandboxIdentity(s)}`,
+        message: `:hourglass: *Stale sandbox* ${label(s)} running *${hrs}h* (>= ${staleHours}h)`,
+      });
     }
   }
 
   // (d) allocation jump vs last run.
   const running = sandboxes.filter((s) => (s.state ?? '').toUpperCase() === 'STARTED').length;
   if (opts.lastRunning != null && running - opts.lastRunning >= 5) {
-    alerts.push(`:chart_with_upwards_trend: *Allocation jump*: running sandboxes ${opts.lastRunning} → *${running}*`);
+    signals.push({
+      fingerprint: `allocation-jump:${opts.lastRunning}->${running}`,
+      message: `:chart_with_upwards_trend: *Allocation jump*: running sandboxes ${opts.lastRunning} → *${running}*`,
+    });
   }
 
-  return { alerts, running };
+  return { alerts: signals.map((signal) => signal.message), signals, running };
 }
 
 /**
@@ -557,6 +576,22 @@ function asList<T>(payload: unknown): T[] {
 }
 function label(s: Sandbox): string {
   return `\`${s.name ?? s.id ?? 'unknown'}\``;
+}
+function sandboxIdentity(s: Sandbox): string {
+  return s.id ?? s.name ?? 'unknown';
+}
+function alertSignature(signals: readonly AlertSignal[]): string {
+  return signals.map((signal) => signal.fingerprint).sort().join('\n');
+}
+function parseAlertSignature(signature: string): Set<string> {
+  return new Set(signature.split('\n').map((value) => value.trim()).filter(Boolean));
+}
+function newlyTriggeredSignals(
+  signals: readonly AlertSignal[],
+  previousSignature: string,
+): AlertSignal[] {
+  const previous = parseAlertSignature(previousSignature);
+  return signals.filter((signal) => !previous.has(signal.fingerprint));
 }
 function input(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona?.inputSpecs?.[name];

@@ -98,7 +98,7 @@ function readAccessMetadata(value: unknown): CloudIntegrationActionAccess | null
     return null;
   }
 
-  const access = {
+  const access: CloudIntegrationActionAccess = {
     credentialSource,
     ...(endpointHost ? { endpointHost } : {}),
   };

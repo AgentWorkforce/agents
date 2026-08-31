@@ -377,9 +377,12 @@ function normalizeListenResponse(value: unknown): ListenResponse {
     ...(rawSourceStatus
       ? {
           source_status: Object.fromEntries(
-            Object.entries(rawSourceStatus)
-              .filter(([, status]) => isRecord(status))
-              .map(([source, status]) => [
+            Object.entries(rawSourceStatus).flatMap(([source, status]) => {
+              if (!isRecord(status)) {
+                return [];
+              }
+
+              return [[
                 source,
                 {
                   ...(readString(status, 'status') ? { status: readString(status, 'status') } : {}),
@@ -393,7 +396,8 @@ function normalizeListenResponse(value: unknown): ListenResponse {
                     ? { error: status.error as string | null }
                     : {}),
                 },
-              ]),
+              ] as const];
+            }),
           ),
         }
       : {}),

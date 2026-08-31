@@ -1067,3 +1067,117 @@ test('gateway failures expose only an allowlisted code to logs and the user', as
   assert.match(observable, /provider-auth-failed/);
   assert.doesNotMatch(observable, /upstream body|credential-shaped|sensitive detail/);
 });
+
+test('an all-sources-failed response is reported as a source outage, not an empty market', () => {
+  const answer = renderListenAnswer(
+    'Acme migration pain',
+    {
+      meta: { fetched_at: '2026-08-31T21:11:12.491874Z', total_results: 0 },
+      results: [],
+      source_status: {
+        reddit: { status: 'error', count: 0, error: "Client error '403 Blocked' for url ..." },
+      },
+    },
+    [],
+    { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+  );
+
+  assert.match(answer, /every queried source failed \(reddit\)/);
+  assert.match(answer, /source outage, not a finding that nothing was posted/);
+  // The misleading empty-market phrasing must not survive a total outage, and
+  // an outage carries no source facts to reason over.
+  assert.doesNotMatch(answer, /No results were returned\./);
+  assert.doesNotMatch(answer, /themes or intent require separate inference/);
+});
+
+test('a partially-failed response flags the missing source alongside the evidence it did get', () => {
+  const answer = renderListenAnswer(
+    'Acme migration pain',
+    {
+      meta: { fetched_at: '2026-08-31T21:11:12.491874Z', total_results: 1 },
+      results: [],
+      source_status: {
+        reddit: { status: 'ok', count: 1 },
+        hackernews: { status: 'error', count: 0, error: 'unsupported_platform' },
+      },
+    },
+    [{ platform: 'reddit', source_id: 'post-1', title: 'Result', url: 'https://example.test/1' }],
+    { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+  );
+
+  assert.match(answer, /Partial coverage: hackernews failed this request/);
+  assert.match(answer, /1\. Result/);
+  assert.match(answer, /themes or intent require separate inference/);
+});
+
+test('a genuine empty result set is still reported as no results', () => {
+  const answer = renderListenAnswer(
+    'Acme migration pain',
+    {
+      meta: { fetched_at: '2026-08-31T21:11:12.491874Z', total_results: 0 },
+      results: [],
+      source_status: { reddit: { status: 'ok', count: 0 } },
+    },
+    [],
+    { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+  );
+
+  assert.match(answer, /No results were returned\./);
+  assert.doesNotMatch(answer, /source outage/);
+});
+
+test('a sweep run whose sources all failed releases its claim and retries the same window', async () => {
+  const now = new Date('2026-08-07T12:00:00.000Z');
+  const watch = createWatch('Acme migration pain', '15m', 'requester', now);
+  const cas = createCasStore(emptyWatchState([watch]));
+  const sent = [];
+  const logs = [];
+  let gatewayCalls = 0;
+  const ctx = {
+    log(level, message, fields) { logs.push({ level, message, fields }); },
+    relay: {
+      async dm(to, text) { sent.push({ to, text }); return { ok: true, messageId: 'message-ok' }; },
+    },
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      gatewayCalls += 1;
+      // First sweep sees the outage; the second sees the post that was
+      // published during the window the outage would otherwise have consumed.
+      if (gatewayCalls === 1) {
+        return {
+          data: {
+            meta: { fetched_at: '2026-08-07T12:00:01.000Z' },
+            results: [],
+            source_status: { reddit: { status: 'error', count: 0, error: '403 Blocked' } },
+          },
+          access: { credentialSource: 'user', endpointHost: 'provider.example' },
+        };
+      }
+      return {
+        data: {
+          meta: { fetched_at: '2026-08-07T12:00:02.000Z' },
+          results: [{ platform: 'reddit', source_id: 'post-1', title: 'Posted during the outage' }],
+          source_status: { reddit: { status: 'ok', count: 1 } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'provider.example' },
+      };
+    },
+  };
+
+  await runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-outage');
+  let persisted = cas.state().watches[0];
+  assert.equal(persisted.lastRunAt, undefined, 'an outage must not consume the window');
+  assert.deepEqual(persisted.seenIds, []);
+  assert.equal(persisted.runClaim, undefined, 'the claim must be released for the retry');
+  assert.equal(sent.length, 0, 'an outage is not a delivery');
+  assert.ok(logs.some((entry) => entry.message === 'askable-gtm.watch-source-outage'));
+
+  await runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-recovered');
+  persisted = cas.state().watches[0];
+  assert.deepEqual(persisted.seenIds, ['reddit:post-1']);
+  assert.equal(persisted.lastRunAt, now.toISOString());
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /Posted during the outage/);
+});

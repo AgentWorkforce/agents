@@ -680,6 +680,17 @@ export async function runWatchSweep(
     try {
       const result = await queryListen(watch.query, gateway);
       const response = result.data;
+      // Every source failed: the empty result set describes the provider, not
+      // the window. Committing it would advance `lastRunAt` past a window whose
+      // posts were never actually seen, so release the claim and retry instead.
+      if (classifyListenCoverage(response).coverage === 'failed') {
+        await releaseWatchClaim(store, watch.id, watch.runClaim?.id).catch(() => undefined);
+        ctx.log('warn', 'askable-gtm.watch-source-outage', {
+          watchId: watch.id,
+          failedSources: classifyListenCoverage(response).failedSources,
+        });
+        continue;
+      }
       const results = response.results ?? [];
       const previous = new Set(watch.seenIds);
       const fresh = results.filter((result) => {
@@ -740,6 +751,49 @@ async function answerQuestion(
   }
 }
 
+/**
+ * Revternal reports per-source outcomes in `source_status`. A source that
+ * failed returns zero rows, so a response where every queried source errored is
+ * indistinguishable from "nothing was posted" if you only read `results`.
+ * Reporting that as an empty result set would present a provider outage as a
+ * finding about the market, which is exactly the gap this persona must never
+ * fill. Classify the run instead, and let callers fail closed.
+ */
+export type ListenCoverage = 'ok' | 'degraded' | 'failed';
+
+export interface ListenCoverageReport {
+  coverage: ListenCoverage;
+  okSources: string[];
+  failedSources: string[];
+}
+
+function sourceStatusFailed(status: { status?: string; error?: string | null }): boolean {
+  const label = status.status?.trim().toLowerCase();
+  if (label === 'error' || label === 'failed' || label === 'failure') return true;
+  return typeof status.error === 'string' && status.error.trim().length > 0;
+}
+
+export function classifyListenCoverage(response: ListenResponse): ListenCoverageReport {
+  const entries = Object.entries(response.source_status ?? {});
+  const okSources: string[] = [];
+  const failedSources: string[] = [];
+  for (const [source, status] of entries) {
+    if (sourceStatusFailed(status)) failedSources.push(source);
+    else okSources.push(source);
+  }
+
+  // No `source_status` at all is not evidence of failure — the documented
+  // response makes the group optional — so treat it as reported-ok coverage.
+  if (failedSources.length === 0) {
+    return { coverage: 'ok', okSources, failedSources };
+  }
+  return {
+    coverage: okSources.length === 0 ? 'failed' : 'degraded',
+    okSources,
+    failedSources,
+  };
+}
+
 export function renderListenAnswer(
   query: string,
   response: ListenResponse,
@@ -757,13 +811,31 @@ export function renderListenAnswer(
     const url = result.url ?? result.permalink ?? '';
     return `${index + 1}. ${title}${community}${engagement}${url ? `\n${url}` : ''}`;
   });
+  const report = classifyListenCoverage(response);
+  const failed = formatSourceList(report.failedSources);
   return [
     `Public-signal evidence for “${oneLine(query)}”`,
     `Fetched: ${fetchedAt} · coverage: ${coverage}`,
     ...(access ? [renderAccessDisclosure(access)] : []),
-    items.length ? items.join('\n') : 'No results were returned.',
-    'Source facts are shown above; themes or intent require separate inference.',
+    ...(report.coverage === 'degraded'
+      ? [`Partial coverage: ${failed} failed this request, so anything posted there is missing below.`]
+      : []),
+    items.length
+      ? items.join('\n')
+      : report.coverage === 'failed'
+        ? `No evidence could be gathered: every queried source failed (${failed}). `
+          + 'This is a source outage, not a finding that nothing was posted. Retry later.'
+        : 'No results were returned.',
+    ...(report.coverage === 'failed'
+      ? []
+      : ['Source facts are shown above; themes or intent require separate inference.']),
   ].join('\n');
+}
+
+function formatSourceList(sources: readonly string[]): string {
+  if (sources.length === 0) return 'no sources';
+  if (sources.length === 1) return sources[0]!;
+  return `${sources.slice(0, -1).join(', ')} and ${sources[sources.length - 1]}`;
 }
 
 export function renderCapabilities(gatewayStatus: ListenGateway['status']): string {

@@ -683,11 +683,12 @@ export async function runWatchSweep(
       // Every source failed: the empty result set describes the provider, not
       // the window. Committing it would advance `lastRunAt` past a window whose
       // posts were never actually seen, so release the claim and retry instead.
-      if (classifyListenCoverage(response).coverage === 'failed') {
+      const sweepCoverage = classifyListenCoverage(response);
+      if (sweepCoverage.coverage === 'failed') {
         await releaseWatchClaim(store, watch.id, watch.runClaim?.id).catch(() => undefined);
         ctx.log('warn', 'askable-gtm.watch-source-outage', {
           watchId: watch.id,
-          failedSources: classifyListenCoverage(response).failedSources,
+          failedSources: sweepCoverage.failedSources,
         });
         continue;
       }
@@ -1135,8 +1136,13 @@ export async function deliverToOwner(
   const target = decodeOwner(owner);
   if (target.transport === 'slack') {
     const result = await (deps.slack ?? defaultSlackDirectMessenger()).dm(target.id, text);
+    // A missing `ts` means Slack never acknowledged the write. Treat it the
+    // same way `replyRelay` treats `ok: false`: throw, so the sweep releases
+    // the claim and retries. Logging and returning would let
+    // `finalizeWatchRun` commit `seenIds` for evidence the user never saw.
     if (!result?.ts) {
       ctx.log('warn', 'askable-gtm.slack-watch-delivery-no-receipt', { user: target.id });
+      throw new Error(`Slack DM delivery failed for ${target.id}`);
     }
     return;
   }

@@ -1181,3 +1181,35 @@ test('a sweep run whose sources all failed releases its claim and retries the sa
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /Posted during the outage/);
 });
+
+test('a Slack watch delivery with no receipt does not consume results', async () => {
+  // Relay delivery already throws on `ok: false` so the sweep can retry. Slack
+  // must behave the same way: a missing `ts` means Slack never acknowledged
+  // the write, and committing seenIds would drop evidence the user never saw.
+  const now = new Date('2026-08-07T12:00:00.000Z');
+  const watch = createWatch('Acme migration pain', '15m', 'slack:U_WATCHER', now);
+  const cas = createCasStore(emptyWatchState([watch]));
+  let dmAttempts = 0;
+  const ctx = {
+    log() {},
+    relay: {
+      async dm() { throw new Error('relay dm must not be used for a Slack owner'); },
+    },
+  };
+  const slack = {
+    async dm() {
+      dmAttempts += 1;
+      // First write is dropped by Slack, second is acknowledged.
+      return dmAttempts === 1 ? {} : { ts: '400.4' };
+    },
+  };
+
+  await assert.rejects(
+    () => deliverToOwner(ctx, watch.owner, 'watch update', { slack }),
+    /Slack DM delivery failed for U_WATCHER/,
+  );
+  assert.equal(dmAttempts, 1);
+
+  await deliverToOwner(ctx, watch.owner, 'watch update', { slack });
+  assert.equal(dmAttempts, 2);
+});

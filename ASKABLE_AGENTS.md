@@ -7,6 +7,7 @@ Two blockers stop it from being useful, and neither is in this repo.
 | Layer | State | Evidence |
 | --- | --- | --- |
 | Persona compile + deploy | working | `agentworkforce deploy --mode cloud`, agent `2a378956-…`, schedule `EDfP6zNdCiTNhTHbUckVZ` firing every 15m |
+| 15-minute watch sweep | working (was broken on `main`) | every tick died with `Durable watch state read failed (400)` — Relayfile rejects an `/fs/file` request with no `x-correlation-id`. Fixed here; the 22:46 UTC tick succeeded |
 | Cloud action gateway → Nango → Revternal | working | `POST /integrations/revternal/actions/social-listen` returns HTTP 200 with `credentialSource: "user"` |
 | Revternal Reddit fetcher | **BLOCKED (vendor)** | `GET https://api.revternal.com/reddit/health` → `reddit_api: error, "Unexpected status: 403"` |
 | Relay DM → deployed agent | **BLOCKED (platform)** | the gateway registers `inbox: ["@self"]` and its alarm fires, but no DM ever dispatches; fix in cloud PR #3230 |

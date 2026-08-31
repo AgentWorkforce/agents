@@ -1213,3 +1213,72 @@ test('a Slack watch delivery with no receipt does not consume results', async ()
   await deliverToOwner(ctx, watch.owner, 'watch update', { slack });
   assert.equal(dmAttempts, 2);
 });
+
+test('watch state requests carry a correlation id on both read and write', async () => {
+  // Relayfile answers an /fs/file request with no correlation id with HTTP 400.
+  // Dropping the header broke every production sweep before it could read a
+  // single watch, so assert it on both verbs.
+  const requests = [];
+  const responses = [
+    new Response(null, { status: 404 }),
+    new Response(JSON.stringify({ revision: '1' }), {
+      status: 200,
+      headers: { etag: '1' },
+    }),
+  ];
+  const store = createRelayfileWatchStateStore({
+    log() {},
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'test-token-placeholder',
+            workspaceId: 'workspace-test',
+          },
+        };
+      },
+    },
+  }, async (input, init) => {
+    requests.push(new Request(input, init));
+    return responses.shift();
+  });
+
+  const snapshot = await store.read();
+  assert.equal(snapshot.revision, '0');
+  assert.equal(await store.compareAndSet(snapshot.revision, snapshot.state), true);
+
+  assert.equal(requests[0].method, 'GET');
+  assert.match(requests[0].headers.get('x-correlation-id'), /^askable-gtm-watch-state-read-/);
+  assert.equal(requests[1].method, 'PUT');
+  assert.equal(requests[1].headers.get('if-match'), '0');
+  assert.match(requests[1].headers.get('x-correlation-id'), /^askable-gtm-watch-state-write-/);
+});
+
+test('a failed watch state read logs a diagnosis without leaking the token', async () => {
+  const logs = [];
+  const store = createRelayfileWatchStateStore({
+    log(level, message, fields) { logs.push({ level, message, fields }); },
+    credentials: {
+      tryRequire() {
+        return {
+          relayfile: {
+            url: 'https://relayfile.example',
+            token: 'relay_pa_abcdefghijklmnopqrstuvwxyz012345',
+            workspaceId: 'workspace-test',
+          },
+        };
+      },
+    },
+  }, async () => new Response(
+    'bad request for relay_pa_abcdefghijklmnopqrstuvwxyz012345',
+    { status: 400 },
+  ));
+
+  await assert.rejects(() => store.read(), /Durable watch state read failed \(400\)/);
+  const diag = logs.find((entry) => entry.message === 'askable-gtm.watch-state-read-diag');
+  assert.ok(diag, 'a failed read must explain itself');
+  assert.equal(diag.fields.status, 400);
+  assert.equal(diag.fields.tokenKind, 'relay_pa');
+  assert.doesNotMatch(JSON.stringify(diag), /relay_pa_abcdefghijklmnopqrstuvwxyz012345/);
+});

@@ -884,12 +884,27 @@ export function createRelayfileWatchStateStore(
     async read() {
       const response = await fetchImpl(fileUrl, {
         method: 'GET',
-        headers: { authorization: `Bearer ${credentials.token}` },
+        headers: {
+          authorization: `Bearer ${credentials.token}`,
+          'x-correlation-id': createWatchStateCorrelationId('read'),
+        },
       });
       if (response.status === 404) {
         return { state: emptyWatchState(), revision: '0' };
       }
       if (!response.ok) {
+        // A failed read aborts the whole sweep, so say why. Without this the
+        // only signal is a bare status code in the run's error field.
+        const responseBodyExcerpt = sanitizeWatchStateReadFailureBody(await response.text());
+        ctx.log('error', 'askable-gtm.watch-state-read-diag', {
+          status: response.status,
+          workspaceId: credentials.workspaceId,
+          relayfileUrl: credentials.url,
+          requestUrl: fileUrl.toString(),
+          path: WATCH_STATE_PATH,
+          tokenKind: classifyRelayfileToken(credentials.token),
+          responseBodyExcerpt,
+        });
         throw new Error(`Durable watch state read failed (${response.status})`);
       }
       const body = await response.json() as { content?: unknown; revision?: unknown };
@@ -910,6 +925,7 @@ export function createRelayfileWatchStateStore(
           authorization: `Bearer ${credentials.token}`,
           'content-type': 'application/json',
           'if-match': expectedRevision,
+          'x-correlation-id': createWatchStateCorrelationId('write'),
         },
         body: JSON.stringify(state),
       });
@@ -1169,6 +1185,33 @@ function safeDisplayHost(value: string): string {
 
 function safeGatewayErrorCode(error: unknown): ListenGatewayErrorCode {
   return error instanceof ListenGatewayError ? error.code : 'request-failed';
+}
+
+function classifyRelayfileToken(token: string): string {
+  if (token.startsWith('relay_pa_')) return 'relay_pa';
+  if (token.startsWith('relay_ws_')) return 'relay_ws';
+  if (token.trim().length === 0) return 'missing';
+  return 'other';
+}
+
+/**
+ * Relayfile rejects an `/fs/file` request that carries no correlation id with
+ * HTTP 400. Dropping this header silently broke every sweep in production —
+ * the run failed before it could read a single watch — so it is required, not
+ * decorative.
+ */
+function createWatchStateCorrelationId(action: 'read' | 'write'): string {
+  return `askable-gtm-watch-state-${action}-${randomUUID()}`;
+}
+
+/** Failure bodies can echo a token; never let one reach a log. */
+function sanitizeWatchStateReadFailureBody(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  return trimmed
+    .replace(/\brelay_(?:pa|ws)_[A-Za-z0-9_-]+\b/gu, '[redacted-relay-token]')
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/gu, '[redacted-long-token]')
+    .slice(0, 400);
 }
 
 function renderGatewayFailure(code: ListenGatewayErrorCode): string {

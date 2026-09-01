@@ -71,6 +71,14 @@ interface InteractiveActor {
   ownerKey: string;
   reply(text: string): Promise<void>;
   owns(watchOwner: string): boolean;
+  /**
+   * Transport-specific presentation for a machine-readable payload. Relay is a
+   * machine surface — `capabilities --json` is documented as a parseable
+   * response and an agent or catalog calls `JSON.parse` on it — so relay leaves
+   * it exactly as-is. Slack is a human surface, where an unfenced 4KB blob is
+   * an unreadable wall, so Slack fences it. Default: unchanged.
+   */
+  presentJson?(json: string): string;
 }
 
 interface SlackDirectMessenger {
@@ -623,7 +631,15 @@ export async function handleSlackMessage(
     {
       ownerKey: slackOwnerKey(message.user),
       owns: (owner) => owner === slackOwnerKey(message.user!),
-      reply: (text) => postReply(ctx, deps.slack ?? defaultSlack(), message, text),
+      // Answer a top-level mention in a thread beneath it. Several agents share
+      // one Slack identity, so a single `@Agent Relay` mention can draw a reply
+      // from each of them; threading keeps the channel readable and each answer
+      // attached to its question. This persona keeps no cross-turn Slack
+      // context, so moving the conversation unit to the thread costs nothing.
+      reply: (text) => postReply(ctx, deps.slack ?? defaultSlack(), message, text, {
+        startThread: true,
+      }),
+      presentJson: presentJsonForSlack,
     },
     stripLeadingMention(message.text).trim(),
     gateway,
@@ -640,7 +656,8 @@ async function handleInteractiveCommand(
 ): Promise<void> {
   const command = parseCommand(text);
   if (command.kind === 'capabilities-json') {
-    await actor.reply(renderCapabilitiesJson(gateway.status));
+    const json = renderCapabilitiesJson(gateway.status);
+    await actor.reply(actor.presentJson ? actor.presentJson(json) : json);
     return;
   }
   if (command.kind === 'capabilities-human') {
@@ -996,25 +1013,29 @@ function formatSourceList(sources: readonly string[]): string {
 }
 
 /**
- * The machine-readable manifest, kept legible for the human who asked. Slack
- * renders an unfenced 4KB blob as an unreadable wall, so pretty-print it inside
- * a fenced block and lead with one line saying what it is and what actually
- * works — nobody should have to parse JSON to find out they can just ask a
- * question in plain language.
+ * The machine-readable manifest, as standalone parseable JSON. Presentation is
+ * the transport's business: `ASKABLE_AGENTS.md` documents this command as a
+ * machine-readable relay response, so wrapping it here would break
+ * `JSON.parse` for every agent and catalog that calls it.
  */
 export function renderCapabilitiesJson(gatewayStatus: ListenGateway['status']): string {
+  return JSON.stringify({
+    type: 'askable.capabilities',
+    capability: ASKABLE_GTM_CAPABILITY,
+    runtimeDataAccess: gatewayStatus === 'configured'
+      ? 'cloud-integration-action-gateway-configured-authorization-checked-per-request'
+      : 'blocked-missing-cloud-runtime-credentials',
+  }, null, 2);
+}
+
+/** Slack presentation: fence the payload so Slack renders it as code. */
+export function presentJsonForSlack(json: string): string {
   return [
     'GTM Signal Scout — machine-readable capability manifest.',
     'You can also just ask a GTM question in plain language, or send'
       + ' \u201cwhat can you tell me?\u201d for the short version.',
     '```json',
-    JSON.stringify({
-      type: 'askable.capabilities',
-      capability: ASKABLE_GTM_CAPABILITY,
-      runtimeDataAccess: gatewayStatus === 'configured'
-        ? 'cloud-integration-action-gateway-configured-authorization-checked-per-request'
-        : 'blocked-missing-cloud-runtime-credentials',
-    }, null, 2),
+    json,
     '```',
   ].join('\n');
 }

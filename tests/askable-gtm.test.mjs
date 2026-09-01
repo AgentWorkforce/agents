@@ -17,6 +17,7 @@ import {
   normalizeLinkedInResponse,
   queryListen,
   renderCapabilities,
+  presentJsonForSlack,
   renderCapabilitiesJson,
   renderListenAnswer,
   runWatchSweep,
@@ -1429,23 +1430,51 @@ test('a failed source is named with its reason while the healthy source still an
   assert.equal(access.credentialSource, 'user');
 });
 
-test('capabilities --json is fenced and led by a human-readable line', () => {
-  // Slack renders an unfenced 4KB blob as an unreadable wall of text.
+test('capabilities --json stays standalone parseable JSON', () => {
+  // ASKABLE_AGENTS.md documents this as a MACHINE-readable relay response: an
+  // agent or catalog calls JSON.parse on it. Presentation belongs to the
+  // transport, never to the payload.
   const out = renderCapabilitiesJson('configured');
-  const [lead] = out.split('\n');
-  assert.match(lead, /GTM Signal Scout/);
-  assert.doesNotMatch(lead, /^\{/, 'the first line must not be raw JSON');
-  assert.match(out, /```json\n/);
-  assert.match(out, /\n```$/);
-
-  // The payload is still the real, parseable manifest.
-  const fenced = out.slice(out.indexOf('```json\n') + 8, out.lastIndexOf('\n```'));
-  const parsed = JSON.parse(fenced);
+  const parsed = JSON.parse(out);
   assert.equal(parsed.type, 'askable.capabilities');
   assert.equal(parsed.capability.kind, 'gtm-signal-scout');
   assert.match(parsed.runtimeDataAccess, /^cloud-integration-action-gateway-configured/);
-  // Pretty-printed, not minified.
-  assert.ok(fenced.includes('\n  '), 'manifest should be indented for reading');
+  assert.ok(out.includes('\n  '), 'pretty-printed, so a human reading raw output can follow it');
+});
+
+test('Slack presentation fences the manifest without corrupting it', () => {
+  const json = renderCapabilitiesJson('configured');
+  const shown = presentJsonForSlack(json);
+  const [lead] = shown.split('\n');
+  assert.match(lead, /GTM Signal Scout/);
+  assert.doesNotMatch(lead, /^\{/, 'the first line must not be raw JSON');
+  assert.match(shown, /```json\n/);
+  assert.match(shown, /\n```$/);
+  // The fenced payload must still round-trip.
+  const fenced = shown.slice(shown.indexOf('```json\n') + 8, shown.lastIndexOf('\n```'));
+  assert.deepEqual(JSON.parse(fenced), JSON.parse(json));
+});
+
+test('relay receives raw JSON while Slack receives the fenced form', async () => {
+  const relaySent = [];
+  const ctx = {
+    log() {},
+    memory: { async recall() { return []; }, async save() {} },
+    relay: { async dm(to, text) { relaySent.push(text); return { ok: true, messageId: 'm' }; } },
+  };
+  const event = envelopeToAgentEvent({
+    id: 'evt-caps', workspace: 'workspace-test', type: 'relaycast.message',
+    occurredAt: '2026-09-01T10:00:00Z',
+    summary: { actor: { id: 'requester' } },
+    resource: { text: 'capabilities --json' },
+  });
+  await handleRelayMessage(ctx, event, { status: 'configured', async listen() { throw new Error('unused'); } });
+
+  assert.equal(relaySent.length, 1);
+  // The whole point: this must not throw.
+  const parsed = JSON.parse(relaySent[0]);
+  assert.equal(parsed.type, 'askable.capabilities');
+  assert.doesNotMatch(relaySent[0], /```/, 'relay must never receive markdown fences');
 });
 
 test('an existing thread is answered in that thread, not a new one', async () => {

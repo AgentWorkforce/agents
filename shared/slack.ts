@@ -102,10 +102,20 @@ export function bareChannelId(channel: string): string {
  * Conversation key for continuity. A threaded message keys on its thread; a
  * top-level message keys on the CHANNEL itself, so consecutive top-level
  * messages in a dedicated chat channel form one continuous conversation.
+ *
+ * `startThread` must match what was passed to {@link postReply}. An agent that
+ * answers a top-level mention in a new thread has made that thread the
+ * conversation, so the opening turn keys on its own ts — otherwise the reply
+ * lands under `channel:ts` while the opening turn sits under `channel`, and the
+ * follow-up prompt loses the question it is answering.
  */
-export function conversationKeyForSlack(msg: SlackMessage): string {
+export function conversationKeyForSlack(
+  msg: SlackMessage,
+  options: SlackReplyOptions = {},
+): string {
   const chanId = bareChannelId(msg.channel);
-  return msg.threadTs ? `${chanId}:${msg.threadTs}` : chanId;
+  const threadTs = msg.threadTs ?? (options.startThread ? msg.ts : undefined);
+  return threadTs ? `${chanId}:${threadTs}` : chanId;
 }
 
 /**
@@ -123,19 +133,32 @@ export function skipReason(msg: SlackMessage, boardChannel: string | undefined):
 
 /** Post the reply (threaded if the incoming message was in a thread). Loud-ish:
  *  a missing receipt is logged (cloud writeback often outruns the wait). */
+export type SlackReplyOptions = {
+  /**
+   * Answer a top-level mention in a NEW thread beneath it rather than in the
+   * channel. Off by default; see the note in the body before enabling.
+   */
+  startThread?: boolean;
+};
+
 export async function postReply(
   ctx: WorkforceCtx,
   slack: SlackPoster,
   msg: SlackMessage,
-  text: string
+  text: string,
+  options: SlackReplyOptions = {}
 ): Promise<void> {
   const chanId = bareChannelId(msg.channel);
-  // Always answer in a thread: reply under the incoming message when it is
-  // top-level, and inside the existing thread otherwise. A channel-level reply
-  // buries the conversation in the main channel, which is worst exactly where
-  // agents are useful — several agents share one Slack identity, so a single
-  // `@Agent Relay` mention can draw a reply from each of them.
-  const threadTs = msg.threadTs ?? msg.ts;
+  // `startThread` opts an agent into answering a TOP-LEVEL mention inside a new
+  // thread under it. It is opt-in, not the default, because it changes the
+  // conversation unit: `conversationKeyForSlack` keys a top-level message on
+  // the channel so consecutive top-level messages form one continuous
+  // conversation, and silently threading them would strand that history under
+  // a different key (see inbox-buddy's multi-turn context).
+  //
+  // An agent that opts in must also key continuity on the thread — use
+  // `conversationKeyForSlack(msg, { startThread: true })`.
+  const threadTs = msg.threadTs ?? (options.startThread ? msg.ts : undefined);
   const result = threadTs
     ? await slack.reply(chanId, threadTs, text)
     : await slack.post(chanId, text);

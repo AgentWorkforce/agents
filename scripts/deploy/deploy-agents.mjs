@@ -139,23 +139,31 @@ export function personaPaths(agent, root = ROOT) {
   return { personaTs, personaJson: personaTs.replace(/persona\.ts$/u, 'persona.json') };
 }
 
-/** The `inputs` map a compiled persona declares, or `{}` when it declares none. */
 /**
  * Provider names this persona declares. Used to turn a bare "deploy failed"
  * into an actionable next step, since an unconnected provider is the most
  * common first-run failure and the CLI error does not name one.
  */
-export function readPersonaIntegrationNames(personaJsonPath) {
+export function readPersonaIntegrationNames(personaJsonPath, resolvedInputs = {}) {
   if (!existsSync(personaJsonPath)) return [];
   try {
     const persona = JSON.parse(readFileSync(personaJsonPath, 'utf8'));
     const integrations = persona?.integrations;
-    if (!integrations || typeof integrations !== 'object') return [];
-    // Optional providers (e.g. slack, gated behind an input) are not what a
-    // failed deploy is complaining about — listing them as required sends
-    // people to connect something they may not want.
+    // `typeof [] === 'object'`, and Object.entries on an array yields "0" —
+    // which would tell someone to connect a provider named `0`.
+    if (!integrations || typeof integrations !== 'object' || Array.isArray(integrations)) {
+      return [];
+    }
     return Object.entries(integrations)
-      .filter(([, config]) => !(config && typeof config === 'object' && config.optional === true))
+      .filter(([, config]) => {
+        if (!config || typeof config !== 'object' || config.optional !== true) return true;
+        // An optional provider gated behind an input becomes required the
+        // moment that input is supplied — deploying askable-gtm WITH
+        // SLACK_CHANNEL really does need Slack connected. Only drop the ones
+        // still dormant.
+        const gate = config.enabledByInput;
+        return typeof gate === 'string' && Boolean(resolvedInputs[gate]);
+      })
       .map(([name]) => name)
       .sort();
   } catch {
@@ -344,11 +352,14 @@ export function deployAgents({
       // connected yet — `--no-connect` fails rather than starting a connect
       // flow, and the CLI error alone does not tell you where to go. Name the
       // providers this persona needs and where to connect them.
-      const providers = readPersonaIntegrationNames(personaJson);
+      // Any nonzero exit reaches here — expired credentials, a backend fault,
+      // an invalid persona. So offer the providers as something to CHECK, and
+      // point at the CLI's own error for the cause; asserting a missing
+      // integration would send people away from the real stderr above.
+      const providers = readPersonaIntegrationNames(personaJson, inputs);
       if (providers.length > 0) {
-        log.error(
-          `  ${agent.name} needs these providers connected first: ${providers.join(', ')}.`,
-        );
+        log.error(`  See the error above. If it names an integration, verify these are`
+          + ` connected for ${agent.name}: ${providers.join(', ')}.`);
         log.error(
           '  Connect them in Workspace Integrations (/integrations) — that is where you'
             + ' paste each provider\'s API key. Providers hold their own credentials;'

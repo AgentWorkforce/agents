@@ -51,9 +51,10 @@ schedule of its own. Saved watches deliver only posts you have not been sent.
 What it will and won't say
 --------------------------
 
-Every claim carries its source: URL, timestamp, author, engagement, and an
-excerpt. A post that did not come back from the provider never appears in an
-answer.
+Every claim is a real post, cited with whatever the provider returned for it —
+URL, timestamp, author, engagement, excerpt. A post that did not come back from
+the provider never appears in an answer, and a field the provider omitted is
+left out rather than guessed.
 
 When the provider fails, the answer says so rather than returning a short list
 as if that were the whole market. A zero-result answer during an outage is

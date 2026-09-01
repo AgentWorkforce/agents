@@ -110,16 +110,53 @@ if (report.coverage === 'failed') {
   process.exit(0);
 }
 
-// Assert on the evidence itself, not on a banner: the Slack surface
-// deliberately drops the header, so pinning it here failed every healthy run.
-if (!/^1\./mu.test(reply) || !/https:\/\/\S*linkedin\.com\//u.test(reply)) {
-  console.error('\nFAIL: reply carries no numbered, linked LinkedIn evidence');
+// Assert on the evidence itself, not on a banner: the surface deliberately
+// drops the header, so pinning it here failed every healthy run.
+//
+// `renderListenAnswer` leads with the answer and nothing else, so requiring the
+// reply to *start* with it is the whole no-header-noise guarantee — and unlike
+// scanning for banned phrases it cannot trip over a cited post whose own body
+// happens to contain one.
+const EMPTY_ANSWER = 'No results were returned.';
+const leadsWithEvidence = /^1\./u.test(reply);
+const leadsWithEmptyAnswer = reply.startsWith(EMPTY_ANSWER);
+if (!leadsWithEvidence && !leadsWithEmptyAnswer) {
+  console.error('\nFAIL: the reply does not lead with the answer — header noise regrew');
   process.exit(1);
 }
-const noise = ['Public-signal evidence for', 'Fetched:', 'Access:']
-  .filter((phrase) => reply.includes(phrase));
-if (noise.length > 0) {
-  console.error(`\nFAIL: the answer regrew header noise the surface drops: ${noise.join(', ')}`);
+
+// The managed and undisclosed paths are metered and billable, so the manifest
+// marks that line `disclosureRequired`; the user's own credential needs none.
+// Assert the contract both ways rather than treating every `Access:` as noise.
+const discloses = /^Access:/mu.test(reply);
+if (access.credentialSource !== 'user' && !discloses) {
+  console.error(`\nFAIL: ${access.credentialSource} access was not disclosed in the reply`);
+  process.exit(1);
+}
+if (access.credentialSource === 'user' && discloses) {
+  console.error('\nFAIL: the reply disclosed access for a user-connected credential');
+  process.exit(1);
+}
+
+if (leadsWithEmptyAnswer) {
+  console.log('\ngate 4 ok: a healthy empty result is reported as no results, not an outage');
+  console.log('\nRESULT: the chain is wired correctly end to end; this query simply matched nothing.');
+  console.log('        Re-run with a broader query to see evidence flow.');
+  process.exit(0);
+}
+
+// Match on the parsed hostname: a URL merely containing "linkedin.com" (say
+// https://example.com/linkedin.com/) is not LinkedIn evidence.
+const citesLinkedIn = (reply.match(/https:\/\/\S+/gu) ?? []).some((raw) => {
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host === 'linkedin.com' || host.endsWith('.linkedin.com');
+  } catch {
+    return false;
+  }
+});
+if (!citesLinkedIn) {
+  console.error('\nFAIL: reply carries no LinkedIn permalink to back its evidence');
   process.exit(1);
 }
 console.log('\ngate 4 ok: evidence-carrying answer returned with live results');

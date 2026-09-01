@@ -180,19 +180,59 @@ test('persona prompt states every evidence field the manifest advertises', () =>
   }
 });
 
-test('persona.ts stays statically resolvable for the launch page', () => {
-  // The one-click deploy page parses this file without executing it. Dynamic
-  // syntax anywhere in the persona object aborts the whole resolve, not just
-  // the field that used it.
-  const source = readFileSync(new URL('../askable-gtm/persona.ts', import.meta.url), 'utf8');
-  const withoutComments = source
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
-    .filter((line) => !line.trim().startsWith('//'))
-    .join('\n');
-  assert.doesNotMatch(withoutComments, /`/, 'no template literals outside comments');
-});
+test('persona.ts stays statically resolvable for the launch page', async () => {
+  // The one-click deploy page PARSES this file without executing it, and one
+  // unsupported node aborts the whole resolve — not just the field using it.
+  // The page then silently shows demo data and reports "does not require
+  // external integrations", so a user could deploy with no Revternal
+  // connection. Nothing else in CI notices.
+  //
+  // Two rejections observed from the real resolver:
+  //   persona.systemPrompt[2] uses unsupported dynamic syntax (TemplateLiteral)
+  //   persona.systemPrompt[2] uses unsupported dynamic syntax (BinaryExpression)
+  //
+  // So: parse rather than grep. A regex for backticks missed the `+` that
+  // replaced them and shipped the same bug twice.
+  const ts = (await import('typescript')).default;
+  const source = ts.createSourceFile(
+    'persona.ts',
+    readFileSync(new URL('../askable-gtm/persona.ts', import.meta.url), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
 
+  let personaArg;
+  const findCall = (node) => {
+    if (ts.isCallExpression(node) && node.expression.getText() === 'definePersona') {
+      personaArg = node.arguments[0];
+    }
+    ts.forEachChild(node, findCall);
+  };
+  findCall(source);
+  assert.ok(personaArg, 'definePersona({...}) call found');
+
+  // `.join(' ')` on the prompt array is fine — the resolver indexes into that
+  // array (it names `systemPrompt[2]`), so it evaluates the join. What it
+  // cannot do is compute a string from parts.
+  //
+  // Compare NUMERIC kinds, not names: SyntaxKind is a reverse-mapped enum with
+  // aliases, and `SyntaxKind[NoSubstitutionTemplateLiteral]` returns
+  // "FirstTemplateToken" — so a name-based check silently misses `\`plain\``.
+  const rejected = new Map([
+    [ts.SyntaxKind.TemplateExpression, 'TemplateExpression'],
+    [ts.SyntaxKind.NoSubstitutionTemplateLiteral, 'NoSubstitutionTemplateLiteral'],
+    [ts.SyntaxKind.BinaryExpression, 'BinaryExpression'],
+  ]);
+  const offenders = [];
+  const walk = (node) => {
+    const name = rejected.get(node.kind);
+    if (name) offenders.push(`${name}: ${node.getText().slice(0, 70)}`);
+    ts.forEachChild(node, walk);
+  };
+  walk(personaArg);
+
+  assert.deepEqual(offenders, [], 'persona values must be static literals');
+});
 test('watch definitions are stable per owner/query and evaluated at their requested cadence', () => {
   const created = new Date('2026-08-07T10:00:00.000Z');
   const watch = createWatch('  Acme   migration pain ', '6h', 'requester', created);

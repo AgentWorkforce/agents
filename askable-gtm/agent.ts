@@ -979,11 +979,22 @@ export function renderListenAnswer(
     .map(([source, status]) => `${source}:${status.status ?? 'unknown'} (${status.count ?? 0})`)
     .join(', ') || 'not supplied';
   const items = results.slice(0, 5).map((result, index) => {
-    const title = oneLine(result.title ?? result.body_text ?? 'Untitled public post');
-    const community = result.community?.name ? ` · ${result.community.name}` : '';
+    // Reddit rows carry a title; LinkedIn rows do not, so this falls back to
+    // the post body — which is a whole post. Cite an EXCERPT: the answer is a
+    // scannable index into the sources, and the link is right there for anyone
+    // who wants the rest.
+    const excerpt = truncateEvidence(
+      result.title ?? result.body_text ?? 'Untitled public post',
+    );
+    // Attribution: Reddit supplies a community, LinkedIn a public author.
+    const attribution = result.community?.name
+      ? ` · ${result.community.name}`
+      : result.author?.handle
+        ? ` · ${result.author.handle}`
+        : '';
     const engagement = ` · score ${result.score_count ?? 0} · comments ${result.comment_count ?? 0}`;
     const url = result.url ?? result.permalink ?? '';
-    return `${index + 1}. ${title}${community}${engagement}${url ? `\n${url}` : ''}`;
+    return `${index + 1}. ${excerpt}${attribution}${engagement}${url ? `\n${url}` : ''}`;
   });
   const report = classifyListenCoverage(response);
   const failed = formatSourceList(report.failedSources);
@@ -1486,6 +1497,24 @@ function unique<T>(values: T[]): T[] {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/gu, ' ').trim();
+}
+
+/** Longest cited excerpt. Enough to judge relevance, short enough to scan. */
+export const EVIDENCE_EXCERPT_MAX = 180;
+
+/**
+ * One-line excerpt of a post, cut on a word boundary. A citation is a pointer
+ * to a source, not a copy of it: pasting five full LinkedIn posts into a Slack
+ * thread buries the very signal the answer exists to surface.
+ */
+export function truncateEvidence(value: string, max = EVIDENCE_EXCERPT_MAX): string {
+  const single = oneLine(value);
+  if (single.length <= max) return single;
+  const clipped = single.slice(0, max);
+  const lastSpace = clipped.lastIndexOf(' ');
+  // Only honour the word boundary if it does not gut the excerpt.
+  const body = lastSpace > max * 0.6 ? clipped.slice(0, lastSpace) : clipped;
+  return `${body.replace(/[\s.,;:!?—-]+$/u, '')}…`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

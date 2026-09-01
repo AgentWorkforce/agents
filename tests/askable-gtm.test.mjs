@@ -20,6 +20,7 @@ import {
   presentJsonForSlack,
   renderCapabilitiesJson,
   renderListenAnswer,
+  truncateEvidence,
   runWatchSweep,
   watchIsDue,
 } from '../.test-build/askable-gtm/agent.js';
@@ -1498,4 +1499,59 @@ test('an existing thread is answered in that thread, not a new one', async () =>
   assert.equal(slackCalls.length, 1);
   assert.equal(slackCalls[0].kind, 'reply');
   assert.equal(slackCalls[0].threadTs, '300.1', 'stays in the existing thread');
+});
+
+test('cited evidence is an excerpt, not the whole post', () => {
+  // Verbatim from a live LinkedIn row. Reddit rows carry a title; LinkedIn ones
+  // do not, so the renderer falls back to `body_text` — which is a whole post.
+  // Five of these turned one Slack answer into an unreadable wall.
+  const post =
+    'One of these two ATS vendors will tell you what it costs. The other won’t, at any '
+    + 'size. Ashby publishes a monthly figure per size band while you’re under 100 '
+    + 'employees. Greenhouse publishes nothing at any tier, and puts the budget into '
+    + 'interview kits, scorecards and the widest integration marketplace in the category. '
+    + 'That isn’t a gap in one vendor’s website. It’s two different decisions about who '
+    + 'the product is for.';
+
+  const answer = renderListenAnswer(
+    'observability pricing',
+    {
+      meta: { fetched_at: '2026-09-01T10:51:38Z' },
+      results: [],
+      source_status: { linkedin: { status: 'ok', count: 1 } },
+    },
+    [{
+      platform: 'linkedin',
+      source_id: 'urn:li:activity:1',
+      body_text: post,
+      url: 'https://www.linkedin.com/posts/x-activity-1',
+      score_count: 0,
+      comment_count: 0,
+      author: { handle: 'Sourcr Lab' },
+    }],
+    { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+  );
+
+  const line = answer.split('\n').find((l) => l.startsWith('1. '));
+  assert.ok(line, 'evidence line present');
+  assert.ok(line.includes('…'), 'long evidence is elided');
+  assert.ok(
+    line.length < 260,
+    `evidence line should stay scannable, got ${line.length} chars`,
+  );
+  assert.doesNotMatch(line, /two different decisions/, 'the tail is not pasted in');
+  // The excerpt still identifies the source, and the link carries the rest.
+  assert.match(line, /^1\. One of these two ATS vendors/);
+  assert.match(line, /Sourcr Lab/, 'public author is the LinkedIn attribution');
+  assert.match(answer, /https:\/\/www\.linkedin\.com\/posts\/x-activity-1/);
+});
+
+test('short evidence is never mangled', () => {
+  assert.equal(truncateEvidence('Short and clean.'), 'Short and clean.');
+  assert.equal(truncateEvidence('  collapses   whitespace  '), 'collapses whitespace');
+  // Cuts on a word boundary and strips dangling punctuation before the ellipsis.
+  const long = truncateEvidence('word '.repeat(80), 40);
+  assert.ok(long.endsWith('…'));
+  assert.ok(long.length <= 41);
+  assert.doesNotMatch(long, /\s…$/, 'no space before the ellipsis');
 });

@@ -55,10 +55,9 @@ Every claim carries its source: URL, timestamp, author, engagement, and an
 excerpt. A post that did not come back from the provider never appears in an
 answer.
 
-When a source fails, the answer says so — `(reddit unavailable this request)` —
-rather than returning a shorter list as if that were the whole market. A
-zero-result answer during an outage is reported as an outage, never as "nothing
-was posted".
+When the provider fails, the answer says so rather than returning a short list
+as if that were the whole market. A zero-result answer during an outage is
+reported as an outage, never as "nothing was posted".
 
 Themes, intent, and sentiment are inference, not evidence, and are labelled as
 such.
@@ -76,6 +75,3 @@ node scripts/acceptance/askable-gtm-live.mjs "your gtm question"
 
 The acceptance script exits 0 either way and states whether it saw live signal
 or a provider outage, so it doubles as a health check.
-
-Design, evidence, and the commercial boundary:
-[`../ASKABLE_AGENTS.md`](../ASKABLE_AGENTS.md).

@@ -9,7 +9,13 @@ export default definePersona({
   cloud: true,
 
   harness: 'opencode',
-  model: 'deepseek-v4-flash-free',
+  // This persona answers through ctx.llm, which opencode subscriptions cannot
+  // back — the runtime stamps the connected anthropic credential instead — so
+  // this pin is currently inert. It is corrected anyway: `deepseek-v4-flash-free`
+  // is on the `opencode` provider, which this workspace's OpenCode Go key does
+  // not authorize, so the moment anything here called ctx.harness.run() it would
+  // fail with an opaque `UnknownError: Unexpected server error`.
+  model: 'opencode-go/mimo-v2.5',
   systemPrompt:
     'You are a Cloudflare spend and usage monitor for the relayfile-cloud service. Answer questions about current Cloudflare resource usage (D1 query volume, R2 storage, queue throughput, Worker metrics) concisely using Slack markdown. When no question is asked, summarize any active alerts.',
 

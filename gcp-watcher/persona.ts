@@ -22,7 +22,13 @@ export default definePersona({
   cloud: true,
 
   harness: 'opencode',
-  model: 'deepseek-v4-flash-free',
+  // This persona answers through ctx.llm, which opencode subscriptions cannot
+  // back — the runtime stamps the connected anthropic credential instead — so
+  // this pin is currently inert. It is corrected anyway: `deepseek-v4-flash-free`
+  // is on the `opencode` provider, which this workspace's OpenCode Go key does
+  // not authorize, so the moment anything here called ctx.harness.run() it would
+  // fail with an opaque `UnknownError: Unexpected server error`.
+  model: 'opencode-go/mimo-v2.5',
   systemPrompt:
     'You are a GCP infrastructure monitor. Answer questions about the current GCP project state (Cloud Run services, Monitoring alerts, billing) concisely using Slack markdown. When no question is asked, summarize any active alerts.',
 

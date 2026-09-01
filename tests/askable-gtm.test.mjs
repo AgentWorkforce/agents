@@ -1590,3 +1590,46 @@ test('short evidence is never mangled', () => {
   assert.ok(long.length <= 41);
   assert.doesNotMatch(long, /\s…$/, 'no space before the ellipsis');
 });
+
+test('a watch delivery identifies which watch fired; an interactive answer does not', async () => {
+  // The renderer serves both paths. Interactive answers drop the preamble
+  // because the reader just typed the question. A watch DM is unsolicited and
+  // may land hours later beside other watches, so it must be identifiable.
+  const now = new Date('2026-08-07T12:00:00.000Z');
+  const watch = createWatch('acme migration pain', '6h', 'requester', now);
+  const cas = createCasStore(emptyWatchState([watch]));
+  const sent = [];
+  const ctx = {
+    log() {},
+    relay: { async dm(to, text) { sent.push(text); return { ok: true, messageId: 'm' }; } },
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      return {
+        data: {
+          meta: { fetched_at: '2026-08-07T12:00:01.000Z' },
+          results: [{ platform: 'reddit', source_id: 'p1', title: 'Ripping out Acme' }],
+          source_status: { reddit: { status: 'ok', count: 1 } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+      };
+    },
+  };
+
+  await runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-1');
+
+  assert.equal(sent.length, 1);
+  const [header, ...rest] = sent[0].split('\n');
+  assert.match(header, /^New for “acme migration pain” · every 6h · /, 'names the query and cadence');
+  assert.ok(header.includes(watch.id), 'carries the id so it can be unwatched');
+  assert.match(rest.join('\n'), /^1\. Ripping out Acme/, 'results follow immediately');
+
+  // The interactive path stays bare.
+  const interactive = renderListenAnswer('acme migration pain', {
+    meta: { fetched_at: '2026-08-07T12:00:01.000Z' },
+    results: [], source_status: { reddit: { status: 'ok', count: 1 } },
+  }, [{ platform: 'reddit', source_id: 'p1', title: 'Ripping out Acme' }]);
+  assert.doesNotMatch(interactive, /New for/);
+  assert.match(interactive, /^1\. Ripping out Acme/);
+});

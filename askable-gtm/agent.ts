@@ -872,7 +872,14 @@ export async function runWatchSweep(
         return Boolean(id && !previous.has(id));
       });
       if (fresh.length > 0) {
-        await deliverToOwner(ctx, watch.owner, renderListenAnswer(watch.query, response, fresh, result.access));
+        // An interactive answer needs no header — the reader just typed the
+        // question. A watch delivery is unsolicited and may arrive hours later
+        // alongside other watches, so it must say which one fired.
+        await deliverToOwner(
+          ctx,
+          watch.owner,
+          `${renderWatchHeader(watch)}\n${renderListenAnswer(watch.query, response, fresh, result.access)}`,
+        );
       }
       await finalizeWatchRun(
         store,
@@ -966,6 +973,15 @@ export function classifyListenCoverage(response: ListenResponse): ListenCoverage
     okSources,
     failedSources,
   };
+}
+
+/**
+ * Identify an unsolicited watch delivery. Compact on purpose: enough to tell
+ * which saved query fired and to `unwatch` it, without reintroducing the
+ * preamble that buries interactive answers.
+ */
+export function renderWatchHeader(watch: Pick<WatchDefinition, 'id' | 'query' | 'cadence'>): string {
+  return `New for \u201c${truncateEvidence(watch.query, 80)}\u201d · every ${watch.cadence} · ${watch.id}`;
 }
 
 export function renderListenAnswer(

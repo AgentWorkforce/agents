@@ -67,12 +67,13 @@ console.log('gate 1 ok: cloud action gateway is configured');
 // it can be used as the recovery check. A provider that is simply down must not
 // surface as an uncaught stack trace — that is the one moment the script is
 // reached for, and the one moment it would fail to answer.
-const VENDOR_OUTAGE_CODES = new Set([
-  'provider-unavailable',
-  'provider-rate-limited',
-  'invalid-response',
-  'request-failed',
-]);
+// Only codes that mean the vendor itself is unwell. `request-failed` is
+// `mapCloudActionError`'s catch-all — it covers any non-CloudIntegrationActionError
+// throw and every unclassified cloud-action error — and `invalid-response` means
+// the Cloud API returned an envelope we could not parse. Calling either of those
+// a provider outage would tell someone whose credentials or gateway are broken
+// to sit and wait for a recovery that is not coming.
+const VENDOR_OUTAGE_CODES = new Set(['provider-unavailable', 'provider-rate-limited']);
 let data;
 let access;
 try {

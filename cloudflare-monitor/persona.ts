@@ -9,7 +9,19 @@ export default definePersona({
   cloud: true,
 
   harness: 'opencode',
-  model: 'deepseek-v4-flash-free',
+  // This persona answers through ctx.llm. While an Anthropic credential backs
+  // ctx.llm this pin is not used: resolveModel() gates on credential family, and
+  // credentialMatchesPersonaFamily('anthropic', 'opencode') is false, so it falls
+  // through to the default Anthropic model. Cloud refuses to back ctx.llm with an
+  // opencode subscription ("harness-only") and stamps Anthropic instead.
+  //
+  // Corrected anyway, because the pin becomes live the moment either an
+  // opencode-family credential is present or something here calls
+  // ctx.harness.run(). `deepseek-v4-flash-free` is on the `opencode` provider,
+  // which this workspace's OpenCode Go key does not authorize, and it fails with
+  // an opaque `UnknownError: Unexpected server error` naming neither the model
+  // nor the credential.
+  model: 'opencode-go/mimo-v2.5',
   systemPrompt:
     'You are a Cloudflare spend and usage monitor for the relayfile-cloud service. Answer questions about current Cloudflare resource usage (D1 query volume, R2 storage, queue throughput, Worker metrics) concisely using Slack markdown. When no question is asked, summarize any active alerts.',
 

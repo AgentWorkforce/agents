@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { parseIntegrations } from '@agentworkforce/persona-kit';
@@ -151,16 +152,45 @@ test('persona and agent expose a gated Slack chat surface', () => {
   assert.deepEqual(askableGtmAgent.triggers?.slack?.[0]?.paths, ['/slack/channels/${SLACK_CHANNEL}/**']);
 });
 
-test('persona prompt includes the full public-post evidence contract', () => {
+test('persona prompt states every evidence field the manifest advertises', () => {
+  // The prompt used to derive this list from the manifest at module scope. The
+  // launch page resolves persona.ts STATICALLY, and a template literal made the
+  // whole file unreadable to it — it then showed "does not require external
+  // integrations" and would have deployed an agent with no Revternal
+  // connection. So the sentence is a plain literal and this test is what keeps
+  // it honest: add an evidence field to the manifest and this fails until the
+  // prompt says it too.
   const prompt = askableGtmPersona.systemPrompt;
-  assert.match(prompt, /source URL/);
-  assert.match(prompt, /source timestamp/);
-  assert.match(prompt, /fetched_at/);
-  assert.match(prompt, /source coverage/);
-  assert.match(prompt, /community/);
-  assert.match(prompt, /public author handle/);
-  assert.match(prompt, /title\/body excerpt/);
-  assert.match(prompt, /score and comment counts/);
+  const evidence = ASKABLE_GTM_CAPABILITY.operations
+    .find((operation) => operation.id === 'query-public-social-signals').evidence;
+  assert.ok(evidence.length > 0, 'the manifest still advertises evidence fields');
+
+  // A couple of manifest entries are reworded for prose; assert the wording the
+  // prompt actually has to carry.
+  const spoken = {
+    'public author handle when supplied': 'the public author handle when one was supplied',
+    'score/comment counts': 'the score and comment counts',
+  };
+  for (const field of evidence) {
+    const expected = spoken[field] ?? field;
+    assert.ok(
+      prompt.includes(expected),
+      `systemPrompt is missing the manifest evidence field: ${expected}`,
+    );
+  }
+});
+
+test('persona.ts stays statically resolvable for the launch page', () => {
+  // The one-click deploy page parses this file without executing it. Dynamic
+  // syntax anywhere in the persona object aborts the whole resolve, not just
+  // the field that used it.
+  const source = readFileSync(new URL('../askable-gtm/persona.ts', import.meta.url), 'utf8');
+  const withoutComments = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n');
+  assert.doesNotMatch(withoutComments, /`/, 'no template literals outside comments');
 });
 
 test('watch definitions are stable per owner/query and evaluated at their requested cadence', () => {

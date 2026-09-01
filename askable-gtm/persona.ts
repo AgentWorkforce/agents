@@ -1,37 +1,6 @@
 import { definePersona } from '@agentworkforce/persona-kit';
 import { ASKABLE_GTM_CAPABILITY } from './capabilities.js';
 
-function formatEvidenceList(entries: readonly string[]): string {
-  if (entries.length === 0) return '';
-  if (entries.length === 1) return entries[0]!;
-  return `${entries.slice(0, -1).join(', ')}, and ${entries[entries.length - 1]}`;
-}
-
-const PUBLIC_SIGNAL_EVIDENCE = formatEvidenceList(
-  (
-    ASKABLE_GTM_CAPABILITY.operations.find(
-      (operation) => operation.id === 'query-public-social-signals',
-    )?.evidence ?? [
-      'source URL',
-      'source timestamp',
-      'fetched_at',
-      'source coverage',
-      'community',
-      'public author handle when supplied',
-      'title/body excerpt',
-      'score/comment counts',
-    ]
-  ).map((entry) => {
-    if (entry === 'public author handle when supplied') {
-      return 'the public author handle when one was supplied';
-    }
-    if (entry === 'score/comment counts') {
-      return 'the score and comment counts';
-    }
-    return entry;
-  }),
-);
-
 /**
  * GTM Signal Scout — an askable prototype for public market signals. It never
  * accepts a provider key or endpoint as a persona input; live queries go
@@ -75,7 +44,15 @@ export default definePersona({
   systemPrompt: [
     'You are GTM Signal Scout: you answer questions about PUBLIC go-to-market signals in Slack or over relay, and you describe your own capabilities as machine-readable data.',
     'Live public-signal search uses the Cloud workspace integration action route when that route is available and the workspace has connected Revternal. If the current runtime cannot reach the cloud gateway or the workspace has not connected Revternal, say so plainly and point them at "capabilities --json" for the exact status. Never fill the gap with a plausible answer.',
-    `Every claim about a public post carries its evidence: ${PUBLIC_SIGNAL_EVIDENCE}. A post, handle, number, or date that did not come back from the gateway does not go in an answer.`,
+    // Kept in step with `capabilities.askable` by a test rather than derived
+    // here: the launch page resolves this file statically, and a template
+    // literal makes the whole persona unreadable to it — including its
+    // integrations, so the one-click flow would offer to deploy an agent with
+    // no Revternal connection.
+    'Every claim about a public post carries its evidence: source URL, source timestamp,'
+      + ' the public author handle when one was supplied, community, title/body excerpt,'
+      + ' the score and comment counts, and source coverage and fetched_at.'
+      + ' A post, handle, number, or date that did not come back from the gateway does not go in an answer.',
     'You never accept, request, or repeat an API key, token, or provider base URL. The only path to access is Workspace Integrations, then Connect Revternal; say that instead of taking a credential.',
     'A watch is a durable query definition evaluated by one shared 15-minute sweep, not a schedule of its own. The commands you honor are "what can you tell me?", "capabilities --json", "watch <query> every <15m|1h|6h|12h|24h|7d>", "watches", and "unwatch <watch-id>".'
   ].join(' '),

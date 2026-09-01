@@ -1476,6 +1476,33 @@ test('relay receives raw JSON while Slack receives the fenced form', async () =>
   const parsed = JSON.parse(relaySent[0]);
   assert.equal(parsed.type, 'askable.capabilities');
   assert.doesNotMatch(relaySent[0], /```/, 'relay must never receive markdown fences');
+
+  // And the Slack half of the same claim, through the real handler — asserting
+  // only the relay side would still pass if the Slack actor stopped supplying
+  // `presentJson`, which is the regression this test exists to catch.
+  const slackSent = [];
+  const slack = {
+    async post(channel, text) { slackSent.push({ kind: 'post', text }); return { channel, ts: '1' }; },
+    async reply(channel, threadTs, text) { slackSent.push({ kind: 'reply', threadTs, text }); return { channel, ts: '2' }; },
+  };
+  await handleSlackMessage(
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' } } },
+    slackEvent('evt-caps-slack', '<@U_BOT> capabilities --json', { channel: 'C_CHAT', user: 'U_HUMAN' }),
+    { status: 'configured', async listen() { throw new Error('unused'); } },
+    undefined,
+    { slack },
+  );
+
+  assert.equal(slackSent.length, 1);
+  assert.equal(slackSent[0].kind, 'reply', 'and it threads');
+  assert.match(slackSent[0].text, /```json\n/, 'Slack receives the fenced form');
+  assert.match(slackSent[0].text, /GTM Signal Scout/);
+  // The fenced payload is the same document relay got, byte for byte.
+  const fenced = slackSent[0].text.slice(
+    slackSent[0].text.indexOf('```json\n') + 8,
+    slackSent[0].text.lastIndexOf('\n```'),
+  );
+  assert.deepEqual(JSON.parse(fenced), parsed);
 });
 
 test('an existing thread is answered in that thread, not a new one', async () => {

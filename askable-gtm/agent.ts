@@ -71,6 +71,14 @@ interface InteractiveActor {
   ownerKey: string;
   reply(text: string): Promise<void>;
   owns(watchOwner: string): boolean;
+  /**
+   * Transport-specific presentation for a machine-readable payload. Relay is a
+   * machine surface — `capabilities --json` is documented as a parseable
+   * response and an agent or catalog calls `JSON.parse` on it — so relay leaves
+   * it exactly as-is. Slack is a human surface, where an unfenced 4KB blob is
+   * an unreadable wall, so Slack fences it. Default: unchanged.
+   */
+  presentJson?(json: string): string;
 }
 
 interface SlackDirectMessenger {
@@ -623,7 +631,15 @@ export async function handleSlackMessage(
     {
       ownerKey: slackOwnerKey(message.user),
       owns: (owner) => owner === slackOwnerKey(message.user!),
-      reply: (text) => postReply(ctx, deps.slack ?? defaultSlack(), message, text),
+      // Answer a top-level mention in a thread beneath it. Several agents share
+      // one Slack identity, so a single `@Agent Relay` mention can draw a reply
+      // from each of them; threading keeps the channel readable and each answer
+      // attached to its question. This persona keeps no cross-turn Slack
+      // context, so moving the conversation unit to the thread costs nothing.
+      reply: (text) => postReply(ctx, deps.slack ?? defaultSlack(), message, text, {
+        startThread: true,
+      }),
+      presentJson: presentJsonForSlack,
     },
     stripLeadingMention(message.text).trim(),
     gateway,
@@ -640,13 +656,8 @@ async function handleInteractiveCommand(
 ): Promise<void> {
   const command = parseCommand(text);
   if (command.kind === 'capabilities-json') {
-    await actor.reply(JSON.stringify({
-      type: 'askable.capabilities',
-      capability: ASKABLE_GTM_CAPABILITY,
-      runtimeDataAccess: gateway.status === 'configured'
-        ? 'cloud-integration-action-gateway-configured-authorization-checked-per-request'
-        : 'blocked-missing-cloud-runtime-credentials',
-    }));
+    const json = renderCapabilitiesJson(gateway.status);
+    await actor.reply(actor.presentJson ? actor.presentJson(json) : json);
     return;
   }
   if (command.kind === 'capabilities-human') {
@@ -861,7 +872,14 @@ export async function runWatchSweep(
         return Boolean(id && !previous.has(id));
       });
       if (fresh.length > 0) {
-        await deliverToOwner(ctx, watch.owner, renderListenAnswer(watch.query, response, fresh, result.access));
+        // An interactive answer needs no header — the reader just typed the
+        // question. A watch delivery is unsolicited and may arrive hours later
+        // alongside other watches, so it must say which one fired.
+        await deliverToOwner(
+          ctx,
+          watch.owner,
+          `${renderWatchHeader(watch)}\n${renderListenAnswer(watch.query, response, fresh, result.access)}`,
+        );
       }
       await finalizeWatchRun(
         store,
@@ -957,41 +975,65 @@ export function classifyListenCoverage(response: ListenResponse): ListenCoverage
   };
 }
 
+/**
+ * Identify an unsolicited watch delivery. Compact on purpose: enough to tell
+ * which saved query fired and to `unwatch` it, without reintroducing the
+ * preamble that buries interactive answers.
+ */
+export function renderWatchHeader(watch: Pick<WatchDefinition, 'id' | 'query' | 'cadence'>): string {
+  return `New for \u201c${truncateEvidence(watch.query, 80)}\u201d · every ${watch.cadence} · ${watch.id}`;
+}
+
 export function renderListenAnswer(
-  query: string,
+  /** Retained for the signature; the answer no longer restates the question. */
+  _query: string,
   response: ListenResponse,
   results: ListenResult[],
   access?: ListenGatewayResult['access'],
 ): string {
-  const fetchedAt = response.meta?.fetched_at ?? 'not supplied';
-  const coverage = Object.entries(response.source_status ?? {})
-    .map(([source, status]) => `${source}:${status.status ?? 'unknown'} (${status.count ?? 0})`)
-    .join(', ') || 'not supplied';
   const items = results.slice(0, 5).map((result, index) => {
-    const title = oneLine(result.title ?? result.body_text ?? 'Untitled public post');
-    const community = result.community?.name ? ` · ${result.community.name}` : '';
+    // Reddit rows carry a title; LinkedIn rows do not, so this falls back to
+    // the post body — which is a whole post. Cite an EXCERPT: the answer is a
+    // scannable index into the sources, and the link is right there for anyone
+    // who wants the rest.
+    const excerpt = truncateEvidence(
+      result.title ?? result.body_text ?? 'Untitled public post',
+    );
+    // Attribution: Reddit supplies a community, LinkedIn a public author.
+    const attribution = result.community?.name
+      ? ` · ${result.community.name}`
+      : result.author?.handle
+        ? ` · ${result.author.handle}`
+        : '';
     const engagement = ` · score ${result.score_count ?? 0} · comments ${result.comment_count ?? 0}`;
     const url = result.url ?? result.permalink ?? '';
-    return `${index + 1}. ${title}${community}${engagement}${url ? `\n${url}` : ''}`;
+    return `${index + 1}. ${excerpt}${attribution}${engagement}${url ? `\n${url}` : ''}`;
   });
   const report = classifyListenCoverage(response);
   const failed = formatSourceList(report.failedSources);
+  // Lead with the answer. The question, the fetch timestamp, the endpoint and a
+  // standing caveat are all things the reader already knows or can see, and
+  // putting four lines of preamble above the results buries them.
+  //
+  // Two things survive the trim, because dropping them would make the answer
+  // dishonest rather than merely terse:
+  //   - a missing source, stated compactly. Silently returning LinkedIn-only
+  //     results while Reddit is down presents a partial view as a complete one.
+  //   - the managed-access disclosure, which the capability manifest marks
+  //     `disclosureRequired` because that path is metered and billable. A
+  //     user's own connected credential needs no such notice.
   return [
-    `Public-signal evidence for “${oneLine(query)}”`,
-    `Fetched: ${fetchedAt} · coverage: ${coverage}`,
-    ...(access ? [renderAccessDisclosure(access)] : []),
-    ...(report.coverage === 'degraded'
-      ? [`Partial coverage: ${failed} failed this request, so anything posted there is missing below.`]
-      : []),
     items.length
       ? items.join('\n')
       : report.coverage === 'failed'
         ? `No evidence could be gathered: every queried source failed (${failed}). `
           + 'This is a source outage, not a finding that nothing was posted. Retry later.'
         : 'No results were returned.',
-    ...(report.coverage === 'failed'
-      ? []
-      : ['Source facts are shown above; themes or intent require separate inference.']),
+    ...(report.coverage === 'degraded' ? [`(${failed} unavailable this request)`] : []),
+    // `unknown` discloses too: the gateway did not say whether this was the
+    // user's credential or the metered managed one, and staying quiet about a
+    // charge that might be billable is the wrong way to be wrong.
+    ...(access && access.credentialSource !== 'user' ? [renderAccessDisclosure(access)] : []),
   ].join('\n');
 }
 
@@ -999,6 +1041,34 @@ function formatSourceList(sources: readonly string[]): string {
   if (sources.length === 0) return 'no sources';
   if (sources.length === 1) return sources[0]!;
   return `${sources.slice(0, -1).join(', ')} and ${sources[sources.length - 1]}`;
+}
+
+/**
+ * The machine-readable manifest, as standalone parseable JSON. Presentation is
+ * the transport's business: `ASKABLE_AGENTS.md` documents this command as a
+ * machine-readable relay response, so wrapping it here would break
+ * `JSON.parse` for every agent and catalog that calls it.
+ */
+export function renderCapabilitiesJson(gatewayStatus: ListenGateway['status']): string {
+  return JSON.stringify({
+    type: 'askable.capabilities',
+    capability: ASKABLE_GTM_CAPABILITY,
+    runtimeDataAccess: gatewayStatus === 'configured'
+      ? 'cloud-integration-action-gateway-configured-authorization-checked-per-request'
+      : 'blocked-missing-cloud-runtime-credentials',
+  }, null, 2);
+}
+
+/** Slack presentation: fence the payload so Slack renders it as code. */
+export function presentJsonForSlack(json: string): string {
+  return [
+    'GTM Signal Scout — machine-readable capability manifest.',
+    'You can also just ask a GTM question in plain language, or send'
+      + ' \u201cwhat can you tell me?\u201d for the short version.',
+    '```json',
+    json,
+    '```',
+  ].join('\n');
 }
 
 export function renderCapabilities(gatewayStatus: ListenGateway['status']): string {
@@ -1447,6 +1517,24 @@ function unique<T>(values: T[]): T[] {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/gu, ' ').trim();
+}
+
+/** Longest cited excerpt. Enough to judge relevance, short enough to scan. */
+export const EVIDENCE_EXCERPT_MAX = 180;
+
+/**
+ * One-line excerpt of a post, cut on a word boundary. A citation is a pointer
+ * to a source, not a copy of it: pasting five full LinkedIn posts into a Slack
+ * thread buries the very signal the answer exists to surface.
+ */
+export function truncateEvidence(value: string, max = EVIDENCE_EXCERPT_MAX): string {
+  const single = oneLine(value);
+  if (single.length <= max) return single;
+  const clipped = single.slice(0, max);
+  const lastSpace = clipped.lastIndexOf(' ');
+  // Only honour the word boundary if it does not gut the excerpt.
+  const body = lastSpace > max * 0.6 ? clipped.slice(0, lastSpace) : clipped;
+  return `${body.replace(/[\s.,;:!?—-]+$/u, '')}…`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

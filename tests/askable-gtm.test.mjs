@@ -17,7 +17,10 @@ import {
   normalizeLinkedInResponse,
   queryListen,
   renderCapabilities,
+  presentJsonForSlack,
+  renderCapabilitiesJson,
   renderListenAnswer,
+  truncateEvidence,
   runWatchSweep,
   watchIsDue,
 } from '../.test-build/askable-gtm/agent.js';
@@ -274,8 +277,13 @@ test('slack question replies in Slack and never falls back to relay dm', async (
 
   assert.equal(relayDmCalls, 0);
   assert.equal(slackCalls.length, 1);
-  assert.deepEqual(slackCalls[0].kind, 'post');
-  assert.match(slackCalls[0].text, /Public-signal evidence for “what are developers saying about Acme\?”/);
+  // A top-level mention is answered IN A THREAD under that message, not in the
+  // channel. Several agents share one Slack identity, so a single
+  // `@Agent Relay` mention can draw a reply from each of them; threading keeps
+  // the channel readable and each answer attached to the question it answers.
+  assert.deepEqual(slackCalls[0].kind, 'reply');
+  assert.equal(slackCalls[0].threadTs, '100.1', 'threads under the incoming message ts');
+  assert.match(slackCalls[0].text, /^1\. Acme migration complaints/);
   assert.match(slackCalls[0].text, /https:\/\/example\.invalid\/post-1/);
 });
 
@@ -1006,11 +1014,20 @@ test('answers expose freshness, coverage, engagement, and source URL', () => {
     community: { name: 'example-community' },
   }]);
 
-  assert.match(answer, /Fetched: 2026-08-07T12:00:00Z/);
-  assert.match(answer, /reddit:ok \(1\)/);
+  // The answer leads with the result. Freshness/coverage headers and the
+  // standing inference caveat were preamble the reader already knew; the
+  // per-item evidence a citation actually needs is unchanged.
+  assert.match(answer, /^1\. Migration took longer than expected/);
+  assert.match(answer, /example-community/);
   assert.match(answer, /score 42 · comments 9/);
   assert.match(answer, /https:\/\/example\.invalid\/post/);
-  assert.match(answer, /themes or intent require separate inference/);
+  assert.doesNotMatch(answer, /Fetched:/);
+  assert.doesNotMatch(answer, /Public-signal evidence/);
+  assert.doesNotMatch(answer, /themes or intent require separate inference/);
+  // A healthy run says nothing about coverage — there is nothing to warn about.
+  assert.doesNotMatch(answer, /unavailable this request/);
+  // A user's own credential needs no disclosure; only metered managed access does.
+  assert.doesNotMatch(answer, /Access:/);
 });
 
 test('answers disclose managed fallback and the connection-provided host', () => {
@@ -1107,9 +1124,8 @@ test('a partially-failed response flags the missing source alongside the evidenc
     { credentialSource: 'user', endpointHost: 'api.revternal.com' },
   );
 
-  assert.match(answer, /Partial coverage: hackernews failed this request/);
+  assert.match(answer, /\(hackernews unavailable this request\)/);
   assert.match(answer, /1\. Result/);
-  assert.match(answer, /themes or intent require separate inference/);
 });
 
 test('a genuine empty result set is still reported as no results', () => {
@@ -1353,7 +1369,7 @@ test('one dead source degrades the answer instead of erasing it', async () => {
   const answer = renderListenAnswer('acme migration pain', data, data.results, {
     credentialSource: 'user', endpointHost: 'api.revternal.com',
   });
-  assert.match(answer, /Partial coverage: reddit failed this request/);
+  assert.match(answer, /\(reddit unavailable this request\)/);
   assert.match(answer, /Moving off Acme was painful/);
   assert.doesNotMatch(answer, /source outage/);
 });
@@ -1421,4 +1437,199 @@ test('a failed source is named with its reason while the healthy source still an
   assert.equal(data.results.length, 1);
   // Access disclosure comes from whichever leg actually answered.
   assert.equal(access.credentialSource, 'user');
+});
+
+test('capabilities --json stays standalone parseable JSON', () => {
+  // ASKABLE_AGENTS.md documents this as a MACHINE-readable relay response: an
+  // agent or catalog calls JSON.parse on it. Presentation belongs to the
+  // transport, never to the payload.
+  const out = renderCapabilitiesJson('configured');
+  const parsed = JSON.parse(out);
+  assert.equal(parsed.type, 'askable.capabilities');
+  assert.equal(parsed.capability.kind, 'gtm-signal-scout');
+  assert.match(parsed.runtimeDataAccess, /^cloud-integration-action-gateway-configured/);
+  assert.ok(out.includes('\n  '), 'pretty-printed, so a human reading raw output can follow it');
+});
+
+test('Slack presentation fences the manifest without corrupting it', () => {
+  const json = renderCapabilitiesJson('configured');
+  const shown = presentJsonForSlack(json);
+  const [lead] = shown.split('\n');
+  assert.match(lead, /GTM Signal Scout/);
+  assert.doesNotMatch(lead, /^\{/, 'the first line must not be raw JSON');
+  assert.match(shown, /```json\n/);
+  assert.match(shown, /\n```$/);
+  // The fenced payload must still round-trip.
+  const fenced = shown.slice(shown.indexOf('```json\n') + 8, shown.lastIndexOf('\n```'));
+  assert.deepEqual(JSON.parse(fenced), JSON.parse(json));
+});
+
+test('relay receives raw JSON while Slack receives the fenced form', async () => {
+  const relaySent = [];
+  const ctx = {
+    log() {},
+    memory: { async recall() { return []; }, async save() {} },
+    relay: { async dm(to, text) { relaySent.push(text); return { ok: true, messageId: 'm' }; } },
+  };
+  const event = envelopeToAgentEvent({
+    id: 'evt-caps', workspace: 'workspace-test', type: 'relaycast.message',
+    occurredAt: '2026-09-01T10:00:00Z',
+    summary: { actor: { id: 'requester' } },
+    resource: { text: 'capabilities --json' },
+  });
+  await handleRelayMessage(ctx, event, { status: 'configured', async listen() { throw new Error('unused'); } });
+
+  assert.equal(relaySent.length, 1);
+  // The whole point: this must not throw.
+  const parsed = JSON.parse(relaySent[0]);
+  assert.equal(parsed.type, 'askable.capabilities');
+  assert.doesNotMatch(relaySent[0], /```/, 'relay must never receive markdown fences');
+
+  // And the Slack half of the same claim, through the real handler — asserting
+  // only the relay side would still pass if the Slack actor stopped supplying
+  // `presentJson`, which is the regression this test exists to catch.
+  const slackSent = [];
+  const slack = {
+    async post(channel, text) { slackSent.push({ kind: 'post', text }); return { channel, ts: '1' }; },
+    async reply(channel, threadTs, text) { slackSent.push({ kind: 'reply', threadTs, text }); return { channel, ts: '2' }; },
+  };
+  await handleSlackMessage(
+    { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' } } },
+    slackEvent('evt-caps-slack', '<@U_BOT> capabilities --json', { channel: 'C_CHAT', user: 'U_HUMAN' }),
+    { status: 'configured', async listen() { throw new Error('unused'); } },
+    undefined,
+    { slack },
+  );
+
+  assert.equal(slackSent.length, 1);
+  assert.equal(slackSent[0].kind, 'reply', 'and it threads');
+  assert.match(slackSent[0].text, /```json\n/, 'Slack receives the fenced form');
+  assert.match(slackSent[0].text, /GTM Signal Scout/);
+  // The fenced payload is the same document relay got, byte for byte.
+  const fenced = slackSent[0].text.slice(
+    slackSent[0].text.indexOf('```json\n') + 8,
+    slackSent[0].text.lastIndexOf('\n```'),
+  );
+  assert.deepEqual(JSON.parse(fenced), parsed);
+});
+
+test('an existing thread is answered in that thread, not a new one', async () => {
+  const slackCalls = [];
+  const ctx = { persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' } }, log() {}, relay: { async dm() { throw new Error('no relay'); } } };
+  const slack = {
+    async post(channel, text) { slackCalls.push({ kind: 'post', channel, text }); return { channel, ts: '1' }; },
+    async reply(channel, threadTs, text) { slackCalls.push({ kind: 'reply', channel, threadTs, text }); return { channel, ts: '2' }; },
+  };
+
+  await handleSlackMessage(
+    ctx,
+    slackEvent('evt-threaded', '<@U_BOT> capabilities --json', {
+      channel: 'C_CHAT', user: 'U_HUMAN', ts: '300.9', threadTs: '300.1',
+    }),
+    { status: 'configured', async listen() { throw new Error('not used'); } },
+    undefined,
+    { slack },
+  );
+
+  assert.equal(slackCalls.length, 1);
+  assert.equal(slackCalls[0].kind, 'reply');
+  assert.equal(slackCalls[0].threadTs, '300.1', 'stays in the existing thread');
+});
+
+test('cited evidence is an excerpt, not the whole post', () => {
+  // Verbatim from a live LinkedIn row. Reddit rows carry a title; LinkedIn ones
+  // do not, so the renderer falls back to `body_text` — which is a whole post.
+  // Five of these turned one Slack answer into an unreadable wall.
+  const post =
+    'One of these two ATS vendors will tell you what it costs. The other won’t, at any '
+    + 'size. Ashby publishes a monthly figure per size band while you’re under 100 '
+    + 'employees. Greenhouse publishes nothing at any tier, and puts the budget into '
+    + 'interview kits, scorecards and the widest integration marketplace in the category. '
+    + 'That isn’t a gap in one vendor’s website. It’s two different decisions about who '
+    + 'the product is for.';
+
+  const answer = renderListenAnswer(
+    'observability pricing',
+    {
+      meta: { fetched_at: '2026-09-01T10:51:38Z' },
+      results: [],
+      source_status: { linkedin: { status: 'ok', count: 1 } },
+    },
+    [{
+      platform: 'linkedin',
+      source_id: 'urn:li:activity:1',
+      body_text: post,
+      url: 'https://www.linkedin.com/posts/x-activity-1',
+      score_count: 0,
+      comment_count: 0,
+      author: { handle: 'Sourcr Lab' },
+    }],
+    { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+  );
+
+  const line = answer.split('\n').find((l) => l.startsWith('1. '));
+  assert.ok(line, 'evidence line present');
+  assert.ok(line.includes('…'), 'long evidence is elided');
+  assert.ok(
+    line.length < 260,
+    `evidence line should stay scannable, got ${line.length} chars`,
+  );
+  assert.doesNotMatch(line, /two different decisions/, 'the tail is not pasted in');
+  // The excerpt still identifies the source, and the link carries the rest.
+  assert.match(line, /^1\. One of these two ATS vendors/);
+  assert.match(line, /Sourcr Lab/, 'public author is the LinkedIn attribution');
+  assert.match(answer, /https:\/\/www\.linkedin\.com\/posts\/x-activity-1/);
+});
+
+test('short evidence is never mangled', () => {
+  assert.equal(truncateEvidence('Short and clean.'), 'Short and clean.');
+  assert.equal(truncateEvidence('  collapses   whitespace  '), 'collapses whitespace');
+  // Cuts on a word boundary and strips dangling punctuation before the ellipsis.
+  const long = truncateEvidence('word '.repeat(80), 40);
+  assert.ok(long.endsWith('…'));
+  assert.ok(long.length <= 41);
+  assert.doesNotMatch(long, /\s…$/, 'no space before the ellipsis');
+});
+
+test('a watch delivery identifies which watch fired; an interactive answer does not', async () => {
+  // The renderer serves both paths. Interactive answers drop the preamble
+  // because the reader just typed the question. A watch DM is unsolicited and
+  // may land hours later beside other watches, so it must be identifiable.
+  const now = new Date('2026-08-07T12:00:00.000Z');
+  const watch = createWatch('acme migration pain', '6h', 'requester', now);
+  const cas = createCasStore(emptyWatchState([watch]));
+  const sent = [];
+  const ctx = {
+    log() {},
+    relay: { async dm(to, text) { sent.push(text); return { ok: true, messageId: 'm' }; } },
+  };
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      return {
+        data: {
+          meta: { fetched_at: '2026-08-07T12:00:01.000Z' },
+          results: [{ platform: 'reddit', source_id: 'p1', title: 'Ripping out Acme' }],
+          source_status: { reddit: { status: 'ok', count: 1 } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+      };
+    },
+  };
+
+  await runWatchSweep(ctx, now, gateway, cas.store, () => 'claim-1');
+
+  assert.equal(sent.length, 1);
+  const [header, ...rest] = sent[0].split('\n');
+  assert.match(header, /^New for “acme migration pain” · every 6h · /, 'names the query and cadence');
+  assert.ok(header.includes(watch.id), 'carries the id so it can be unwatched');
+  assert.match(rest.join('\n'), /^1\. Ripping out Acme/, 'results follow immediately');
+
+  // The interactive path stays bare.
+  const interactive = renderListenAnswer('acme migration pain', {
+    meta: { fetched_at: '2026-08-07T12:00:01.000Z' },
+    results: [], source_status: { reddit: { status: 'ok', count: 1 } },
+  }, [{ platform: 'reddit', source_id: 'p1', title: 'Ripping out Acme' }]);
+  assert.doesNotMatch(interactive, /New for/);
+  assert.match(interactive, /^1\. Ripping out Acme/);
 });

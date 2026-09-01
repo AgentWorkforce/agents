@@ -1,9 +1,26 @@
 # Askable proactive agents
 
-Status: proposed class with one compile-ready, fail-closed GTM instance. Live
-Revternal result quality is not verified because the authorized 1Password CLI
-session was unavailable during the investigation. Nothing in this document
-should be read as a production-readiness claim.
+Status (verified 2026-08-31): the GTM instance is **deployed and wired end to
+end**, and the whole provider chain is confirmed working against production.
+Two blockers stop it from being useful, and neither is in this repo.
+
+| Layer | State | Evidence |
+| --- | --- | --- |
+| Persona compile + deploy | working | `agentworkforce deploy --mode cloud`, agent `2a378956-…`, schedule `EDfP6zNdCiTNhTHbUckVZ` firing every 15m |
+| 15-minute watch sweep | working (was broken on `main`) | every tick died with `Durable watch state read failed (400)` — Relayfile rejects an `/fs/file` request with no `x-correlation-id`. Fixed here; the 22:46 UTC tick succeeded |
+| Cloud action gateway → Nango → Revternal | working | `POST /integrations/revternal/actions/social-listen` returns HTTP 200 with `credentialSource: "user"` |
+| Revternal Reddit fetcher | **BLOCKED (vendor)** | `GET https://api.revternal.com/reddit/health` → `reddit_api: error, "Unexpected status: 403"` |
+| Relay DM → deployed agent | **BLOCKED (platform)** | the gateway registers `inbox: ["@self"]` and its alarm fires, but no DM ever dispatches; fix in cloud PR #3230 |
+| Slack surface | deployed, unverified | deployed with `SLACK_CHANNEL=C0BRF5BB0TB` (`#proj-sandbox`); no Slack token was available to post the `@mention` that would verify it |
+
+Reproduce the provider chain with
+[`scripts/acceptance/askable-gtm-live.mjs`](scripts/acceptance/askable-gtm-live.mjs),
+which drives the real handler through the real gateway and reports which of the
+two outcomes it observed.
+
+**Reddit is Revternal's only registered fetcher**, so its 403 zeroes every
+result. `hackernews` returns `unsupported_platform` and `devto` returns an
+upstream HTTP 424; there is no alternate source to fall back to.
 
 ## Decision
 
@@ -256,14 +273,16 @@ employment, contact information, or qualification from absent fields.
 
 ### Concrete answer: how a user adds the key
 
-**Today, they cannot add a Revternal key in Agent Workforce.** Cloud has a real
-Nango connection UX, but Revternal is absent. At Cloud commit `bc41e61aad15`, a
-repository search found no `revternal` provider, UI card, Nango integration, or
-action. The current Integrations page enumerates its supported providers and
-does not list Revternal
-([page](https://github.com/AgentWorkforce/cloud/blob/bc41e61aad15/packages/web/app/integrations/page.tsx#L117-L164)).
+**This now works.** It did not when this document was first written; Cloud
+registered the provider in [cloud#3093](https://github.com/AgentWorkforce/cloud/pull/3093),
+which added the `revternal-relay` Nango integration, the `social-listen` action
+over `POST /social/listen`, and the Revternal card in the workspace
+Integrations catalog. Verified 2026-08-31: the workspace holds a connected
+`revternal-relay` connection (`connected: true`, `state: "ready"`) and an
+authenticated `social-listen` call returns HTTP 200 with
+`access.credentialSource: "user"`.
 
-The required user path is concrete:
+The user path is:
 
 1. Open **Workspace Integrations** at `/integrations` and click **Connect
    Revternal**.

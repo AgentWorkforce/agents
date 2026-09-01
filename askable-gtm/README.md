@@ -1,78 +1,79 @@
 # GTM Signal Scout
 
-An askable proactive-agent prototype for public GTM signals. It has a Slack
-chat surface, a relay inbox for agent-to-agent traffic, a machine-readable
-capability manifest, durable user watch definitions, and a real deploy-time
-15-minute sweep.
+Ask it what the market is saying, get cited public posts back.
 
-It intentionally fails closed for live Revternal access. The runtime path is a
-cloud-backed Revternal listen route, not a persona-held credential, so this
-persona does not declare or accept an API key or endpoint input. Do not add a
-key or provider base URL to `persona.ts`, `agent.ts`, a fixture, a README
-command, or Relayfile.
+It searches **LinkedIn** through [Revternal](https://revternal.com) — the
+strongest public surface for B2B go-to-market chatter — and answers with the
+post, its author, its engagement, and a link. Save a query as a watch and it
+re-runs on a 15-minute sweep, DMing you only what is new.
 
-The product flow is Workspace Integrations (`/integrations`) → Connect
-Revternal. Hosted users paste their API key and confirm the visible hosted
-provider endpoint; they do not supply a base URL. Nango stores the user-owned
-credential and endpoint together. Managed access uses the same Nango action but
-a gated environment-held pair. Revternal is registered in Cloud's provider
-catalog as of cloud#3093, and this workspace's connection is live.
+[![Deploy this agent](https://img.shields.io/badge/Deploy-this%20agent-2ea44f?style=for-the-badge&logo=github)](../../actions/workflows/deploy-agent.yml)
 
-## Known blockers (2026-08-31)
+## Deploy
 
-The provider chain is verified working, but two things outside this repo stop
-the agent from being useful. See [`../ASKABLE_AGENTS.md`](../ASKABLE_AGENTS.md)
-for the evidence table.
+1. **Connect Revternal.** In your workspace, open **Integrations → Connect
+   Revternal** and paste your Revternal API key. It is stored with the
+   provider, and the agent never sees it — every query is authorized per
+   request. Without this the deploy fails loudly rather than shipping a
+   half-wired agent.
+2. **Set up the workspace secrets** once, per [`../docs/SELF-DEPLOY.md`](../docs/SELF-DEPLOY.md).
+3. **Run the deploy** with the button above — pick `askable-gtm`, and add
+   `SLACK_CHANNEL=C0123ABCD` under agent inputs to answer in a Slack channel.
 
-1. **Revternal's Reddit fetcher is 403-blocked upstream.** Reddit is their only
-   registered source, so every query returns zero results. Check with
-   `curl https://api.revternal.com/reddit/health`. The agent reports this as a
-   source outage rather than an empty market — a zero-result answer here is
-   never a finding that nothing was posted.
-2. **A relay DM does not wake a deployed agent.** The Agent Gateway's durable
-   delivery drain matched the Relaycast recipient id against the Cloud
-   deployment UUID and skipped every row, so the relay inbox is dead until the
-   fix (cloud PR #3230) ships and the gateway is released. Slack is the working
-   human surface in the meantime.
+`SLACK_CHANNEL` is optional. With it, `@mention` the agent in that channel and
+it replies in a thread. Without it, the agent is relay-only.
 
-## Conversation contract
+> Never put your Revternal key in the deploy input box — values typed there
+> appear in the run log, and nothing in this agent reads a key anyway. The
+> Integrations connection above is the only path.
+
+## Talk to it
 
 ```text
-what can you tell me?
-capabilities --json
-watch <query> every <15m|1h|6h|12h|24h|7d>
-watches
-unwatch <watch-id>
-<any GTM signal question>
+what are developers saying about observability pricing?   any GTM question
+watch <query> every <15m|1h|6h|12h|24h|7d>                save it
+watches                                                   list yours
+unwatch <watch-id>                                        stop one
+what can you tell me?                                     what it does
+capabilities --json                                       the same, as JSON
 ```
 
-Human chat runs through Slack `@mention` in the configured channel. The relay
-inbox remains available for agent-to-agent usage, not as the primary human
-entry point. Saved watches created from Slack deliver later updates by Slack DM
-to the requesting user; relay-created watches continue to deliver over relay.
+A watch is a durable query definition evaluated by one shared sweep, not a
+schedule of its own. Saved watches deliver only posts you have not been sent.
 
-Watch requests are durable query definitions evaluated by the shared static
-sweep. They do not create one dynamic Relaycron recurrence per utterance.
+## What it will and won't say
 
-## Verify locally
+Every claim carries its source: URL, timestamp, author, engagement, and an
+excerpt. A post that did not come back from the provider never appears in an
+answer.
+
+When a source fails, the answer says so — `(reddit unavailable this request)` —
+rather than returning a shorter list as if that were the whole market. A
+zero-result answer during an outage is reported as an outage, never as "nothing
+was posted".
+
+Themes, intent, and sentiment are inference, not evidence, and are labelled as
+such.
+
+## Verify
 
 ```sh
 npm run typecheck
 node scripts/test.mjs tests/askable-gtm.test.mjs
-agentworkforce persona compile ./askable-gtm/persona.ts
-```
 
-## Verify against live production
-
-Drives the real handler through the real Cloud action gateway, Nango, and
-Revternal, stubbing only the chat transport. Uses your existing CLI login:
-
-```sh
+# End to end against the real gateway, Nango, and Revternal:
 node scripts/acceptance/askable-gtm-live.mjs "your gtm question"
 ```
 
-It exits 0 either way and says whether it saw live signal or the vendor
-outage, so it doubles as the recovery check.
+The acceptance script exits 0 either way and states whether it saw live signal
+or a provider outage, so it doubles as a health check.
 
-See [`../ASKABLE_AGENTS.md`](../ASKABLE_AGENTS.md) for evidence, both persona
-designs, the commercial boundary, and the explicit production gaps.
+## Notes
+
+Revternal also registers a Reddit source. Their Reddit fetcher scrapes the
+unauthenticated public endpoint and has been returning `403 Blocked` upstream —
+check `curl https://api.revternal.com/reddit/health`. The agent still queries
+it, reports it as unavailable when it fails, and answers from LinkedIn.
+
+Design, evidence, and the commercial boundary:
+[`../ASKABLE_AGENTS.md`](../ASKABLE_AGENTS.md).

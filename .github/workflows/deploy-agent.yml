@@ -30,7 +30,11 @@ on:
   workflow_dispatch:
     inputs:
       agent:
-        description: Agent to deploy (must be listed in scripts/deploy/agents.json)
+        description: >-
+          Agent to deploy (must be listed in scripts/deploy/agents.json).
+          Connect the agent's providers FIRST in Workspace Integrations —
+          e.g. askable-gtm needs Revternal, where you paste your Revternal API
+          key. Providers hold their own credentials; never type a key below.
         required: true
         type: string
       agent-inputs:

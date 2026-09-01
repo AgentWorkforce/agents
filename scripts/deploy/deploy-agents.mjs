@@ -140,6 +140,31 @@ export function personaPaths(agent, root = ROOT) {
 }
 
 /** The `inputs` map a compiled persona declares, or `{}` when it declares none. */
+/**
+ * Provider names this persona declares. Used to turn a bare "deploy failed"
+ * into an actionable next step, since an unconnected provider is the most
+ * common first-run failure and the CLI error does not name one.
+ */
+export function readPersonaIntegrationNames(personaJsonPath) {
+  if (!existsSync(personaJsonPath)) return [];
+  try {
+    const persona = JSON.parse(readFileSync(personaJsonPath, 'utf8'));
+    const integrations = persona?.integrations;
+    if (!integrations || typeof integrations !== 'object') return [];
+    // Optional providers (e.g. slack, gated behind an input) are not what a
+    // failed deploy is complaining about — listing them as required sends
+    // people to connect something they may not want.
+    return Object.entries(integrations)
+      .filter(([, config]) => !(config && typeof config === 'object' && config.optional === true))
+      .map(([name]) => name)
+      .sort();
+  } catch {
+    // A malformed persona.json is the compile step's problem to report, not
+    // this hint's — never let a diagnostic mask the real error.
+    return [];
+  }
+}
+
 export function readPersonaInputSpecs(personaJsonPath) {
   if (!existsSync(personaJsonPath)) {
     throw new Error(
@@ -315,6 +340,21 @@ export function deployAgents({
     log.log(`=== ${agent.name}: deploy (${mode}) ===`);
     if (runCli(spawn, deployArgs, root).status !== 0) {
       log.error(`✗ ${agent.name}: deploy failed`);
+      // The most common first-run failure is a provider the workspace has not
+      // connected yet — `--no-connect` fails rather than starting a connect
+      // flow, and the CLI error alone does not tell you where to go. Name the
+      // providers this persona needs and where to connect them.
+      const providers = readPersonaIntegrationNames(personaJson);
+      if (providers.length > 0) {
+        log.error(
+          `  ${agent.name} needs these providers connected first: ${providers.join(', ')}.`,
+        );
+        log.error(
+          '  Connect them in Workspace Integrations (/integrations) — that is where you'
+            + ' paste each provider\'s API key. Providers hold their own credentials;'
+            + ' never pass one as an agent input.',
+        );
+      }
       failures.push(agent.name);
       if (args.failFast) break;
       continue;

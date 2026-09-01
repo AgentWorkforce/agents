@@ -969,15 +969,12 @@ export function classifyListenCoverage(response: ListenResponse): ListenCoverage
 }
 
 export function renderListenAnswer(
-  query: string,
+  /** Retained for the signature; the answer no longer restates the question. */
+  _query: string,
   response: ListenResponse,
   results: ListenResult[],
   access?: ListenGatewayResult['access'],
 ): string {
-  const fetchedAt = response.meta?.fetched_at ?? 'not supplied';
-  const coverage = Object.entries(response.source_status ?? {})
-    .map(([source, status]) => `${source}:${status.status ?? 'unknown'} (${status.count ?? 0})`)
-    .join(', ') || 'not supplied';
   const items = results.slice(0, 5).map((result, index) => {
     // Reddit rows carry a title; LinkedIn rows do not, so this falls back to
     // the post body — which is a whole post. Cite an EXCERPT: the answer is a
@@ -998,22 +995,29 @@ export function renderListenAnswer(
   });
   const report = classifyListenCoverage(response);
   const failed = formatSourceList(report.failedSources);
+  // Lead with the answer. The question, the fetch timestamp, the endpoint and a
+  // standing caveat are all things the reader already knows or can see, and
+  // putting four lines of preamble above the results buries them.
+  //
+  // Two things survive the trim, because dropping them would make the answer
+  // dishonest rather than merely terse:
+  //   - a missing source, stated compactly. Silently returning LinkedIn-only
+  //     results while Reddit is down presents a partial view as a complete one.
+  //   - the managed-access disclosure, which the capability manifest marks
+  //     `disclosureRequired` because that path is metered and billable. A
+  //     user's own connected credential needs no such notice.
   return [
-    `Public-signal evidence for “${oneLine(query)}”`,
-    `Fetched: ${fetchedAt} · coverage: ${coverage}`,
-    ...(access ? [renderAccessDisclosure(access)] : []),
-    ...(report.coverage === 'degraded'
-      ? [`Partial coverage: ${failed} failed this request, so anything posted there is missing below.`]
-      : []),
     items.length
       ? items.join('\n')
       : report.coverage === 'failed'
         ? `No evidence could be gathered: every queried source failed (${failed}). `
           + 'This is a source outage, not a finding that nothing was posted. Retry later.'
         : 'No results were returned.',
-    ...(report.coverage === 'failed'
-      ? []
-      : ['Source facts are shown above; themes or intent require separate inference.']),
+    ...(report.coverage === 'degraded' ? [`(${failed} unavailable this request)`] : []),
+    // `unknown` discloses too: the gateway did not say whether this was the
+    // user's credential or the metered managed one, and staying quiet about a
+    // charge that might be billable is the wrong way to be wrong.
+    ...(access && access.credentialSource !== 'user' ? [renderAccessDisclosure(access)] : []),
   ].join('\n');
 }
 

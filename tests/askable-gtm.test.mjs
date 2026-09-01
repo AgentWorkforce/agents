@@ -283,7 +283,7 @@ test('slack question replies in Slack and never falls back to relay dm', async (
   // the channel readable and each answer attached to the question it answers.
   assert.deepEqual(slackCalls[0].kind, 'reply');
   assert.equal(slackCalls[0].threadTs, '100.1', 'threads under the incoming message ts');
-  assert.match(slackCalls[0].text, /Public-signal evidence for “what are developers saying about Acme\?”/);
+  assert.match(slackCalls[0].text, /^1\. Acme migration complaints/);
   assert.match(slackCalls[0].text, /https:\/\/example\.invalid\/post-1/);
 });
 
@@ -1014,11 +1014,20 @@ test('answers expose freshness, coverage, engagement, and source URL', () => {
     community: { name: 'example-community' },
   }]);
 
-  assert.match(answer, /Fetched: 2026-08-07T12:00:00Z/);
-  assert.match(answer, /reddit:ok \(1\)/);
+  // The answer leads with the result. Freshness/coverage headers and the
+  // standing inference caveat were preamble the reader already knew; the
+  // per-item evidence a citation actually needs is unchanged.
+  assert.match(answer, /^1\. Migration took longer than expected/);
+  assert.match(answer, /example-community/);
   assert.match(answer, /score 42 · comments 9/);
   assert.match(answer, /https:\/\/example\.invalid\/post/);
-  assert.match(answer, /themes or intent require separate inference/);
+  assert.doesNotMatch(answer, /Fetched:/);
+  assert.doesNotMatch(answer, /Public-signal evidence/);
+  assert.doesNotMatch(answer, /themes or intent require separate inference/);
+  // A healthy run says nothing about coverage — there is nothing to warn about.
+  assert.doesNotMatch(answer, /unavailable this request/);
+  // A user's own credential needs no disclosure; only metered managed access does.
+  assert.doesNotMatch(answer, /Access:/);
 });
 
 test('answers disclose managed fallback and the connection-provided host', () => {
@@ -1115,9 +1124,8 @@ test('a partially-failed response flags the missing source alongside the evidenc
     { credentialSource: 'user', endpointHost: 'api.revternal.com' },
   );
 
-  assert.match(answer, /Partial coverage: hackernews failed this request/);
+  assert.match(answer, /\(hackernews unavailable this request\)/);
   assert.match(answer, /1\. Result/);
-  assert.match(answer, /themes or intent require separate inference/);
 });
 
 test('a genuine empty result set is still reported as no results', () => {
@@ -1361,7 +1369,7 @@ test('one dead source degrades the answer instead of erasing it', async () => {
   const answer = renderListenAnswer('acme migration pain', data, data.results, {
     credentialSource: 'user', endpointHost: 'api.revternal.com',
   });
-  assert.match(answer, /Partial coverage: reddit failed this request/);
+  assert.match(answer, /\(reddit unavailable this request\)/);
   assert.match(answer, /Moving off Acme was painful/);
   assert.doesNotMatch(answer, /source outage/);
 });

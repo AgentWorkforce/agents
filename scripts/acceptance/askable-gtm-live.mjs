@@ -63,7 +63,34 @@ if (gateway.status !== 'configured') {
 }
 console.log('gate 1 ok: cloud action gateway is configured');
 
-const { data, access } = await queryListen(QUERY, gateway);
+// The README promises this script states the outcome and exits 0 either way so
+// it can be used as the recovery check. A provider that is simply down must not
+// surface as an uncaught stack trace — that is the one moment the script is
+// reached for, and the one moment it would fail to answer.
+const VENDOR_OUTAGE_CODES = new Set([
+  'provider-unavailable',
+  'provider-rate-limited',
+  'invalid-response',
+  'request-failed',
+]);
+let data;
+let access;
+try {
+  ({ data, access } = await queryListen(QUERY, gateway));
+} catch (error) {
+  const code = error && typeof error === 'object' ? error.code : undefined;
+  const detail = error instanceof Error ? error.message : String(error);
+  if (VENDOR_OUTAGE_CODES.has(code)) {
+    console.log(`gate 2: the provider is unavailable (${code}): ${detail}`);
+    console.log('\nRESULT: the chain is wired correctly up to the provider, which is down.');
+    console.log('        Re-run this script to check whether it has recovered.');
+    process.exit(0);
+  }
+  // Everything else needs someone to act — a missing connection, a rejected
+  // credential, an exhausted quota — so it must not read as "just wait".
+  console.error(`\nFAIL: the query could not run (${code ?? 'unknown'}): ${detail}`);
+  process.exit(1);
+}
 const report = classifyListenCoverage(data);
 console.log(`gate 2 ok: provider answered · fetched_at=${data.meta?.fetched_at ?? 'n/a'}`
   + ` · total=${data.meta?.total_results ?? 0} · credentialSource=${access.credentialSource}`
@@ -90,10 +117,12 @@ if (!event) {
 // metadata would compare two separate provider requests, so a valid reply could
 // fail this gate if credential resolution differed between them. Record what the
 // handler itself was told.
-let handlerAccess = null;
+// Keep every call rather than the last one: with one shared slot the gate would
+// silently judge the reply by whichever request happened to settle last.
+const recordedAccess = [];
 const recordAccess = (fn) => async (request) => {
   const result = await fn(request);
-  handlerAccess = result.access;
+  recordedAccess.push(result.access);
   return result;
 };
 const recordingGateway = {
@@ -146,13 +175,24 @@ if (!leadsWithEvidence && !leadsWithEmptyAnswer) {
 // The managed and undisclosed paths are metered and billable, so the manifest
 // marks that line `disclosureRequired`; the user's own credential needs none.
 // Assert the contract both ways rather than treating every `Access:` as noise.
-const replyAccess = handlerAccess ?? access;
-const discloses = /^Access:/mu.test(reply);
-if (replyAccess.credentialSource !== 'user' && !discloses) {
-  console.error(`\nFAIL: ${replyAccess.credentialSource} access was not disclosed in the reply`);
+const credentialSources = new Set(recordedAccess.map((entry) => entry.credentialSource));
+if (credentialSources.size > 1) {
+  console.error(`\nFAIL: the handler's gateway calls disagreed on the credential source `
+    + `(${[...credentialSources].join(', ')}), so the reply cannot disclose one honestly`);
   process.exit(1);
 }
-if (replyAccess.credentialSource === 'user' && discloses) {
+const replyAccess = recordedAccess[0];
+const discloses = /^Access:/mu.test(reply);
+if (!replyAccess) {
+  // Falling back to the preflight's metadata here would reintroduce exactly the
+  // cross-request comparison the wrapper above exists to remove. Nothing was
+  // observed, so nothing is asserted — and the run says so rather than passing
+  // a gate it never actually ran.
+  console.log('note: the handler made no gateway call, so the access disclosure was not asserted');
+} else if (replyAccess.credentialSource !== 'user' && !discloses) {
+  console.error(`\nFAIL: ${replyAccess.credentialSource} access was not disclosed in the reply`);
+  process.exit(1);
+} else if (replyAccess.credentialSource === 'user' && discloses) {
   console.error('\nFAIL: the reply disclosed access for a user-connected credential');
   process.exit(1);
 }

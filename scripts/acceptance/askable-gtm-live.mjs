@@ -105,13 +105,21 @@ if (report.coverage === 'failed') {
   }
   console.log('\ngate 4 ok: total source failure is reported as an outage, not "no results"');
   console.log('\nRESULT: the chain is wired correctly end to end, but the provider is degraded.');
-  console.log('        askable-gtm cannot return real signal until Revternal\'s Reddit fetcher recovers:');
-  console.log('        curl https://api.revternal.com/reddit/health');
+  console.log(`        askable-gtm cannot return real signal until Revternal's `
+    + `${report.failedSources.join(', ')} listener recovers. Re-run this script to check.`);
   process.exit(0);
 }
 
-if (!/Public-signal evidence for/.test(reply)) {
-  console.error('\nFAIL: reply is not the evidence-carrying answer shape');
+// Assert on the evidence itself, not on a banner: the Slack surface
+// deliberately drops the header, so pinning it here failed every healthy run.
+if (!/^1\./mu.test(reply) || !/https:\/\/\S*linkedin\.com\//u.test(reply)) {
+  console.error('\nFAIL: reply carries no numbered, linked LinkedIn evidence');
+  process.exit(1);
+}
+const noise = ['Public-signal evidence for', 'Fetched:', 'Access:']
+  .filter((phrase) => reply.includes(phrase));
+if (noise.length > 0) {
+  console.error(`\nFAIL: the answer regrew header noise the surface drops: ${noise.join(', ')}`);
   process.exit(1);
 }
 console.log('\ngate 4 ok: evidence-carrying answer returned with live results');

@@ -85,7 +85,25 @@ if (!event) {
   console.error('FAIL: could not build a relaycast.message event');
   process.exit(1);
 }
-await handleRelayMessage(ctx, event, gateway);
+// The reply below comes from the handler's own gateway calls, not from the
+// preflight query above. Asserting the access disclosure against the preflight's
+// metadata would compare two separate provider requests, so a valid reply could
+// fail this gate if credential resolution differed between them. Record what the
+// handler itself was told.
+let handlerAccess = null;
+const recordAccess = (fn) => async (request) => {
+  const result = await fn(request);
+  handlerAccess = result.access;
+  return result;
+};
+const recordingGateway = {
+  ...gateway,
+  listen: recordAccess((request) => gateway.listen(request)),
+  ...(gateway.searchLinkedIn
+    ? { searchLinkedIn: recordAccess((request) => gateway.searchLinkedIn(request)) }
+    : {}),
+};
+await handleRelayMessage(ctx, event, recordingGateway);
 
 if (sent.length !== 1) {
   console.error(`FAIL: expected exactly one reply, got ${sent.length}`);
@@ -128,12 +146,13 @@ if (!leadsWithEvidence && !leadsWithEmptyAnswer) {
 // The managed and undisclosed paths are metered and billable, so the manifest
 // marks that line `disclosureRequired`; the user's own credential needs none.
 // Assert the contract both ways rather than treating every `Access:` as noise.
+const replyAccess = handlerAccess ?? access;
 const discloses = /^Access:/mu.test(reply);
-if (access.credentialSource !== 'user' && !discloses) {
-  console.error(`\nFAIL: ${access.credentialSource} access was not disclosed in the reply`);
+if (replyAccess.credentialSource !== 'user' && !discloses) {
+  console.error(`\nFAIL: ${replyAccess.credentialSource} access was not disclosed in the reply`);
   process.exit(1);
 }
-if (access.credentialSource === 'user' && discloses) {
+if (replyAccess.credentialSource === 'user' && discloses) {
   console.error('\nFAIL: the reply disclosed access for a user-connected credential');
   process.exit(1);
 }

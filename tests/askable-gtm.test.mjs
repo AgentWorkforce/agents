@@ -232,6 +232,44 @@ test('persona.ts stays statically resolvable for the launch page', async () => {
   walk(personaArg);
 
   assert.deepEqual(offenders, [], 'persona values must be static literals');
+
+  // Third failure mode: `persona.capabilities.askable uses unsupported dynamic
+  // syntax (Identifier)`. The resolver builds its constant scope from THIS FILE
+  // only, so an identifier the persona references must be declared here — an
+  // import puts it out of reach even though the compile is happy.
+  const declaredHere = new Set();
+  const collectConsts = (node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      declaredHere.add(node.name.text);
+    }
+    ts.forEachChild(node, collectConsts);
+  };
+  collectConsts(source);
+
+  const unreachable = [];
+  const checkIdentifiers = (node) => {
+    // Property KEYS are identifiers too and are never resolved as values.
+    if (ts.isPropertyAssignment(node)) {
+      checkIdentifiers(node.initializer);
+      return;
+    }
+    // Nor are member names: the `join` in `[...].join(' ')` is a method on the
+    // array the resolver already evaluated, not a binding it must look up.
+    if (ts.isPropertyAccessExpression(node)) {
+      checkIdentifiers(node.expression);
+      return;
+    }
+    if (ts.isIdentifier(node) && node.text !== 'undefined' && !declaredHere.has(node.text)) {
+      unreachable.push(node.text);
+    }
+    ts.forEachChild(node, checkIdentifiers);
+  };
+  checkIdentifiers(personaArg);
+  assert.deepEqual(
+    [...new Set(unreachable)],
+    [],
+    'persona references an identifier not declared in persona.ts',
+  );
 });
 test('watch definitions are stable per owner/query and evaluated at their requested cadence', () => {
   const created = new Date('2026-08-07T10:00:00.000Z');

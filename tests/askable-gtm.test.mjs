@@ -13,6 +13,8 @@ import {
   handleRelayMessage,
   handleSlackMessage,
   parseCommand,
+  classifyListenCoverage,
+  normalizeLinkedInResponse,
   queryListen,
   renderCapabilities,
   renderListenAnswer,
@@ -1281,4 +1283,142 @@ test('a failed watch state read logs a diagnosis without leaking the token', asy
   assert.equal(diag.fields.status, 400);
   assert.equal(diag.fields.tokenKind, 'relay_pa');
   assert.doesNotMatch(JSON.stringify(diag), /relay_pa_abcdefghijklmnopqrstuvwxyz012345/);
+});
+
+test('LinkedIn posts fold into the shared evidence shape', () => {
+  const response = normalizeLinkedInResponse({
+    keywords: 'migrating off datadog',
+    posts: [
+      {
+        post_id: 'urn:li:activity:7000000000000000000',
+        content: 'We finally moved our observability stack off Datadog.',
+        post_url: 'https://www.linkedin.com/feed/update/urn:li:activity:7000',
+        author: { name: 'A Person', linkedin_url: 'https://www.linkedin.com/in/a-person' },
+        published_at: '2026-08-30T09:00:00Z',
+        engagement: { comments: 12, shares: 3, likes: 87 },
+      },
+      { content: 'no post_id, must be dropped', engagement: {} },
+    ],
+  });
+
+  assert.equal(response.results.length, 1, 'a post without an id carries no citable evidence');
+  const [post] = response.results;
+  assert.equal(post.platform, 'linkedin');
+  assert.equal(post.source_id, 'urn:li:activity:7000000000000000000');
+  assert.equal(post.created_at, '2026-08-30T09:00:00Z');
+  assert.equal(post.score_count, 87);
+  assert.equal(post.comment_count, 12);
+  assert.equal(post.author.handle, 'A Person');
+  assert.deepEqual(response.source_status, { linkedin: { status: 'ok', count: 1 } });
+});
+
+test('one dead source degrades the answer instead of erasing it', async () => {
+  // This is the live shape today: Revternal's Reddit fetcher 403s while the
+  // LinkedIn listener answers. The reply must carry the LinkedIn evidence AND
+  // name Reddit as missing.
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      return {
+        data: {
+          meta: { fetched_at: '2026-09-01T06:00:00Z', total_results: 0 },
+          results: [],
+          source_status: { reddit: { status: 'error', count: 0, error: '403 Blocked' } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+      };
+    },
+    async searchLinkedIn() {
+      return {
+        data: normalizeLinkedInResponse({
+          keywords: 'acme migration pain',
+          posts: [{
+            post_id: 'urn:li:activity:1',
+            content: 'Moving off Acme was painful',
+            post_url: 'https://www.linkedin.com/feed/update/urn:li:activity:1',
+            engagement: { likes: 5, comments: 2 },
+          }],
+        }),
+        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+      };
+    },
+  };
+
+  const { data } = await queryListen('acme migration pain', gateway);
+  const report = classifyListenCoverage(data);
+  assert.equal(report.coverage, 'degraded');
+  assert.deepEqual(report.failedSources, ['reddit']);
+  assert.equal(data.results.length, 1);
+
+  const answer = renderListenAnswer('acme migration pain', data, data.results, {
+    credentialSource: 'user', endpointHost: 'api.revternal.com',
+  });
+  assert.match(answer, /Partial coverage: reddit failed this request/);
+  assert.match(answer, /Moving off Acme was painful/);
+  assert.doesNotMatch(answer, /source outage/);
+});
+
+test('a gateway with no LinkedIn support still answers from Reddit alone', async () => {
+  const gateway = {
+    status: 'configured',
+    async listen() {
+      return {
+        data: {
+          meta: { fetched_at: '2026-09-01T06:00:00Z' },
+          results: [{ platform: 'reddit', source_id: 'p1', title: 'Reddit post' }],
+          source_status: { reddit: { status: 'ok', count: 1 } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+      };
+    },
+  };
+
+  const { data } = await queryListen('acme', gateway);
+  assert.equal(classifyListenCoverage(data).coverage, 'ok');
+  assert.deepEqual(data.meta.sources_queried, ['reddit']);
+  assert.equal(data.results.length, 1);
+});
+
+test('both sources failing still raises rather than reporting an empty market', async () => {
+  const gateway = {
+    status: 'configured',
+    async listen() { throw new ListenGatewayError('provider-unavailable'); },
+    async searchLinkedIn() { throw new ListenGatewayError('quota-exhausted'); },
+  };
+  await assert.rejects(() => queryListen('acme', gateway), /provider-unavailable/);
+});
+
+test('a single-source gateway propagates an actionable failure instead of calling it an outage', async () => {
+  // Regression: fanning out to two sources must not flatten a one-source
+  // failure into "every queried source failed". An auth failure or exhausted
+  // quota is actionable — the user can reconnect or upgrade — and reporting it
+  // as a provider outage tells them to sit and wait instead.
+  const gateway = {
+    status: 'configured',
+    async listen() { throw new ListenGatewayError('provider-auth-failed'); },
+  };
+  await assert.rejects(() => queryListen('acme', gateway), /provider-auth-failed/);
+});
+
+test('a failed source is named with its reason while the healthy source still answers', async () => {
+  const gateway = {
+    status: 'configured',
+    async listen() { throw new ListenGatewayError('provider-auth-failed'); },
+    async searchLinkedIn() {
+      return {
+        data: normalizeLinkedInResponse({
+          keywords: 'acme',
+          posts: [{ post_id: 'urn:li:activity:9', content: 'still here', engagement: {} }],
+        }),
+        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+      };
+    },
+  };
+
+  const { data, access } = await queryListen('acme', gateway);
+  assert.equal(classifyListenCoverage(data).coverage, 'degraded');
+  assert.equal(data.source_status.reddit.error, 'provider-auth-failed');
+  assert.equal(data.results.length, 1);
+  // Access disclosure comes from whichever leg actually answered.
+  assert.equal(access.credentialSource, 'user');
 });

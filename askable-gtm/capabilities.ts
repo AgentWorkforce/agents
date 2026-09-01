@@ -47,6 +47,9 @@ export const ASKABLE_GTM_CAPABILITY = {
         'score/comment counts',
         'source coverage and fetched_at',
       ],
+      // Both are queried per request and folded into one answer; a source that
+      // fails is named in the reply rather than silently omitted.
+      sources: ['reddit', 'linkedin'],
     },
   ],
   questions: [
@@ -79,7 +82,27 @@ export const ASKABLE_GTM_CAPABILITY = {
     authentication: 'required-observed',
     documentedRegisteredSources: ['reddit'],
     identicalRequestCache: '15m-documented-unverified',
+    // Results remain unverified: no real Reddit row has ever come back.
     liveResultVerification: 'not-yet-live-verified',
+    // The transport, separately, IS verified — observed 2026-09-01 answering
+    // HTTP 200 with credentialSource "user". What fails is upstream of us:
+    // Revternal's Reddit fetcher returns "Unexpected status: 403", so every
+    // result set is empty for reasons no change here can fix.
+    liveTransportVerification: 'verified',
+    liveSourceStatus: 'reddit-blocked-upstream',
+  },
+  secondaryProvider: {
+    id: 'revternal.linkedin-post-search',
+    availability: 'implemented_unverified',
+    operation: 'POST /api/v1/workspaces/:workspaceId/integrations/revternal/actions/linkedin-post-search',
+    endpointSource: 'nango-connection',
+    authentication: 'required-observed',
+    documentedRegisteredSources: ['linkedin'],
+    // Same Revternal credential and workspace action gateway as Listen; only
+    // the provider capability differs.
+    sharesCredentialWith: 'revternal.listen',
+    liveResultVerification: 'not-yet-live-verified',
+    meteredSeparately: 'documented-unverified',
   },
   credentials: {
     personaInput: false,
@@ -108,7 +131,9 @@ export const ASKABLE_GTM_CAPABILITY = {
     'Live result quality with a real keyed workspace connection is not yet verified in this repo.',
     'Live search depends on a connected Revternal workspace integration and cloud runtime credentials.',
     'Managed fallback has no Revternal entitlement, per-workspace meter, or hard quota today.',
-    'Only Reddit is documented as currently registered.',
+    'Revternal registers only Reddit for social-listen; LinkedIn is a separate provider operation.',
+    'Revternal\u2019s Reddit fetcher is returning 403 upstream, so Reddit evidence is unavailable regardless of this persona.',
+    'LinkedIn results are engagement-shaped (likes/comments) and carry no community field.',
     'No full comments, contact data, employer/title, or qualification evidence.',
     'Per-watch recurrence is evaluated by one deploy-time sweep, not a dynamic Relaycron recurrence.',
     'Watch definitions use Relayfile revision compare-and-set updates and a pre-delivery run claim.',

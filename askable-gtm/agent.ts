@@ -130,9 +130,20 @@ export interface ListenGatewayResult {
   };
 }
 
+export interface LinkedInSearchRequest {
+  keywords: string;
+  recency: 'Day' | 'Week' | 'Month' | 'Quarter' | 'HalfYear' | 'Year';
+}
+
 export interface ListenGateway {
   status: 'configured' | 'blocked';
   listen(request: ListenRequest): Promise<ListenGatewayResult>;
+  /**
+   * Revternal's LinkedIn listener. Optional so a gateway double that only
+   * models `social-listen` stays valid: a gateway without it simply reports no
+   * LinkedIn coverage rather than failing the whole query.
+   */
+  searchLinkedIn?(request: LinkedInSearchRequest): Promise<ListenGatewayResult>;
 }
 
 export type ListenGatewayErrorCode =
@@ -191,6 +202,88 @@ export function createCloudApiListenGateway(
         throw mapCloudActionError(error);
       }
     },
+    async searchLinkedIn(request) {
+      try {
+        const result = await actionClient.invoke({
+          provider: 'revternal',
+          action: 'linkedin-post-search',
+          input: request,
+        });
+        return {
+          data: normalizeLinkedInResponse(result.result),
+          access: normalizeGatewayAccess(result.access),
+        };
+      } catch (error) {
+        if (error instanceof ListenGatewayError) {
+          throw error;
+        }
+        throw mapCloudActionError(error);
+      }
+    },
+  };
+}
+
+/**
+ * Fold a LinkedIn post-search response into the same `ListenResponse` shape the
+ * Reddit path produces, so evidence rendering, coverage classification, watch
+ * diffing and the sweep all stay source-agnostic.
+ */
+export function normalizeLinkedInResponse(value: unknown): ListenResponse {
+  if (!isRecord(value)) {
+    throw new ListenGatewayError('invalid-response');
+  }
+  const rawPosts = value.posts;
+  if (!Array.isArray(rawPosts)) {
+    throw new ListenGatewayError('invalid-response');
+  }
+
+  const results = rawPosts.flatMap((entry) => {
+    if (!isRecord(entry)) return [];
+    const postId = readString(entry, 'post_id');
+    if (!postId) return [];
+
+    const author = readRecord(entry, 'author');
+    const authorName = author ? readString(author, 'name') : undefined;
+    const authorUrl = author ? readString(author, 'linkedin_url') : undefined;
+    const engagement = readRecord(entry, 'engagement');
+    const likes = engagement ? readInteger(engagement, 'likes') : undefined;
+    const comments = engagement ? readInteger(engagement, 'comments') : undefined;
+    const content = readString(entry, 'content');
+
+    return [{
+      source_id: postId,
+      id: postId,
+      platform: 'linkedin',
+      ...(readString(entry, 'post_url') ? { url: readString(entry, 'post_url') } : {}),
+      ...(readString(entry, 'published_at')
+        ? { created_at: readString(entry, 'published_at') }
+        : {}),
+      // LinkedIn posts have no title; the body doubles as the headline and the
+      // renderer already falls back to `body_text`.
+      ...(content ? { body_text: content } : {}),
+      // `likes` is the closest analogue to a score, so engagement stays
+      // comparable across sources in one answer.
+      ...(likes !== undefined ? { score_count: likes } : {}),
+      ...(comments !== undefined ? { comment_count: comments } : {}),
+      ...(authorName || authorUrl
+        ? {
+            author: {
+              ...(authorName ? { handle: authorName } : {}),
+              ...(authorUrl ? { profile: authorUrl } : {}),
+            },
+          }
+        : {}),
+    }];
+  });
+
+  return {
+    meta: {
+      ...(readString(value, 'keywords') ? { query: readString(value, 'keywords') } : {}),
+      total_results: results.length,
+      sources_queried: ['linkedin'],
+    },
+    results,
+    source_status: { linkedin: { status: 'ok', count: results.length } },
   };
 }
 
@@ -642,12 +735,20 @@ export function watchIsDue(watch: WatchDefinition, now: Date): boolean {
   return now.getTime() - last >= cadenceMs(watch.cadence);
 }
 
+/**
+ * Query every Revternal source this persona is entitled to and fold the answers
+ * into one response. A source that throws is recorded as a failed source rather
+ * than failing the whole query, so one provider outage degrades the answer
+ * instead of erasing it — `classifyListenCoverage` then reports which sources
+ * are missing. Only a total failure surfaces as an error.
+ */
 export async function queryListen(
   query: string,
   gateway: ListenGateway,
 ): Promise<ListenGatewayResult> {
   const normalizedQuery = normalizeListenQuery(query, 'Query');
-  return gateway.listen({
+
+  const reddit = gateway.listen({
     query: normalizedQuery,
     sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
     filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
@@ -655,6 +756,67 @@ export async function queryListen(
     page: 1,
     per_page: 20,
   });
+  const linkedin = gateway.searchLinkedIn?.({
+    keywords: normalizedQuery,
+    recency: 'Week',
+  });
+
+  // Only legs actually attempted are settled and judged. A gateway with no
+  // LinkedIn support has ONE leg, and its failure must propagate: an auth
+  // failure or exhausted quota is actionable and must never be flattened into
+  // "the source is having an outage".
+  const attempted: Array<{ source: string; promise: Promise<ListenGatewayResult> }> = [
+    { source: 'reddit', promise: reddit },
+    ...(linkedin ? [{ source: 'linkedin', promise: linkedin }] : []),
+  ];
+  const settled = await Promise.allSettled(attempted.map((leg) => leg.promise));
+  const legs = attempted.map((leg, index) => ({ source: leg.source, outcome: settled[index]! }));
+
+  if (legs.every((leg) => leg.outcome.status === 'rejected')) {
+    throw (legs[0]!.outcome as PromiseRejectedResult).reason;
+  }
+
+  const firstFulfilled = legs.find((leg) => leg.outcome.status === 'fulfilled');
+  const access = firstFulfilled
+    ? (firstFulfilled.outcome as PromiseFulfilledResult<ListenGatewayResult>).value.access
+    : { credentialSource: 'unknown' as CredentialSource, endpointHost: '' };
+
+  const merged: ListenResponse = { results: [], source_status: {} };
+  const sourcesQueried: string[] = [];
+  let fetchedAt: string | undefined;
+
+  for (const { source, outcome } of legs) {
+    if (outcome.status === 'rejected') {
+      merged.source_status![source] = {
+        status: 'error',
+        count: 0,
+        error: safeGatewayErrorCode(outcome.reason),
+      };
+      sourcesQueried.push(source);
+      continue;
+    }
+
+    const data = outcome.value.data;
+    merged.results!.push(...(data.results ?? []));
+    fetchedAt ??= data.meta?.fetched_at;
+    for (const [name, status] of Object.entries(data.source_status ?? {})) {
+      merged.source_status![name] = status;
+    }
+    // A leg that reported no per-source status still counts as queried.
+    if (!data.source_status || Object.keys(data.source_status).length === 0) {
+      merged.source_status![source] = { status: 'ok', count: data.results?.length ?? 0 };
+    }
+    sourcesQueried.push(...(data.meta?.sources_queried ?? [source]));
+  }
+
+  merged.meta = {
+    query: normalizedQuery,
+    total_results: merged.results!.length,
+    sources_queried: [...new Set(sourcesQueried)],
+    ...(fetchedAt ? { fetched_at: fetchedAt } : {}),
+  };
+
+  return { data: merged, access };
 }
 
 export async function runWatchSweep(

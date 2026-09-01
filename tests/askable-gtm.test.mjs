@@ -17,6 +17,7 @@ import {
   normalizeLinkedInResponse,
   queryListen,
   renderCapabilities,
+  renderCapabilitiesJson,
   renderListenAnswer,
   runWatchSweep,
   watchIsDue,
@@ -274,7 +275,12 @@ test('slack question replies in Slack and never falls back to relay dm', async (
 
   assert.equal(relayDmCalls, 0);
   assert.equal(slackCalls.length, 1);
-  assert.deepEqual(slackCalls[0].kind, 'post');
+  // A top-level mention is answered IN A THREAD under that message, not in the
+  // channel. Several agents share one Slack identity, so a single
+  // `@Agent Relay` mention can draw a reply from each of them; threading keeps
+  // the channel readable and each answer attached to the question it answers.
+  assert.deepEqual(slackCalls[0].kind, 'reply');
+  assert.equal(slackCalls[0].threadTs, '100.1', 'threads under the incoming message ts');
   assert.match(slackCalls[0].text, /Public-signal evidence for “what are developers saying about Acme\?”/);
   assert.match(slackCalls[0].text, /https:\/\/example\.invalid\/post-1/);
 });
@@ -1421,4 +1427,46 @@ test('a failed source is named with its reason while the healthy source still an
   assert.equal(data.results.length, 1);
   // Access disclosure comes from whichever leg actually answered.
   assert.equal(access.credentialSource, 'user');
+});
+
+test('capabilities --json is fenced and led by a human-readable line', () => {
+  // Slack renders an unfenced 4KB blob as an unreadable wall of text.
+  const out = renderCapabilitiesJson('configured');
+  const [lead] = out.split('\n');
+  assert.match(lead, /GTM Signal Scout/);
+  assert.doesNotMatch(lead, /^\{/, 'the first line must not be raw JSON');
+  assert.match(out, /```json\n/);
+  assert.match(out, /\n```$/);
+
+  // The payload is still the real, parseable manifest.
+  const fenced = out.slice(out.indexOf('```json\n') + 8, out.lastIndexOf('\n```'));
+  const parsed = JSON.parse(fenced);
+  assert.equal(parsed.type, 'askable.capabilities');
+  assert.equal(parsed.capability.kind, 'gtm-signal-scout');
+  assert.match(parsed.runtimeDataAccess, /^cloud-integration-action-gateway-configured/);
+  // Pretty-printed, not minified.
+  assert.ok(fenced.includes('\n  '), 'manifest should be indented for reading');
+});
+
+test('an existing thread is answered in that thread, not a new one', async () => {
+  const slackCalls = [];
+  const ctx = { persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' } }, log() {}, relay: { async dm() { throw new Error('no relay'); } } };
+  const slack = {
+    async post(channel, text) { slackCalls.push({ kind: 'post', channel, text }); return { channel, ts: '1' }; },
+    async reply(channel, threadTs, text) { slackCalls.push({ kind: 'reply', channel, threadTs, text }); return { channel, ts: '2' }; },
+  };
+
+  await handleSlackMessage(
+    ctx,
+    slackEvent('evt-threaded', '<@U_BOT> capabilities --json', {
+      channel: 'C_CHAT', user: 'U_HUMAN', ts: '300.9', threadTs: '300.1',
+    }),
+    { status: 'configured', async listen() { throw new Error('not used'); } },
+    undefined,
+    { slack },
+  );
+
+  assert.equal(slackCalls.length, 1);
+  assert.equal(slackCalls[0].kind, 'reply');
+  assert.equal(slackCalls[0].threadTs, '300.1', 'stays in the existing thread');
 });

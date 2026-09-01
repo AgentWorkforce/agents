@@ -640,13 +640,7 @@ async function handleInteractiveCommand(
 ): Promise<void> {
   const command = parseCommand(text);
   if (command.kind === 'capabilities-json') {
-    await actor.reply(JSON.stringify({
-      type: 'askable.capabilities',
-      capability: ASKABLE_GTM_CAPABILITY,
-      runtimeDataAccess: gateway.status === 'configured'
-        ? 'cloud-integration-action-gateway-configured-authorization-checked-per-request'
-        : 'blocked-missing-cloud-runtime-credentials',
-    }));
+    await actor.reply(renderCapabilitiesJson(gateway.status));
     return;
   }
   if (command.kind === 'capabilities-human') {
@@ -999,6 +993,30 @@ function formatSourceList(sources: readonly string[]): string {
   if (sources.length === 0) return 'no sources';
   if (sources.length === 1) return sources[0]!;
   return `${sources.slice(0, -1).join(', ')} and ${sources[sources.length - 1]}`;
+}
+
+/**
+ * The machine-readable manifest, kept legible for the human who asked. Slack
+ * renders an unfenced 4KB blob as an unreadable wall, so pretty-print it inside
+ * a fenced block and lead with one line saying what it is and what actually
+ * works — nobody should have to parse JSON to find out they can just ask a
+ * question in plain language.
+ */
+export function renderCapabilitiesJson(gatewayStatus: ListenGateway['status']): string {
+  return [
+    'GTM Signal Scout — machine-readable capability manifest.',
+    'You can also just ask a GTM question in plain language, or send'
+      + ' \u201cwhat can you tell me?\u201d for the short version.',
+    '```json',
+    JSON.stringify({
+      type: 'askable.capabilities',
+      capability: ASKABLE_GTM_CAPABILITY,
+      runtimeDataAccess: gatewayStatus === 'configured'
+        ? 'cloud-integration-action-gateway-configured-authorization-checked-per-request'
+        : 'blocked-missing-cloud-runtime-credentials',
+    }, null, 2),
+    '```',
+  ].join('\n');
 }
 
 export function renderCapabilities(gatewayStatus: ListenGateway['status']): string {

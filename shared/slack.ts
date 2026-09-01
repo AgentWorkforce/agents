@@ -130,10 +130,16 @@ export async function postReply(
   text: string
 ): Promise<void> {
   const chanId = bareChannelId(msg.channel);
-  const result = msg.threadTs
-    ? await slack.reply(chanId, msg.threadTs, text)
+  // Always answer in a thread: reply under the incoming message when it is
+  // top-level, and inside the existing thread otherwise. A channel-level reply
+  // buries the conversation in the main channel, which is worst exactly where
+  // agents are useful — several agents share one Slack identity, so a single
+  // `@Agent Relay` mention can draw a reply from each of them.
+  const threadTs = msg.threadTs ?? msg.ts;
+  const result = threadTs
+    ? await slack.reply(chanId, threadTs, text)
     : await slack.post(chanId, text);
   if (!result?.ts) {
-    ctx.log?.('warn', 'slack.reply.no-receipt', { channel: chanId, threaded: Boolean(msg.threadTs) });
+    ctx.log?.('warn', 'slack.reply.no-receipt', { channel: chanId, threaded: Boolean(threadTs) });
   }
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { parseIntegrations } from '@agentworkforce/persona-kit';
@@ -151,16 +152,45 @@ test('persona and agent expose a gated Slack chat surface', () => {
   assert.deepEqual(askableGtmAgent.triggers?.slack?.[0]?.paths, ['/slack/channels/${SLACK_CHANNEL}/**']);
 });
 
-test('persona prompt includes the full public-post evidence contract', () => {
+test('persona prompt states every evidence field the manifest advertises', () => {
+  // The prompt used to derive this list from the manifest at module scope. The
+  // launch page resolves persona.ts STATICALLY, and a template literal made the
+  // whole file unreadable to it — it then showed "does not require external
+  // integrations" and would have deployed an agent with no Revternal
+  // connection. So the sentence is a plain literal and this test is what keeps
+  // it honest: add an evidence field to the manifest and this fails until the
+  // prompt says it too.
   const prompt = askableGtmPersona.systemPrompt;
-  assert.match(prompt, /source URL/);
-  assert.match(prompt, /source timestamp/);
-  assert.match(prompt, /fetched_at/);
-  assert.match(prompt, /source coverage/);
-  assert.match(prompt, /community/);
-  assert.match(prompt, /public author handle/);
-  assert.match(prompt, /title\/body excerpt/);
-  assert.match(prompt, /score and comment counts/);
+  const evidence = ASKABLE_GTM_CAPABILITY.operations
+    .find((operation) => operation.id === 'query-public-social-signals').evidence;
+  assert.ok(evidence.length > 0, 'the manifest still advertises evidence fields');
+
+  // A couple of manifest entries are reworded for prose; assert the wording the
+  // prompt actually has to carry.
+  const spoken = {
+    'public author handle when supplied': 'the public author handle when one was supplied',
+    'score/comment counts': 'the score and comment counts',
+  };
+  for (const field of evidence) {
+    const expected = spoken[field] ?? field;
+    assert.ok(
+      prompt.includes(expected),
+      `systemPrompt is missing the manifest evidence field: ${expected}`,
+    );
+  }
+});
+
+test('persona.ts stays statically resolvable for the launch page', () => {
+  // The one-click deploy page parses this file without executing it. Dynamic
+  // syntax anywhere in the persona object aborts the whole resolve, not just
+  // the field that used it.
+  const source = readFileSync(new URL('../askable-gtm/persona.ts', import.meta.url), 'utf8');
+  const withoutComments = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n');
+  assert.doesNotMatch(withoutComments, /`/, 'no template literals outside comments');
 });
 
 test('watch definitions are stable per owner/query and evaluated at their requested cadence', () => {
@@ -235,7 +265,7 @@ test('slack question replies in Slack and never falls back to relay dm', async (
   };
   const gateway = {
     status: 'configured',
-    async listen() {
+    async searchLinkedIn() {
       return {
         data: {
           meta: { fetched_at: '2026-08-07T12:00:00Z' },
@@ -316,7 +346,7 @@ test('slack-created watches persist a Slack owner and future deliveries use Slac
       channel: 'C_CHAT',
       user: 'U_WATCHER',
     }),
-    { status: 'blocked', async listen() { throw new Error('not used'); } },
+    { status: 'blocked', async searchLinkedIn() { throw new Error('not used'); } },
     cas.store,
     { slack },
   );
@@ -748,42 +778,40 @@ test('cloud API listen gateway maps allowlisted route errors into gateway errors
   );
 });
 
-test('Listen gateway receives one bounded request with no credential or endpoint field', async () => {
+test('the gateway receives one bounded request with no credential or endpoint field', async () => {
   const requests = [];
   const result = await queryListen('developer tool migration pain', {
     status: 'configured',
-    async listen(request) {
+    async searchLinkedIn(request) {
       requests.push(request);
       return {
         data: {
-          meta: {
-            query: 'developer tool migration pain',
-            fetched_at: '2026-08-07T12:00:00Z',
-          },
+          meta: { query: 'developer tool migration pain', fetched_at: '2026-08-07T12:00:00Z' },
           results: [],
-          source_status: { reddit: { status: 'ok', count: 0 } },
+          source_status: { linkedin: { status: 'ok', count: 0 } },
         },
         access: { credentialSource: 'user', endpointHost: 'provider.example' },
       };
     },
   });
 
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].sources[0].platform, 'reddit');
-  assert.equal(requests[0].page, 1);
-  assert.equal(requests[0].per_page, 20);
+  assert.equal(requests.length, 1, 'one source, one call');
+  assert.equal(requests[0].keywords, 'developer tool migration pain');
+  assert.equal(requests[0].recency, 'Week');
+  // The credential lives on the provider connection and is resolved
+  // server-side; it must never appear in a request this persona builds.
   assert.equal('credential' in requests[0], false);
   assert.equal('apiKey' in requests[0], false);
   assert.equal('endpoint' in requests[0], false);
   assert.equal('baseUrl' in requests[0], false);
-  assert.equal(result.data.source_status.reddit.status, 'ok');
+  assert.equal(result.data.source_status.linkedin.status, 'ok');
 });
 
 test('interactive queries are normalized and validated before the gateway is called', async () => {
   const requests = [];
   const gateway = {
     status: 'configured',
-    async listen(request) {
+    async searchLinkedIn(request) {
       requests.push(request);
       return {
         data: { results: [] },
@@ -799,8 +827,8 @@ test('interactive queries are normalized and validated before the gateway is cal
   await assert.rejects(() => queryListen('x'.repeat(501), gateway), /between 2 and 500 characters/);
 
   assert.equal(requests.length, 2);
-  assert.equal(requests[0].query, 'ok');
-  assert.equal(requests[1].query.length, 500);
+  assert.equal(requests[0].keywords, 'ok', 'trimmed before it reaches the provider');
+  assert.equal(requests[1].keywords.length, 500);
 });
 
 test('invalid interactive query returns an error without invoking the gateway', async () => {
@@ -814,7 +842,7 @@ test('invalid interactive query returns an error without invoking the gateway', 
   };
   const gateway = {
     status: 'configured',
-    async listen() {
+    async searchLinkedIn() {
       gatewayCalls += 1;
       throw new Error('must not be called');
     },
@@ -876,7 +904,7 @@ test('failed watch delivery does not consume results and the next sweep retries 
   };
   const gateway = {
     status: 'configured',
-    async listen() {
+    async searchLinkedIn() {
       gatewayCalls += 1;
       return {
         data: {
@@ -923,7 +951,7 @@ test('CAS preserves concurrent create, remove, and sweep mutations without dupli
   };
   const gateway = {
     status: 'configured',
-    async listen() {
+    async searchLinkedIn() {
       gatewayCalls += 1;
       await Promise.resolve();
       return {
@@ -979,7 +1007,7 @@ test('a CAS run claim fences concurrent sweeps for the same work unit', async ()
   };
   const gateway = {
     status: 'configured',
-    async listen() {
+    async searchLinkedIn() {
       gatewayCalls += 1;
       await gatewayBarrier;
       return {
@@ -1073,7 +1101,7 @@ test('gateway failures expose only an allowlisted code to logs and the user', as
   };
   const gateway = {
     status: 'configured',
-    async listen() {
+    async searchLinkedIn() {
       const error = new ListenGatewayError('provider-auth-failed');
       error.cause = new Error('upstream body with credential-shaped sensitive detail');
       throw error;
@@ -1159,7 +1187,7 @@ test('a sweep run whose sources all failed releases its claim and retries the sa
   };
   const gateway = {
     status: 'configured',
-    async listen() {
+    async searchLinkedIn() {
       gatewayCalls += 1;
       // First sweep sees the outage; the second sees the post that was
       // published during the window the outage would otherwise have consumed.
@@ -1328,82 +1356,6 @@ test('LinkedIn posts fold into the shared evidence shape', () => {
   assert.deepEqual(response.source_status, { linkedin: { status: 'ok', count: 1 } });
 });
 
-test('one dead source degrades the answer instead of erasing it', async () => {
-  // This is the live shape today: Revternal's Reddit fetcher 403s while the
-  // LinkedIn listener answers. The reply must carry the LinkedIn evidence AND
-  // name Reddit as missing.
-  const gateway = {
-    status: 'configured',
-    async listen() {
-      return {
-        data: {
-          meta: { fetched_at: '2026-09-01T06:00:00Z', total_results: 0 },
-          results: [],
-          source_status: { reddit: { status: 'error', count: 0, error: '403 Blocked' } },
-        },
-        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
-      };
-    },
-    async searchLinkedIn() {
-      return {
-        data: normalizeLinkedInResponse({
-          keywords: 'acme migration pain',
-          posts: [{
-            post_id: 'urn:li:activity:1',
-            content: 'Moving off Acme was painful',
-            post_url: 'https://www.linkedin.com/feed/update/urn:li:activity:1',
-            engagement: { likes: 5, comments: 2 },
-          }],
-        }),
-        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
-      };
-    },
-  };
-
-  const { data } = await queryListen('acme migration pain', gateway);
-  const report = classifyListenCoverage(data);
-  assert.equal(report.coverage, 'degraded');
-  assert.deepEqual(report.failedSources, ['reddit']);
-  assert.equal(data.results.length, 1);
-
-  const answer = renderListenAnswer('acme migration pain', data, data.results, {
-    credentialSource: 'user', endpointHost: 'api.revternal.com',
-  });
-  assert.match(answer, /\(reddit unavailable this request\)/);
-  assert.match(answer, /Moving off Acme was painful/);
-  assert.doesNotMatch(answer, /source outage/);
-});
-
-test('a gateway with no LinkedIn support still answers from Reddit alone', async () => {
-  const gateway = {
-    status: 'configured',
-    async listen() {
-      return {
-        data: {
-          meta: { fetched_at: '2026-09-01T06:00:00Z' },
-          results: [{ platform: 'reddit', source_id: 'p1', title: 'Reddit post' }],
-          source_status: { reddit: { status: 'ok', count: 1 } },
-        },
-        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
-      };
-    },
-  };
-
-  const { data } = await queryListen('acme', gateway);
-  assert.equal(classifyListenCoverage(data).coverage, 'ok');
-  assert.deepEqual(data.meta.sources_queried, ['reddit']);
-  assert.equal(data.results.length, 1);
-});
-
-test('both sources failing still raises rather than reporting an empty market', async () => {
-  const gateway = {
-    status: 'configured',
-    async listen() { throw new ListenGatewayError('provider-unavailable'); },
-    async searchLinkedIn() { throw new ListenGatewayError('quota-exhausted'); },
-  };
-  await assert.rejects(() => queryListen('acme', gateway), /provider-unavailable/);
-});
-
 test('a single-source gateway propagates an actionable failure instead of calling it an outage', async () => {
   // Regression: fanning out to two sources must not flatten a one-source
   // failure into "every queried source failed". An auth failure or exhausted
@@ -1411,37 +1363,14 @@ test('a single-source gateway propagates an actionable failure instead of callin
   // as a provider outage tells them to sit and wait instead.
   const gateway = {
     status: 'configured',
-    async listen() { throw new ListenGatewayError('provider-auth-failed'); },
+    async searchLinkedIn() { throw new ListenGatewayError('provider-auth-failed'); },
   };
   await assert.rejects(() => queryListen('acme', gateway), /provider-auth-failed/);
 });
 
-test('a failed source is named with its reason while the healthy source still answers', async () => {
-  const gateway = {
-    status: 'configured',
-    async listen() { throw new ListenGatewayError('provider-auth-failed'); },
-    async searchLinkedIn() {
-      return {
-        data: normalizeLinkedInResponse({
-          keywords: 'acme',
-          posts: [{ post_id: 'urn:li:activity:9', content: 'still here', engagement: {} }],
-        }),
-        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
-      };
-    },
-  };
-
-  const { data, access } = await queryListen('acme', gateway);
-  assert.equal(classifyListenCoverage(data).coverage, 'degraded');
-  assert.equal(data.source_status.reddit.error, 'provider-auth-failed');
-  assert.equal(data.results.length, 1);
-  // Access disclosure comes from whichever leg actually answered.
-  assert.equal(access.credentialSource, 'user');
-});
-
 test('capabilities --json stays standalone parseable JSON', () => {
-  // ASKABLE_AGENTS.md documents this as a MACHINE-readable relay response: an
-  // agent or catalog calls JSON.parse on it. Presentation belongs to the
+  // The manifest advertises this as machine-readable (`discovery.machine`):
+  // an agent or catalog calls JSON.parse on it. Presentation belongs to the
   // transport, never to the payload.
   const out = renderCapabilitiesJson('configured');
   const parsed = JSON.parse(out);
@@ -1477,7 +1406,7 @@ test('relay receives raw JSON while Slack receives the fenced form', async () =>
     summary: { actor: { id: 'requester' } },
     resource: { text: 'capabilities --json' },
   });
-  await handleRelayMessage(ctx, event, { status: 'configured', async listen() { throw new Error('unused'); } });
+  await handleRelayMessage(ctx, event, { status: 'configured', async searchLinkedIn() { throw new Error('unused'); } });
 
   assert.equal(relaySent.length, 1);
   // The whole point: this must not throw.
@@ -1496,7 +1425,7 @@ test('relay receives raw JSON while Slack receives the fenced form', async () =>
   await handleSlackMessage(
     { ...ctx, persona: { inputs: { SLACK_CHANNEL: 'C_CHAT' } } },
     slackEvent('evt-caps-slack', '<@U_BOT> capabilities --json', { channel: 'C_CHAT', user: 'U_HUMAN' }),
-    { status: 'configured', async listen() { throw new Error('unused'); } },
+    { status: 'configured', async searchLinkedIn() { throw new Error('unused'); } },
     undefined,
     { slack },
   );
@@ -1526,7 +1455,7 @@ test('an existing thread is answered in that thread, not a new one', async () =>
     slackEvent('evt-threaded', '<@U_BOT> capabilities --json', {
       channel: 'C_CHAT', user: 'U_HUMAN', ts: '300.9', threadTs: '300.1',
     }),
-    { status: 'configured', async listen() { throw new Error('not used'); } },
+    { status: 'configured', async searchLinkedIn() { throw new Error('not used'); } },
     undefined,
     { slack },
   );
@@ -1605,7 +1534,7 @@ test('a watch delivery identifies which watch fired; an interactive answer does 
   };
   const gateway = {
     status: 'configured',
-    async listen() {
+    async searchLinkedIn() {
       return {
         data: {
           meta: { fetched_at: '2026-08-07T12:00:01.000Z' },
@@ -1632,4 +1561,59 @@ test('a watch delivery identifies which watch fired; an interactive answer does 
   }, [{ platform: 'reddit', source_id: 'p1', title: 'Ripping out Acme' }]);
   assert.doesNotMatch(interactive, /New for/);
   assert.match(interactive, /^1\. Ripping out Acme/);
+});
+
+test('the only source failing is reported as an outage, not an empty market', async () => {
+  const gateway = {
+    status: 'configured',
+    async searchLinkedIn() {
+      return {
+        data: {
+          meta: { fetched_at: '2026-09-01T10:00:00Z' },
+          results: [],
+          source_status: { linkedin: { status: 'error', count: 0, error: 'upstream 503' } },
+        },
+        access: { credentialSource: 'user', endpointHost: 'api.revternal.com' },
+      };
+    },
+  };
+
+  const { data } = await queryListen('acme migration pain', gateway);
+  const report = classifyListenCoverage(data);
+  assert.equal(report.coverage, 'failed');
+  assert.deepEqual(report.failedSources, ['linkedin']);
+
+  const answer = renderListenAnswer('acme migration pain', data, data.results, {
+    credentialSource: 'user', endpointHost: 'api.revternal.com',
+  });
+  assert.match(answer, /source outage, not a finding that nothing was posted/);
+  assert.doesNotMatch(answer, /No results were returned\./);
+});
+
+test('a source that throws propagates its reason rather than becoming an outage', async () => {
+  // With a single source there is nothing to degrade to. An auth failure or
+  // exhausted quota is actionable — reconnect, or upgrade — and must not be
+  // flattened into "the provider is having an outage", which says wait.
+  const gateway = {
+    status: 'configured',
+    async searchLinkedIn() { throw new ListenGatewayError('provider-auth-failed'); },
+  };
+  await assert.rejects(() => queryListen('acme', gateway), /provider-auth-failed/);
+});
+
+test('a gateway with no LinkedIn support fails loudly instead of answering emptily', async () => {
+  // Reddit is no longer queried, so a gateway without the LinkedIn leg has no
+  // source at all. Returning "no results" there would be a lie.
+  const gateway = {
+    status: 'configured',
+    async listen() { throw new Error('reddit leg must not be called'); },
+  };
+  await assert.rejects(
+    () => queryListen('acme', gateway),
+    (error) => {
+      assert.equal(error.code, 'provider-unavailable');
+      assert.match(error.message, /No public-signal source is configured/);
+      return true;
+    },
+  );
 });

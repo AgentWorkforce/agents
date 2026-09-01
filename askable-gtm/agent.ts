@@ -759,27 +759,28 @@ export async function queryListen(
 ): Promise<ListenGatewayResult> {
   const normalizedQuery = normalizeListenQuery(query, 'Query');
 
-  const reddit = gateway.listen({
-    query: normalizedQuery,
-    sources: [{ platform: 'reddit', subreddits: ['all'], limit: 20 }],
-    filters: { timeline: 'week', languages: ['en'], exclude_nsfw: true },
-    sort_by: 'relevance_score',
-    page: 1,
-    per_page: 20,
-  });
+  // LinkedIn is the source. Revternal also registers Reddit, but it scrapes
+  // Reddit's unauthenticated endpoint and is blocked upstream, so querying it
+  // bought a doomed call and a "reddit unavailable" line on every answer that
+  // told the reader nothing they could act on. `ListenGateway.listen` stays on
+  // the interface: restoring the leg is adding it back to `attempted`.
   const linkedin = gateway.searchLinkedIn?.({
     keywords: normalizedQuery,
     recency: 'Week',
   });
 
-  // Only legs actually attempted are settled and judged. A gateway with no
-  // LinkedIn support has ONE leg, and its failure must propagate: an auth
-  // failure or exhausted quota is actionable and must never be flattened into
-  // "the source is having an outage".
+  // Only legs actually attempted are settled and judged, and a lone leg's
+  // failure must propagate: an auth failure or exhausted quota is actionable
+  // and must never be flattened into "the source is having an outage".
   const attempted: Array<{ source: string; promise: Promise<ListenGatewayResult> }> = [
-    { source: 'reddit', promise: reddit },
     ...(linkedin ? [{ source: 'linkedin', promise: linkedin }] : []),
   ];
+  if (attempted.length === 0) {
+    throw new ListenGatewayError(
+      'provider-unavailable',
+      'No public-signal source is configured for this runtime.',
+    );
+  }
   const settled = await Promise.allSettled(attempted.map((leg) => leg.promise));
   const legs = attempted.map((leg, index) => ({ source: leg.source, outcome: settled[index]! }));
 
@@ -1045,8 +1046,8 @@ function formatSourceList(sources: readonly string[]): string {
 
 /**
  * The machine-readable manifest, as standalone parseable JSON. Presentation is
- * the transport's business: `ASKABLE_AGENTS.md` documents this command as a
- * machine-readable relay response, so wrapping it here would break
+ * the transport's business: the capability manifest advertises this command
+ * as machine-readable (`discovery.machine`), so wrapping it here would break
  * `JSON.parse` for every agent and catalog that calls it.
  */
 export function renderCapabilitiesJson(gatewayStatus: ListenGateway['status']): string {

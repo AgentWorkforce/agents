@@ -10,6 +10,7 @@ import {
   buildDeployArgs,
   deployAgents,
   formatMissingInputs,
+  readPersonaIntegrationNames,
   loadRegistry,
   missingWorkspaceSecrets,
   parseArgs,
@@ -516,4 +517,40 @@ test('no workflow interpolates user-controlled input directly into a shell scrip
       );
     }
   }
+});
+
+test('readPersonaIntegrationNames names the providers a failed deploy needs connected', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'persona-integrations-'));
+  const personaJson = join(dir, 'persona.json');
+
+  writeFileSync(personaJson, JSON.stringify({
+    id: 'x',
+    integrations: {
+      revternal: { source: { kind: 'workspace' } },
+      // Optional providers are gated behind an input; sending someone to
+      // connect one they never asked for is worse than saying nothing.
+      slack: { optional: true, enabledByInput: 'SLACK_CHANNEL' },
+    },
+  }));
+  // Dormant: no SLACK_CHANNEL supplied, so Slack is not something to check.
+  assert.deepEqual(readPersonaIntegrationNames(personaJson), ['revternal']);
+
+  // Supplied: the gate is open, so Slack really does need connecting and
+  // omitting it would hide the provider the deploy is most likely failing on.
+  assert.deepEqual(
+    readPersonaIntegrationNames(personaJson, { SLACK_CHANNEL: 'C0123ABCD' }),
+    ['revternal', 'slack'],
+  );
+  // An empty value is not a supplied gate.
+  assert.deepEqual(readPersonaIntegrationNames(personaJson, { SLACK_CHANNEL: '' }), ['revternal']);
+
+  // `typeof [] === 'object'`; without an array guard this reports a provider
+  // named "0".
+  writeFileSync(personaJson, JSON.stringify({ integrations: ['revternal'] }));
+  assert.deepEqual(readPersonaIntegrationNames(personaJson), []);
+
+  // A diagnostic must never mask the real error it is trying to explain.
+  writeFileSync(personaJson, 'not json at all');
+  assert.deepEqual(readPersonaIntegrationNames(personaJson), []);
+  assert.deepEqual(readPersonaIntegrationNames(join(dir, 'absent.json')), []);
 });

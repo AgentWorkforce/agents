@@ -86,9 +86,10 @@ $ npm run test:hn
 ✔ pinned Relayflow v1 resumes a failed run without replaying completed HN step identities
 ✔ v1 resume reactivation rejects non-failed runs and touches only named descendants
 ✔ generated workflow dry run resolves least-privilege artifact grants and denies an unrelated secret
+✔ tracked TypeScript generator emits a self-contained Relayflow workflow
 ✔ production Relayflow budget covers core v1 transient replays and caller overhead
-ℹ tests 44
-ℹ pass 44
+ℹ tests 45
+ℹ pass 45
 ℹ fail 0
 ```
 
@@ -157,7 +158,7 @@ $ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm run evals:hn
 Representative scheduled trace order:
 
 ```text
-06. [PREVIEW] files.write path=workflows/hn-monitor-scheduled-digest-v1.ts bytes=14435
+08. [PREVIEW] files.write path=workflows/hn-monitor-scheduled-digest-v1.ts bytes=14470
 07. [PREVIEW] compose.run name=hn-monitor-scheduled-digest-v1 relayflowVersion=v1
 08. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] phase=claim
 09. [PREVIEW] memory.save tags=["hn-monitor:seen"]
@@ -197,7 +198,7 @@ The first cold start timed out before readiness at 30 seconds. The same command
 with a 60-second readiness allowance completed:
 
 ```text
-$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-i5.run.json
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-final-f87bf43.run.json
 preview: 1 run(s) — 1 ok, 0 failed
 policy: reads=live writes=preview model=stub shell=simulate compose=preview
 ```
@@ -208,14 +209,14 @@ Captured RunRecord summary:
 {
   "status": "succeeded",
   "liveReads": ["show_hn:current", "front_page:current", "new:current"],
-  "workflowSource": {"status":"previewed","path":"workflows/hn-monitor-scheduled-digest-v1.ts","bytes":14435},
+  "workflowSource": {"status":"previewed","path":"workflows/hn-monitor-scheduled-digest-v1.ts","bytes":14470},
   "workflow": {"status":"previewed","name":"hn-monitor-scheduled-digest-v1","version":"v1","batchKey":"hn-monitor:v1:49534948,49536840,49539792,49542723,49546659,49546831,49547372,49547527"},
   "providerWrites": ["slack.messages:previewed", "slack.messages:previewed"]
 }
 ```
 
 The RunRecord was moved to the recoverable Trash path
-`/Users/khaliqgant/.Trash/hn-monitor-live-read-i5-cadaea5.run.json` after
+`/Users/khaliqgant/.Trash/hn-monitor-live-read-final-f87bf43.run.json` after
 extracting this evidence. No provider write had status `executed`, and no
 deployment was performed.
 
@@ -227,12 +228,12 @@ persona hn-monitor: 0 integration(s), 1 schedule(s)
 --dry-run: persona validated; exiting before any side effects
 ok: hn-monitor (dry-run)
 
-$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-review-i5 --no-prompt
-bundle: staged to .hn-bundle-review-i5/runner.mjs (678.1KB)
---bundle-out: bundle ready at .hn-bundle-review-i5; skipping launch
+$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-final-f87bf43 --no-prompt
+bundle: staged to .hn-bundle-final-f87bf43/runner.mjs (705.8KB)
+--bundle-out: bundle ready at .hn-bundle-final-f87bf43; skipping launch
 
-$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-review-i5
-{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14435,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-f87bf43
+{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14470,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
 ```
 
 The bundle smoke invokes `postFreshStories` from the emitted
@@ -242,14 +243,14 @@ workflow before `ctx.workflow.run`, consumes a validated result, publishes the
 same header/thread pair through the production digest-delivery seam with stable
 keys, and completes the seen/outbox/exact-state transition.
 The inspected bundle was then moved to the recoverable Trash path
-`/Users/khaliqgant/.Trash/hn-bundle-review-i5-cadaea5`.
+`/Users/khaliqgant/.Trash/hn-bundle-final-f87bf43`.
 
 ## Repository regression result
 
 ```text
 $ npm test
-ℹ tests 338
-ℹ pass 336
+ℹ tests 347
+ℹ pass 345
 ℹ fail 2
 ```
 
@@ -376,7 +377,7 @@ $ npm run typecheck
 (exit 0)
 ```
 
-Latest literal results:
+Iteration 3 literal results:
 
 ```text
 $ npm run test:hn
@@ -408,3 +409,56 @@ both failures: ENOENT .../workforce/packages/harness-kit/package.json
 
 The live run record and bundle were moved to explicit Trash paths after
 inspection; no production provider or state write was made.
+
+## Independent review iteration 4 preflight
+
+A final executable source-closure test was added after a literal standalone
+materialization exposed a deployment-toolchain boundary:
+
+```text
+$ npm run test:hn
+✖ tracked TypeScript generator emits a self-contained Relayflow workflow
+ReferenceError: __name is not defined
+tests 45; pass 44; fail 1
+```
+
+`tsx` can insert esbuild's `__name` calls into serialized function bodies. The
+generator now carries that no-op naming helper into the new uploaded module.
+The test was not weakened; its exact TypeScript materialize-then-execute path
+now passes.
+
+```text
+$ npm run test:hn
+tests 45; pass 45; fail 0
+
+$ npm run typecheck
+> tsc --noEmit
+(exit 0)
+
+$ node scripts/test.mjs tests/hn-monitor-cases.test.mjs
+tests 14; pass 14; fail 0
+
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm run evals:hn
+all platform cases: 1 run(s) — 1 ok, 0 failed per case
+(exit 0)
+
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output .../live-read-final-f87bf43.run.json
+policy: reads=live writes=preview model=stub shell=simulate compose=preview
+fidelity: state=simulated inputs=current http=current model=simulated
+3 current HN feed reads; 1 run — 1 ok, 0 failed
+
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-f87bf43
+{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14470,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
+
+$ npm test
+tests 347; pass 345; fail 2
+both failures: ENOENT .../workforce/packages/harness-kit/package.json
+```
+
+`git diff --check` and an added-line credential-pattern scan passed. `npm
+audit --omit=dev --audit-level=high` reports the repository's existing
+transitive audit baseline (17 findings: 1 critical, 3 high, 13 moderate); this
+HN-only diff changes no dependency manifest or lockfile. The required Veto MCP
+tools were not exposed in this session, so the mandated Veto diff-review call
+could not be run; fresh independent review and the local scans are used below,
+and that tooling limitation is not represented as a pass.

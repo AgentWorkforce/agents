@@ -171,7 +171,7 @@ test('defineAgent scan schedule invokes the durable Relayflow v1 digest before p
   assert.equal(workflowCalls[0].args.batchKey, 'hn-monitor:v1:20');
   assert.deepEqual(workflowCalls[0].args.stories.map((story) => story.id), [20]);
   assert.match(workflowCalls[0].source, /from '@relayflows\/core'/u);
-  assert.match(workflowCalls[0].source, /\.step\("validate-digest"/u);
+  assert.match(workflowCalls[0].source, /\.step\(["']validate-digest["']/u);
   assert.doesNotMatch(workflowCalls[0].source, /from ['"]\.\/relayflow-v1-resume/u);
   assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [20]);

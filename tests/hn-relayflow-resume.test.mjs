@@ -11,7 +11,7 @@ import {
   scheduledDigestJournalWorkflowName,
   scheduledDigestWorkflowSource,
   SCHEDULED_DIGEST_WORKFLOW_NAME,
-} from '../.test-build/workflows/hn-monitor-scheduled-digest-v1-source.js';
+} from '../.test-build/hn-monitor/workflows/scheduled-digest.js';
 
 function resumeFixture() {
   return workflow('hn-monitor-v1-resume-fixture')

@@ -10,10 +10,10 @@ inputs:
     description: Agent name as listed in scripts/deploy/agents.json
     required: true
   workspace-id:
-    description: WORKFORCE_WORKSPACE_ID, from the caller job's environment secrets
+    description: WORKFORCE_WORKSPACE_ID, from the caller job's environment variables (a UUID; not sensitive)
     required: true
   workspace-token:
-    description: WORKFORCE_WORKSPACE_TOKEN, from the caller job's environment secrets
+    description: WORKFORCE_WORKSPACE_TOKEN, from the caller job's environment secrets (sensitive)
     required: true
   agent-inputs:
     description: >-

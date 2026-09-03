@@ -18,13 +18,17 @@ HN discussion, points/comments, feed provenance, category, and a short “why it
 matters” note.
 
 Fresh scheduled batches run through the checked-in Relayflow v1 DAG in
-`lib/batch-workflow.ts`. Its durable steps are `analyze-batch`, `review-batch`,
-`repair-batch`, and `validate-batch`; the batch idempotency key is derived from
-the sorted HN story ids. The persona remains the side-effect owner: it fetches
-and filters feeds, claims ids before posting, calls its configured model, sends
-the Slack/Telegram digest, and appends exact and semantic memory only after the
-workflow completes. A workflow failure exhausts one retry, releases the
+`../workflows/hn-monitor-scheduled-batch.ts`. Its durable steps are
+`analyze-batch`, `review-batch`, `repair-batch`, and `validate-batch`; its
+idempotency key and canonical invocation order are derived from the sorted HN
+story ids. The persona remains the side-effect owner: it fetches and filters
+feeds, claims ids before posting, invokes and awaits the workflow, sends the
+Slack/Telegram digest, and appends exact and semantic memory only after the
+workflow succeeds. A workflow failure exhausts one retry, releases the
 provisional claim when nothing was delivered, and never reaches publication.
+When the runtime returns the validator payload, the digest uses its reviewed
+notes; runtimes that expose only terminal run metadata use the existing
+grounded deterministic rendering after that successful validation gate.
 
 You can also chat with it:
 

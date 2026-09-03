@@ -34,7 +34,7 @@ expect:
     - hn-monitor.posted
   effectsContain:
     - http.read
-    - model.complete
+    - compose.run
     - provider.write
   providerActions:
     - provider: slack

@@ -5,7 +5,7 @@
  *     → fetch Front Page, Show HN, and the last 24h of New HN
  *     → score stories against an agent-infrastructure interest profile
  *     → drop ones already posted (durable memory)
- *     → add concise "why it matters" notes with ctx.llm
+ *     → analyze/review/repair/validate the fresh batch in Relayflow v1
  *     → post digest to Slack, Telegram, or both
  *
  *   Slack mention / Telegram message / relay inbox DM
@@ -40,17 +40,15 @@ import {
 import {
   createHnBatchIdempotencyKey,
   createHnBatchWorkflowInput,
+  HN_BATCH_RESULT_MARKER,
   HN_BATCH_STEP_IDS,
+  HN_BATCH_WORKFLOW_VERSION,
   HN_BATCH_WORKFLOW_NAME,
-  runHnBatchWorkflow,
-  type HnBatchWorkflowHooks,
-  type HnBatchWorkflowResult
 } from './lib/batch-workflow.js';
 
 export {
   createHnBatchIdempotencyKey,
   HN_BATCH_STEP_IDS,
-  runHnBatchWorkflow
 } from './lib/batch-workflow.js';
 
 export type HnFeed = 'front_page' | 'show_hn' | 'new';
@@ -209,15 +207,9 @@ async function resolveRelaySender(event: AgentEvent, expandedFull: unknown): Pro
 
 // ── agent definition ─────────────────────────────────────────────────────
 
-type HnBatchRunner = (
-  storyIds: readonly number[],
-  hooks: HnBatchWorkflowHooks<PostedStory>
-) => Promise<HnBatchWorkflowResult<PostedStory>>;
-
 interface HnMonitorHandlerDeps {
   createDelivery: (ctx: WorkforceCtx) => DeliveryClient;
   fetchFeeds: (lookbackHours: number) => Promise<Story[]>;
-  runBatchWorkflow: HnBatchRunner;
 }
 
 export function createHnMonitorHandler(
@@ -226,7 +218,6 @@ export function createHnMonitorHandler(
   const deps: HnMonitorHandlerDeps = {
     createDelivery: (ctx) => createDelivery(ctx),
     fetchFeeds: fetchHackerNewsFeeds,
-    runBatchWorkflow: (storyIds, hooks) => runHnBatchWorkflow(storyIds, hooks),
     ...overrides
   };
 
@@ -275,7 +266,7 @@ export function createHnMonitorHandler(
       return;
     }
 
-    await postFreshStories(ctx, delivery, seen, fresh, deps.runBatchWorkflow);
+    await postFreshStories(ctx, delivery, seen, fresh);
   };
 }
 
@@ -542,8 +533,7 @@ export async function postFreshStories(
   ctx: WorkforceCtx,
   delivery: DeliveryClient,
   seen: number[],
-  fresh: Story[],
-  batchRunner: HnBatchRunner = (storyIds, hooks) => runHnBatchWorkflow(storyIds, hooks)
+  fresh: Story[]
 ): Promise<void> {
   // Claim the stories as seen BEFORE the post. Cron delivery is at-least-once:
   // a single tick can re-invoke this handler (cloud re-runs a delivery whose
@@ -554,29 +544,38 @@ export async function postFreshStories(
   let headerPosted = false;
   let pending: PendingThreadBody | null = null;
   try {
-    const workflowInput = createHnBatchWorkflowInput(fresh.map((story) => story.id));
+    const workflowInput = createHnBatchWorkflowInput(fresh);
     ctx.log('info', 'hn-monitor.batch-workflow-started', {
       workflowName: HN_BATCH_WORKFLOW_NAME,
+      relayflowVersion: HN_BATCH_WORKFLOW_VERSION,
       idempotencyKey: workflowInput.idempotencyKey,
       storyIds: workflowInput.storyIds,
       stepIds: [...HN_BATCH_STEP_IDS]
     });
-    const workflowResult = await batchRunner(fresh.map((story) => story.id), {
-      analyze: async () => {
-        ctx.log('info', 'hn-monitor.summarizing', { fresh: fresh.length });
-        return summarize(ctx, fresh);
-      },
-      repair: async () => renderDigest(fresh, {
-        theme: fallbackTheme(fresh),
-        whyById: new Map()
-      })
-    });
+    const workflowRun = await withTimeout(
+      ctx.workflow.run(HN_BATCH_WORKFLOW_NAME, workflowInput as unknown as Record<string, unknown>),
+      30_000,
+      `ctx.workflow.run(${HN_BATCH_WORKFLOW_NAME})`
+    );
+    const workflowResult = await withTimeout(
+      workflowRun.completion(),
+      300_000,
+      `ctx.workflow.completion(${workflowRun.runId})`
+    );
+    if (workflowResult.status !== 'success') {
+      throw new Error(`HN batch workflow ${workflowRun.runId} completed with status ${workflowResult.status}`);
+    }
+    const workflowNotes = parseWorkflowDigestNotes(workflowResult.output, fresh);
     ctx.log('info', 'hn-monitor.batch-workflow-completed', {
-      idempotencyKey: workflowResult.input.idempotencyKey,
-      runId: workflowResult.runId,
-      status: workflowResult.status
+      idempotencyKey: workflowInput.idempotencyKey,
+      runId: workflowRun.runId,
+      status: workflowResult.status,
+      usedFallback: !workflowNotes
     });
-    const { header, body, stories } = workflowResult.batch;
+    const { header, body, stories } = renderDigest(fresh, workflowNotes ?? {
+      theme: fallbackTheme(fresh),
+      whyById: new Map()
+    });
     ctx.log('info', 'hn-monitor.posting', { targets: delivery.targets });
 
     // Wait for the header receipt so its delivered Slack thread timestamp can
@@ -947,60 +946,61 @@ interface DigestNotes {
   whyById: Map<number, string>;
 }
 
-async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header: string; body: string; stories: PostedStory[] }> {
-  const storyData = stories.map((story) => ({
-    id: story.id,
-    title: story.title,
-    category: story.category,
-    points: story.points,
-    comments: story.comments ?? 0,
-    feeds: story.feeds ?? [],
-    url: story.url,
-    hnUrl: story.hnUrl
-  }));
-  let notes: DigestNotes = { theme: fallbackTheme(stories), whyById: new Map() };
-  try {
-    const output = await withTimeout(
-      ctx.llm.complete(
-        [
-          'You are curating Hacker News for the Agent Relay team, which builds agent messaging, multi-agent orchestration, agent runtimes, cloud sandboxes, coding-agent workflows, and developer infrastructure.',
-          'Return ONLY compact JSON with this shape:',
-          '{"theme":"one specific sentence about the batch","stories":[{"id":123,"why":"one specific sentence, <= 160 characters"}]}',
-          'Keep every supplied story. Explain why each matters to builders of agentic developer tools; avoid generic hype and do not invent facts beyond the title/metadata.',
-          '',
-          JSON.stringify(storyData)
-        ].join('\n'),
-        { maxTokens: 900 }
-      ),
-      45_000,
-      'ctx.llm.complete'
-    );
-    notes = parseDigestNotes(output, stories);
-  } catch (error) {
-    ctx.log('warn', 'hn-monitor.llm-fallback', { error: String(error) });
-  }
-  return renderDigest(stories, notes);
-}
-
-function parseDigestNotes(output: string, stories: Story[]): DigestNotes {
-  const json = output.match(/\{[\s\S]*\}/u)?.[0] ?? output;
+function parseWorkflowDigestNotes(output: unknown, stories: Story[]): DigestNotes | null {
+  const candidate = findWorkflowDigestCandidate(output, new Set<object>());
+  if (!candidate) return null;
+  const json = candidate.match(/\{[\s\S]*\}/u)?.[0] ?? candidate;
   try {
     const parsed = JSON.parse(json) as { theme?: unknown; stories?: Array<{ id?: unknown; why?: unknown }> };
+    if (typeof parsed.theme !== 'string' || !parsed.theme.trim() || !Array.isArray(parsed.stories)) return null;
+    if (parsed.stories.length !== stories.length) return null;
+    const expectedIds = stories.map((story) => story.id).sort((a, b) => a - b);
+    const actualIds = parsed.stories.map((item) => Number(item.id)).sort((a, b) => a - b);
+    if (new Set(actualIds).size !== actualIds.length || !sameNumberList(actualIds, expectedIds)) return null;
     const whyById = new Map<number, string>();
-    for (const item of parsed.stories ?? []) {
+    for (const item of parsed.stories) {
       const id = Number(item.id);
-      if (!stories.some((story) => story.id === id) || typeof item.why !== 'string' || !item.why.trim()) continue;
+      if (typeof item.why !== 'string' || !item.why.trim()) return null;
       whyById.set(id, truncate(oneLine(item.why), 180));
     }
     return {
-      theme: typeof parsed.theme === 'string' && parsed.theme.trim()
-        ? truncate(oneLine(parsed.theme), 220)
-        : fallbackTheme(stories),
+      theme: truncate(oneLine(parsed.theme), 220),
       whyById
     };
   } catch {
-    return { theme: fallbackTheme(stories), whyById: new Map() };
+    return null;
   }
+}
+
+function sameNumberList(actual: readonly number[], expected: readonly number[]): boolean {
+  return actual.length === expected.length && actual.every((value, index) => value === expected[index]);
+}
+
+/**
+ * Runtime v4 currently returns the Relayflow run row, while test/future
+ * runtimes may return the validator payload directly. Only inspect explicit
+ * output-bearing fields so embedded prompt JSON in a run config is never
+ * mistaken for validated notes.
+ */
+function findWorkflowDigestCandidate(output: unknown, seen: Set<object>): string | null {
+  if (typeof output === 'string') {
+    const markerIndex = output.lastIndexOf(HN_BATCH_RESULT_MARKER);
+    if (markerIndex >= 0) {
+      return output.slice(markerIndex + HN_BATCH_RESULT_MARKER.length).split(/\r?\n/u, 1)[0]?.trim() ?? null;
+    }
+    return output.trim() || null;
+  }
+  const record = asRecord(output);
+  if (!record || seen.has(record)) return null;
+  seen.add(record);
+  if (typeof record.theme === 'string' && Array.isArray(record.stories)) {
+    return JSON.stringify(record);
+  }
+  for (const key of ['output', 'digest', 'result', 'stateSnapshot']) {
+    const candidate = findWorkflowDigestCandidate(record[key], seen);
+    if (candidate) return candidate;
+  }
+  return null;
 }
 
 export function renderDigest(

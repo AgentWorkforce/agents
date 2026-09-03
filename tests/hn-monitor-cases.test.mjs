@@ -83,14 +83,14 @@ test('scheduled scan case keeps the reference policy and Slack thread assertion'
   assert.ok(scan.expect.logsContain.includes('hn-monitor.feed-scan'));
   assert.ok(scan.expect.logsContain.includes('hn-monitor.batch-workflow-started'));
   assert.ok(scan.expect.logsContain.includes('hn-monitor.batch-workflow-completed'));
-  assert.ok(scan.expect.effectsContain.includes('model.complete'));
+  assert.ok(scan.expect.effectsContain.includes('compose.run'));
   assert.ok(scan.expect.effectsContain.includes('provider.write'));
   assert.deepEqual(scan.expect.providerActions[0], {
     provider: 'slack',
     resource: 'messages',
     channel: 'C123',
     threaded: true,
-    textContains: ['Agent'],
+    textContains: ['What stands out'],
   });
 });
 
@@ -109,6 +109,7 @@ test('deterministic feed case preserves story-selection and memory coverage', ()
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.batch-workflow-started'));
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.batch-workflow-completed'));
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.posted'));
+  assert.ok(deterministic.expect.effectsContain.includes('compose.run'));
   assert.ok(deterministic.expect.effectsContain.includes('memory.save'));
 });
 
@@ -125,6 +126,7 @@ test('legacy eval JSONL keeps the HN deterministic feed-count contract in sync',
   );
   assert.ok(legacyEntry.expect.logsAny.includes('hn-monitor.batch-workflow-started'));
   assert.ok(legacyEntry.expect.logsAny.includes('hn-monitor.batch-workflow-completed'));
+  assert.ok(legacyEntry.expect.sideEffectsAll.includes('workflow.run'));
 });
 
 test('Slack provider-trigger case is multi-turn and shares the HN detail fixture', () => {
@@ -182,8 +184,8 @@ test('live-model case uses fixture HN reads plus live model mode', () => {
     'live-model must assert feed-scan log with concrete counts');
   assert.ok(liveModel.expect?.effectsContain?.includes('http.read'),
     'live-model must assert http.read effect for fixture-backed HN fetches');
-  assert.ok(liveModel.expect?.effectsContain?.includes('model.complete'),
-    'live-model must assert model.complete effect (proves real model path was exercised)');
+  assert.ok(liveModel.expect?.effectsContain?.includes('compose.run'),
+    'live-model must assert that scheduled analysis delegates to Relayflow');
   assert.ok(liveModel.expect?.effectsContain?.includes('provider.write'),
     'live-model must assert provider.write effect');
   assert.ok(Array.isArray(liveModel.expect?.providerActions) && liveModel.expect.providerActions.length >= 1,

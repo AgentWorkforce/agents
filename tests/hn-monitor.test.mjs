@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
+import { WorkflowRunner } from '@relayflows/core';
 
 import {
   createHnBatchIdempotencyKey,
@@ -13,14 +14,13 @@ import {
   postFreshStories,
   renderDigest,
   retryPendingThreadBody,
-  runHnBatchWorkflow,
   selectQuestionStories,
   selectRelevantStories,
 } from '../.test-build/hn-monitor/agent.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-function fakeCtx({ llm } = {}) {
+function fakeCtx({ llm, workflow } = {}) {
   const events = [];
   const saved = [];
   const logs = [];
@@ -60,6 +60,18 @@ function fakeCtx({ llm } = {}) {
         async complete() {
           events.push('llm');
           return 'digest body';
+        },
+      },
+      workflow: workflow ?? {
+        async run(name, args) {
+          events.push('workflow.run');
+          return {
+            runId: 'wf-preview',
+            async completion() {
+              events.push('workflow.completion');
+              return { status: 'success', output: null };
+            },
+          };
         },
       },
     },
@@ -119,16 +131,28 @@ function cronEvent() {
   });
 }
 
-test('fresh cron batch invokes and awaits the real Relayflow with stable inputs, then publishes and persists once', async () => {
-  let releaseAnalysis;
-  let markAnalysisStarted;
-  const analysisStarted = new Promise((resolve) => { markAnalysisStarted = resolve; });
-  const analysisGate = new Promise((resolve) => { releaseAnalysis = resolve; });
+test('fresh cron batch invokes and awaits the checked-in Relayflow with stable inputs, then publishes and persists once', async () => {
+  let releaseCompletion;
+  let markCompletionStarted;
+  const completionStarted = new Promise((resolve) => { markCompletionStarted = resolve; });
+  const completionGate = new Promise((resolve) => { releaseCompletion = resolve; });
+  const workflowCalls = [];
   const { ctx, saved, logs, files } = fakeCtx({
     llm: {
       async complete() {
-        markAnalysisStarted();
-        return analysisGate;
+        throw new Error('scheduled batches must not call ctx.llm outside Relayflow');
+      },
+    },
+    workflow: {
+      async run(name, args) {
+        workflowCalls.push({ name, args });
+        return {
+          runId: 'wf-hn-v1-20-30',
+          async completion() {
+            markCompletionStarted();
+            return completionGate;
+          },
+        };
       },
     },
   });
@@ -158,29 +182,45 @@ test('fresh cron batch invokes and awaits the real Relayflow with stable inputs,
 
   let settled = false;
   const run = handler(ctx, cronEvent()).then(() => { settled = true; });
-  await analysisStarted;
+  await completionStarted;
 
   assert.equal(settled, false, 'cron handler must await Relayflow completion');
-  assert.equal(posts.length, 0, 'publishing must not begin while batch analysis is running');
+  assert.equal(posts.length, 0, 'publishing must not begin while Relayflow is running');
   assert.equal(
     saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length,
     0,
     'digest persistence must not begin while the workflow is running',
   );
 
-  releaseAnalysis('digest body');
+  releaseCompletion({
+    status: 'success',
+    output: {
+      theme: 'Durable orchestration is moving into the scheduled product path.',
+      stories: [
+        { id: 20, why: 'The batch now has a durable analysis and review gate.' },
+        { id: 30, why: 'The result remains grounded in the supplied HN metadata.' },
+      ],
+    },
+  });
   await run;
 
   const sortedIds = [20, 30];
   const idempotencyKey = createHnBatchIdempotencyKey(sortedIds);
+  assert.equal(workflowCalls.length, 1);
+  assert.equal(workflowCalls[0].name, 'hn-monitor-scheduled-batch-v1');
+  assert.equal(workflowCalls[0].args.relayflowVersion, 'v1');
+  assert.equal(workflowCalls[0].args.idempotencyKey, idempotencyKey);
+  assert.deepEqual(workflowCalls[0].args.storyIds, sortedIds);
+  assert.deepEqual(workflowCalls[0].args.stories.map((story) => story.id), sortedIds);
   const started = logs.find((entry) => entry.message === 'hn-monitor.batch-workflow-started');
   const completed = logs.find((entry) => entry.message === 'hn-monitor.batch-workflow-completed');
   assert.deepEqual(started?.attrs?.storyIds, sortedIds);
   assert.equal(started?.attrs?.idempotencyKey, idempotencyKey);
   assert.deepEqual(started?.attrs?.stepIds, HN_BATCH_STEP_IDS);
   assert.equal(completed?.attrs?.idempotencyKey, idempotencyKey);
-  assert.equal(completed?.attrs?.status, 'completed');
+  assert.equal(completed?.attrs?.status, 'success');
   assert.equal(posts.length, 2, 'one digest is one header plus one threaded body');
+  assert.match(posts[1].text, /durable analysis and review gate/u);
   assert.equal(
     saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length,
     1,
@@ -189,109 +229,67 @@ test('fresh cron batch invokes and awaits the real Relayflow with stable inputs,
   assert.ok(files.has('/slack/channels/C123/hn-monitor/recent-digests.json'));
 });
 
-test('HN batch Relayflow keeps its story-id key order independent and runs the four static durable steps', async () => {
+test('HN batch Relayflow keeps its story-id key order independent', () => {
   assert.equal(
     createHnBatchIdempotencyKey([30, 20, 30]),
     createHnBatchIdempotencyKey([20, 30]),
   );
-  const events = [];
-  const draft = {
-    header: 'header',
-    body: 'body',
-    stories: [{ id: 30 }, { id: 20 }],
-  };
+});
 
-  const result = await runHnBatchWorkflow(
-    [30, 20],
-    {
-      analyze: async () => draft,
-      repair: async () => { throw new Error('valid draft must not need repair'); },
-    },
-    { onEvent: (event) => events.push(event) },
+test('checked-in HN Relayflow v1 has a valid four-step production DAG and one pinned retry', async () => {
+  const previousArgs = process.env.invocationArgs;
+  const previousConfigOnly = process.env.HN_MONITOR_WORKFLOW_CONFIG_ONLY;
+  process.env.invocationArgs = JSON.stringify({
+    relayflowVersion: 'v1',
+    idempotencyKey: createHnBatchIdempotencyKey([9102, 9101]),
+    storyIds: [9101, 9102],
+    stories: [
+      { id: 9101, title: 'Agent runtime', url: 'https://example.com/9101', points: 8, comments: 1, feeds: ['new'] },
+      { id: 9102, title: 'Coding agent memory', url: 'https://example.com/9102', points: 12, comments: 3, feeds: ['front_page'] },
+    ],
+  });
+  process.env.HN_MONITOR_WORKFLOW_CONFIG_ONLY = '1';
+  let workflowModule;
+  try {
+    workflowModule = await import(`../.test-build/workflows/hn-monitor-scheduled-batch.js?test=${Date.now()}`);
+  } finally {
+    if (previousArgs === undefined) delete process.env.invocationArgs;
+    else process.env.invocationArgs = previousArgs;
+    if (previousConfigOnly === undefined) delete process.env.HN_MONITOR_WORKFLOW_CONFIG_ONLY;
+    else process.env.HN_MONITOR_WORKFLOW_CONFIG_ONLY = previousConfigOnly;
+  }
+
+  const config = workflowModule.config;
+  assert.equal(typeof workflowModule.runWorkflow, 'function');
+  assert.throws(
+    () => workflowModule.assertCompletedWorkflowRun({ status: 'failed', error: 'validator failed' }),
+    /HN batch workflow failed \(failed\): validator failed/u,
   );
-
-  assert.equal(result.status, 'completed');
+  assert.deepEqual(config.workflows[0].steps.map((step) => step.name), HN_BATCH_STEP_IDS);
+  assert.equal(config.errorHandling.strategy, 'retry');
+  assert.equal(config.errorHandling.maxRetries, 1);
+  assert.equal(config.errorHandling.onExhaustion, 'fail');
   assert.deepEqual(
-    events.filter((event) => event.type === 'step:started').map((event) => event.stepName),
-    HN_BATCH_STEP_IDS,
+    config.workflows[0].steps.map((step) => step.dependsOn ?? []),
+    [[], ['analyze-batch'], ['review-batch'], ['repair-batch']],
   );
-  assert.deepEqual(result.input.storyIds, [20, 30]);
+  assert.ok(config.agents.every((agent) => agent.cli === 'claude' && agent.interactive === false));
+
+  const report = new WorkflowRunner().dryRun(config);
+  assert.equal(report.valid, true, report.errors.join('\n'));
+  assert.equal(report.totalSteps, HN_BATCH_STEP_IDS.length);
 });
 
-test('HN batch Relayflow retries one transient analysis failure and completes with one validated result', async () => {
-  let attempts = 0;
-  const events = [];
-  const result = await runHnBatchWorkflow(
-    [9102, 9101],
-    {
-      analyze: async () => {
-        attempts += 1;
-        if (attempts === 1) throw new Error('transient analysis failure');
-        return { header: 'header', body: 'body', stories: [{ id: 9102 }, { id: 9101 }] };
-      },
-      repair: async () => { throw new Error('valid retry result must not need repair'); },
-    },
-    { onEvent: (event) => events.push(event) },
-  );
-
-  assert.equal(result.status, 'completed');
-  assert.equal(attempts, 2);
-  assert.deepEqual(
-    events.filter((event) => event.type === 'step:retrying').map((event) => event.stepName),
-    ['analyze-batch'],
-  );
-});
-
-test('HN batch Relayflow repairs a review finding before final validation', async () => {
-  let repairs = 0;
-  const result = await runHnBatchWorkflow(
-    [9151],
-    {
-      analyze: async () => ({ header: 'header', body: '', stories: [{ id: 9151 }] }),
-      repair: async (_draft, findings) => {
-        repairs += 1;
-        assert.deepEqual(findings, ['body is empty']);
-        return { header: 'header', body: 'repaired body', stories: [{ id: 9151 }] };
-      },
-    },
-  );
-
-  assert.equal(repairs, 1);
-  assert.equal(result.batch.body, 'repaired body');
-  assert.equal(result.status, 'completed');
-});
-
-test('HN batch Relayflow pins retry exhaustion as failed completion, and failed cron analysis cannot publish or persist', async () => {
-  let attempts = 0;
-  const events = [];
-  await assert.rejects(
-    () => runHnBatchWorkflow(
-      [9201],
-      {
-        analyze: async () => {
-          attempts += 1;
-          throw new Error('permanent analysis failure');
-        },
-        repair: async (draft) => draft,
-      },
-      { onEvent: (event) => events.push(event) },
-    ),
-    /Step "analyze-batch" failed/u,
-  );
-  assert.equal(attempts, 2, 'one initial attempt plus one configured retry');
-  assert.ok(events.some((event) => event.type === 'run:failed'));
-
+test('failed workflow completion cannot publish or persist and releases the provisional claim', async () => {
   const { ctx, saved } = fakeCtx();
+  ctx.workflow.run = async () => ({
+    runId: 'wf-failed',
+    async completion() { return { status: 'failure', output: 'review failed' }; },
+  });
   const posts = [];
   await assert.rejects(
-    () => postFreshStories(
-      ctx,
-      fakeDelivery(posts),
-      [10],
-      [STORY],
-      async () => { throw new Error('workflow failed completion'); },
-    ),
-    /workflow failed completion/u,
+    () => postFreshStories(ctx, fakeDelivery(posts), [10], [STORY]),
+    /completed with status failure/u,
   );
   assert.equal(posts.length, 0);
   assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length, 0);
@@ -414,14 +412,14 @@ test('selectQuestionStories normalizes common HN prefixes when the question omit
 
 // ── posting tests ─────────────────────────────────────────────────────────
 
-test('postFreshStories claims fresh ids before summarizing, then threads the digest under a header', async () => {
+test('postFreshStories claims fresh ids before the workflow, then threads the digest under a header', async () => {
   const { ctx, events, saved } = fakeCtx();
   const posts = [];
   const delivery = fakeDelivery(posts);
 
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [10, 20]);
   assert.deepEqual(saved[0].opts, { tags: ['hn-monitor:seen'], scope: 'workspace' });
   assert.equal(posts.length, 2);
@@ -441,16 +439,14 @@ test('postFreshStories claims fresh ids before summarizing, then threads the dig
   assert.match(record.stories[0].why, /agent ecosystem/i);
 });
 
-test('postFreshStories falls back to plain digest when LLM throws', async () => {
-  const { ctx, events, saved } = fakeCtx({
-    llm: { async complete() { events.push('llm'); throw new Error('llm exploded'); } },
-  });
+test('postFreshStories falls back to the deterministic digest when workflow output has no notes', async () => {
+  const { ctx, events, saved } = fakeCtx();
   const posts = [];
   const delivery = fakeDelivery(posts);
 
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [10, 20]);
   assert.equal(posts.length, 2);
   assert.match(posts[0].text, /HN agentic radar/);
@@ -586,7 +582,7 @@ test('postFreshStories releases claim when header publish fails', async () => {
     /Header publish failed/,
   );
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
   assert.deepEqual(saved.map(savedSeenIds), [[10, 20], [10]]);
 });
 

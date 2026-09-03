@@ -5,6 +5,11 @@ interface JournalRun {
 
 export const SCHEDULED_DIGEST_WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 
+/** Core v1 journals the builder's executable workflow definition with this suffix. */
+export function scheduledDigestJournalWorkflowName(publicName: string): string {
+  return `${publicName}-workflow`;
+}
+
 interface JournalStep {
   id: string;
   stepName: string;
@@ -64,6 +69,7 @@ interface WorkflowProgramDependencies {
   workflow: typeof import('@relayflows/core').workflow;
   JsonFileWorkflowDb: typeof import('@relayflows/core').JsonFileWorkflowDb;
   reactivateSkippedV1Steps: typeof reactivateSkippedV1Steps;
+  scheduledDigestJournalWorkflowName: typeof scheduledDigestJournalWorkflowName;
 }
 
 function workflowProgram({
@@ -75,6 +81,7 @@ function workflowProgram({
   workflow,
   JsonFileWorkflowDb,
   reactivateSkippedV1Steps,
+  scheduledDigestJournalWorkflowName,
 }: WorkflowProgramDependencies): void {
 const WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 const OUTPUT_MARKER = 'HN_DIGEST_NOTES_JSON:';
@@ -249,7 +256,7 @@ async function main(): Promise<void> {
   if (requestedResumeRunId) {
     await reactivateSkippedV1Steps(
       requestedResumeRunId,
-      WORKFLOW_NAME,
+      scheduledDigestJournalWorkflowName(WORKFLOW_NAME),
       path.join(process.cwd(), '.agent-relay', 'workflow-runs.jsonl'),
       (filePath) => new JsonFileWorkflowDb(filePath),
       ['analyze-stories', 'review-digest', 'validate-digest'],
@@ -395,7 +402,8 @@ export function scheduledDigestWorkflowSource(): string {
     "import path from 'node:path';",
     "import { JsonFileWorkflowDb, workflow } from '@relayflows/core';",
     `const reactivateSkippedV1Steps = (${reactivateSkippedV1Steps.toString()});`,
-    `(${workflowProgram.toString()})({ readFile, mkdir, writeFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps });`,
+    `const scheduledDigestJournalWorkflowName = (${scheduledDigestJournalWorkflowName.toString()});`,
+    `(${workflowProgram.toString()})({ readFile, mkdir, writeFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps, scheduledDigestJournalWorkflowName });`,
     '',
   ].join('\n');
 }

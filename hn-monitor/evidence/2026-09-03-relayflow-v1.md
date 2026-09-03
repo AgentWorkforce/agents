@@ -258,3 +258,13 @@ the same gate when retrying a previously queued body. The focused regression
 asserts the body is not sent and exact state is not attempted under the compound
 failure; a second regression asserts the recovery path also performs no
 provider effect until the intent succeeds.
+
+The fresh Claude reviewer independently found a second high-severity issue on
+the same candidate: pinned core v1 journals `workflow(publicName)` as
+`${publicName}-workflow`, while the product resume guard compared the public
+name. A production-name contract was added against the installed
+`@relayflows/core` builder before the source change and failed because the new
+contract export did not yet exist. The source now derives the journal name in
+one explicit v1 helper, embeds that helper in the uploaded workflow, and the
+mock journal uses the real suffixed name. The separate actual-core resume test
+continues to prove completed steps are not replayed.

@@ -198,7 +198,7 @@ The first cold start timed out before readiness at 30 seconds. The same command
 with a 60-second readiness allowance completed:
 
 ```text
-$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-final-f87bf43.run.json
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-final-091be58.run.json
 preview: 1 run(s) — 1 ok, 0 failed
 policy: reads=live writes=preview model=stub shell=simulate compose=preview
 ```
@@ -216,7 +216,7 @@ Captured RunRecord summary:
 ```
 
 The RunRecord was moved to the recoverable Trash path
-`/Users/khaliqgant/.Trash/hn-monitor-live-read-final-f87bf43.run.json` after
+`/Users/khaliqgant/.Trash/hn-monitor-live-read-final-091be58.run.json` after
 extracting this evidence. No provider write had status `executed`, and no
 deployment was performed.
 
@@ -228,11 +228,11 @@ persona hn-monitor: 0 integration(s), 1 schedule(s)
 --dry-run: persona validated; exiting before any side effects
 ok: hn-monitor (dry-run)
 
-$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-final-f87bf43 --no-prompt
-bundle: staged to .hn-bundle-final-f87bf43/runner.mjs (705.8KB)
---bundle-out: bundle ready at .hn-bundle-final-f87bf43; skipping launch
+$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-final-091be58 --no-prompt
+bundle: staged to .hn-bundle-final-091be58/runner.mjs (705.7KB)
+--bundle-out: bundle ready at .hn-bundle-final-091be58; skipping launch
 
-$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-f87bf43
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-091be58
 {"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14470,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
 ```
 
@@ -243,7 +243,7 @@ workflow before `ctx.workflow.run`, consumes a validated result, publishes the
 same header/thread pair through the production digest-delivery seam with stable
 keys, and completes the seen/outbox/exact-state transition.
 The inspected bundle was then moved to the recoverable Trash path
-`/Users/khaliqgant/.Trash/hn-bundle-final-f87bf43`.
+`/Users/khaliqgant/.Trash/hn-bundle-final-091be58`.
 
 ## Repository regression result
 
@@ -442,12 +442,12 @@ $ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm run evals:hn
 all platform cases: 1 run(s) — 1 ok, 0 failed per case
 (exit 0)
 
-$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output .../live-read-final-f87bf43.run.json
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output .../live-read-final-091be58.run.json
 policy: reads=live writes=preview model=stub shell=simulate compose=preview
 fidelity: state=simulated inputs=current http=current model=simulated
 3 current HN feed reads; 1 run — 1 ok, 0 failed
 
-$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-f87bf43
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-091be58
 {"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14470,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
 
 $ npm test
@@ -462,3 +462,11 @@ HN-only diff changes no dependency manifest or lockfile. The required Veto MCP
 tools were not exposed in this session, so the mandated Veto diff-review call
 could not be run; fresh independent review and the local scans are used below,
 and that tooling limitation is not represented as a pass.
+
+While the final PR was being prepared, upstream PR #131 moved the materializer
+and source generator under `hn-monitor/workflows/`. The branch merged that
+change instead of duplicating the old top-level layout. The executable tracked
+source test then failed red on its stale import (`MODULE_NOT_FOUND`), was updated
+to the persona-local path, and returned to 45/45. Deterministic E2E, live HN
+read/preview-only delivery, deploy dry-run, and emitted-bundle/source smoke were
+rerun on merge-clean checkpoint `091be58`; PR #132 reports mergeable.

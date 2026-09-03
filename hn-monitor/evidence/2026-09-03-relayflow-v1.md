@@ -5,8 +5,8 @@
 The product surface is the deployed `hn-monitor/persona.ts` plus
 `hn-monitor/agent.ts`. The implementation preserves the schedule, HN reads,
 ranking, channel-scoped seen claim, header/thread delivery, exact Slack state,
-semantic memory, pending-body recovery, and conversational Q&A. Only scheduled
-digest curation moved behind a Relayflow v1 workflow.
+semantic memory, durable partial-delivery recovery, and conversational Q&A.
+Only scheduled digest curation moved behind a Relayflow v1 workflow.
 
 Initial worktree proof, before the red test:
 
@@ -26,6 +26,28 @@ All later commands used the absolute worktree and the first two checkpoints were
 pushed as `18ab776` (red test) and `c1390fc` (product workflow). Deploy closure
 was pushed as `7757261`.
 
+After the path was recreated again, the required absolute-path durability
+check found the intact review candidate and no cleanup source:
+
+```text
+$ pwd
+/Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt
+$ git rev-parse --abbrev-ref HEAD
+feat/hn-monitor-relayflow-v1-0903
+$ git rev-parse HEAD
+59b7151aa84c1688817ab3f3ee5be57ef9e71568
+$ git worktree list --porcelain
+worktree /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt
+HEAD 59b7151aa84c1688817ab3f3ee5be57ef9e71568
+branch refs/heads/feat/hn-monitor-relayflow-v1-0903
+$ rg -n --hidden --glob '!node_modules/**' --glob '!.git/**' 'git worktree remove|worktree prune|rm -r[fF]?.*(worktree|private/tmp)|/private/tmp|mktemp' .
+hn-monitor/evidence/2026-09-03-relayflow-v1.md:... prior evidence text only
+```
+
+Only sample Git hooks exist, and the process scan found no worktree remove or
+prune command. The subsequent review-fix checkpoint was committed and pushed
+as `cadaea5`.
+
 ## Red first
 
 ```text
@@ -41,6 +63,20 @@ This failed against the actual `defineAgent` cron entrypoint, not a meta
 workflow. The red assertion required that the scheduled scan delegate to a
 testable product seam and invoke a named v1 workflow before any provider write.
 
+The final durability review also began red against the same product delivery
+path:
+
+```text
+$ npm run test:hn
+not ok - critical memory save returning no receipt aborts before any provider effect
+not ok - partial multi-target header persists a phase-aware per-provider outbox
+```
+
+The first failure proved that `ctx.memory.save()` can resolve without a receipt
+and the old path continued to a provider effect. The second proved that a
+header-success/body-failure marker could not represent a partial header across
+Slack and Telegram.
+
 ## Focused product and journal gates
 
 ```text
@@ -50,8 +86,9 @@ $ npm run test:hn
 ✔ pinned Relayflow v1 resumes a failed run without replaying completed HN step identities
 ✔ v1 resume reactivation rejects non-failed runs and touches only named descendants
 ✔ generated workflow dry run resolves least-privilege artifact grants and denies an unrelated secret
-ℹ tests 36
-ℹ pass 36
+✔ production Relayflow budget covers core v1 transient replays and caller overhead
+ℹ tests 40
+ℹ pass 40
 ℹ fail 0
 ```
 
@@ -113,27 +150,46 @@ typechecked source generator and is intentionally ignored by Git.
 ## Deterministic platform E2E
 
 ```text
-$ env WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=30000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=60000 npm run evals:hn
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm run evals:hn
 (exit 0; every checked-in non-live HN case passed)
 ```
 
 Representative scheduled trace order:
 
 ```text
-07. [PREVIEW] memory.save tags=["hn-monitor:seen"]
-08. [PREVIEW] files.write path=workflows/hn-monitor-scheduled-digest-v1.ts bytes=14095
-09. [PREVIEW] compose.run name=hn-monitor-scheduled-digest-v1 relayflowVersion=v1 batchKey=hn-monitor:v1:1001,1002,1003
-10. [PREVIEW] provider.write slack.messages (header)
-11. [PREVIEW] memory.save tags=["hn-monitor:pending-post-state"]
-12. [PREVIEW] provider.write slack.messages (thread body)
-13. [PREVIEW] files.write exact per-thread digest state
-14. [PREVIEW] files.write rolling digest index
-15. [PREVIEW] memory.save tags=["hn-monitor:post"]
-16. [PREVIEW] memory.save tags=["hn-monitor:pending-post-state"] (clear)
+06. [PREVIEW] files.write path=workflows/hn-monitor-scheduled-digest-v1.ts bytes=14435
+07. [PREVIEW] compose.run name=hn-monitor-scheduled-digest-v1 relayflowVersion=v1
+08. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] phase=claim
+09. [PREVIEW] memory.save tags=["hn-monitor:seen"]
+10. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] phase=headers
+11. [PREVIEW] provider.write slack.messages idempotencyKey=...:slack:header
+12-13. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] header checkpoint → bodies
+14. [PREVIEW] provider.write slack.messages idempotencyKey=...:slack:body parentRef=...
+15-16. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] body checkpoint → state
+17-18. [PREVIEW] files.write exact per-thread digest state + rolling index
+19. [PREVIEW] memory.save tags=["hn-monitor:post"]
+20. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] cleared=true
 ```
 
 The multi-turn fixture also proves the later Slack Q&A path still performs the
 grounded item read, `model.complete`, and in-thread reply.
+
+The live-model case was also invoked explicitly so its final source could not
+be inferred from a batch wrapper:
+
+```text
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH ./node_modules/.bin/agentworkforce invoke ./hn-monitor/agent.ts --case ./hn-monitor/cases/live-model.case.yaml
+preview: 1 run(s) — 1 ok, 0 failed
+[ok] slack.message.created@1 ... (24 action(s))
+policy: reads=fixtures writes=preview model=live shell=simulate compose=preview
+```
+
+This machine had no parent-side live model adapter, so the `model.complete`
+action was recorded as `denied`/`source=unavailable` and the persona exercised
+its grounded fallback answer. The case still proves the final event is Slack,
+the schedule is Relayflow compose-previewed, HN item hydration is fixture-backed,
+and every provider write is preview-only; it is not evidence of a successful
+live model response.
 
 ## Live HN read without production writes
 
@@ -141,7 +197,7 @@ The first cold start timed out before readiness at 30 seconds. The same command
 with a 60-second readiness allowance completed:
 
 ```text
-$ env WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output ./hn-monitor/live-read.run.json
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-i5.run.json
 preview: 1 run(s) — 1 ok, 0 failed
 policy: reads=live writes=preview model=stub shell=simulate compose=preview
 ```
@@ -152,14 +208,16 @@ Captured RunRecord summary:
 {
   "status": "succeeded",
   "liveReads": ["show_hn:current", "front_page:current", "new:current"],
-  "workflowSource": {"status":"previewed","path":"workflows/hn-monitor-scheduled-digest-v1.ts","bytes":14095},
-  "workflow": {"status":"previewed","name":"hn-monitor-scheduled-digest-v1","version":"v1","batchKey":"hn-monitor:v1:49534948,49535390,49536840,49539792,49542723,49545164,49546659,49546831"},
+  "workflowSource": {"status":"previewed","path":"workflows/hn-monitor-scheduled-digest-v1.ts","bytes":14435},
+  "workflow": {"status":"previewed","name":"hn-monitor-scheduled-digest-v1","version":"v1","batchKey":"hn-monitor:v1:49534948,49536840,49539792,49542723,49546659,49546831,49547372,49547527"},
   "providerWrites": ["slack.messages:previewed", "slack.messages:previewed"]
 }
 ```
 
-The RunRecord was deleted after extracting this evidence. No provider write had
-status `executed`, and no deployment was performed.
+The RunRecord was moved to the recoverable Trash path
+`/Users/khaliqgant/.Trash/hn-monitor-live-read-i5-cadaea5.run.json` after
+extracting this evidence. No provider write had status `executed`, and no
+deployment was performed.
 
 ## Existing deploy surface and packaged handler
 
@@ -169,18 +227,22 @@ persona hn-monitor: 0 integration(s), 1 schedule(s)
 --dry-run: persona validated; exiting before any side effects
 ok: hn-monitor (dry-run)
 
-$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-review-i2 --no-prompt
-bundle: staged to .hn-bundle-review-i2/runner.mjs (668.5KB)
---bundle-out: bundle ready at .hn-bundle-review-i2; skipping launch
+$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-review-i5 --no-prompt
+bundle: staged to .hn-bundle-review-i5/runner.mjs (678.1KB)
+--bundle-out: bundle ready at .hn-bundle-review-i5; skipping launch
 
-$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-review-i2
-{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14095,"posts":2,"stateSaves":4}
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-review-i5
+{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14435,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
 ```
 
 The bundle smoke invokes `postFreshStories` from the emitted
-`agent.bundle.mjs`, proves the bundled handler materializes a self-contained
-core workflow before `ctx.workflow.run`, consumes a validated result, publishes
-the same header/thread pair, and saves seen/post state.
+`agent.bundle.mjs`, runs the bundled scheduled product entrypoint with a
+deterministic HN fixture, proves the handler materializes a self-contained core
+workflow before `ctx.workflow.run`, consumes a validated result, publishes the
+same header/thread pair through the production digest-delivery seam with stable
+keys, and completes the seen/outbox/exact-state transition.
+The inspected bundle was then moved to the recoverable Trash path
+`/Users/khaliqgant/.Trash/hn-bundle-review-i5-cadaea5`.
 
 ## Repository regression result
 
@@ -210,8 +272,9 @@ No credential values were added. Story titles are treated as untrusted data;
 agents are instructed not to follow title instructions or browse, and a
 deterministic gate requires the exact batch key and story IDs with bounded
 text. Each agent runs from the batch artifact directory with `restricted`
-access, no inherited workspace paths, no network, and only its request/input
-plus one output grant. The executable adversarial dry-run fixture places a
+access, no inherited workspace paths, a `network: false` declaration, and only
+its request/input plus one output grant. The hosting runtime remains responsible
+for enforcing that compiled network policy. The executable adversarial dry-run fixture places a
 credential-named unrelated file beside the workflow and fails unless Relayflow
 resolves exactly 1 read + 1 write path for the curator and 2 reads + 1 write
 path for the reviewer while denying unrelated paths.
@@ -277,13 +340,38 @@ remain isolated as a narrow follow-up diff on the required feature branch.
 
 Automated review also identified an under-budgeted retry path and a bundle
 smoke that captured but did not execute the emitted workflow source. The
-workflow now makes the supported retry path explicit: deterministic prepare
-and both agent steps get one attempt; the final validator gets one
-reviewer-assisted repair and retry. Their 210-second maximum is covered by the
-240-second workflow timeout and the persona's 255-second completion wait. The
-bundle smoke now writes the exact source captured from `agent.bundle.mjs` into
+workflow makes the supported retry path explicit: deterministic prepare and
+both agent steps get one nominal attempt; the final validator gets one
+reviewer-assisted repair and retry. The bundle smoke writes the exact source captured from `agent.bundle.mjs` into
 a workspace-local scratch directory, runs its real Relayflow dry-run, checks
 the journaled workflow name, and removes the scratch directory.
+
+## Independent review iteration 3
+
+A fresh Claude reviewer passed `59b7151` with no findings. A fresh Codex
+reviewer found two high-severity delivery gaps plus timeout and evidence issues:
+critical memory writes failed open on a receiptless success; a single marker
+could not distinguish pre-effect from post-effect worker death or partial
+Slack/Telegram progress; core v1.0.6 transient same-attempt replays were not
+included in the timeout; and the live-model final event source was incorrectly
+pinned to cron.
+
+The remediation introduces one durable `claim → headers → bodies → state`
+outbox, independent per-provider status, stable batch/provider/phase operation
+keys on the real provider drafts, receipt-checked critical memory writes,
+`failOnError: true` critical recalls, and state-only recovery after delivery.
+The worst supported Relayflow path is now budgeted at about 451 seconds with a
+480-second workflow timeout, 510-second completion wait, and 600-second persona
+harness timeout. The live-model final source is explicitly Slack.
+
+```text
+$ npm run test:hn
+tests 40; pass 40; fail 0
+
+$ npm run typecheck
+> tsc --noEmit
+(exit 0)
+```
 
 Latest literal results:
 

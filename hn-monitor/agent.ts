@@ -709,6 +709,9 @@ async function resumeDigestOutbox(
     throw new ExactPostPersistenceError();
   }
   await clearDigestOutbox(ctx, outbox.batchKey);
+  ctx.log('info', 'hn-monitor.posted', {
+    targets: digestProviderEntries(outbox).map(([provider]) => provider).join(',')
+  });
   ctx.log('info', 'hn-monitor.outbox-completed', {
     batchKey: outbox.batchKey,
     providers: digestProviderEntries(outbox).map(([provider]) => provider)

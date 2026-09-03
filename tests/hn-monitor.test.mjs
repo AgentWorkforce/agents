@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 
+import hnMonitorAgent, * as hnMonitor from '../.test-build/hn-monitor/agent.js';
 import {
   fetchHackerNewsFeeds,
   findStoryByExactTitle,
@@ -16,7 +17,7 @@ import {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-function fakeCtx({ llm } = {}) {
+function fakeCtx({ llm, workflow } = {}) {
   const events = [];
   const saved = [];
   const logs = [];
@@ -58,6 +59,7 @@ function fakeCtx({ llm } = {}) {
           return 'digest body';
         },
       },
+      workflow,
     },
     events,
     saved,
@@ -103,6 +105,61 @@ function isClearedPending(entry) {
 }
 
 const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
+
+test('defineAgent scan schedule invokes the durable Relayflow v1 digest before publishing', async () => {
+  assert.deepEqual(hnMonitorAgent.schedules, [
+    { name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' },
+  ]);
+  assert.equal(
+    typeof hnMonitor.runScheduledScan,
+    'function',
+    'the product schedule handler must delegate to an executable scheduled-scan seam',
+  );
+
+  const workflowCalls = [];
+  const { ctx, events, saved } = fakeCtx({
+    llm: {
+      async complete() {
+        throw new Error('the scheduled product path must not call ctx.llm directly');
+      },
+    },
+    workflow: {
+      async run(name, args) {
+        events.push('workflow.run');
+        workflowCalls.push({ name, args });
+        return {
+          runId: 'wf-hn-v1-20',
+          async completion() {
+            events.push('workflow.completion');
+            return {
+              status: 'success',
+              output: JSON.stringify({
+                theme: 'Durable orchestration is moving into the product path.',
+                stories: [{ id: 20, why: 'The scan now has journaled, resumable workflow steps.' }],
+              }),
+            };
+          },
+        };
+      },
+    },
+  });
+  const posts = [];
+
+  await hnMonitor.runScheduledScan(ctx, {
+    delivery: fakeDelivery(posts),
+    fetchStories: async () => [{ ...STORY, feeds: ['front_page'] }],
+  });
+
+  assert.equal(workflowCalls.length, 1);
+  assert.equal(workflowCalls[0].name, 'hn-monitor-scheduled-digest-v1');
+  assert.equal(workflowCalls[0].args.relayflowVersion, 'v1');
+  assert.equal(workflowCalls[0].args.batchKey, 'hn-monitor:v1:20');
+  assert.deepEqual(workflowCalls[0].args.stories.map((story) => story.id), [20]);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
+  assert.deepEqual(savedSeenIds(saved[0]), [20]);
+  assert.equal(posts.length, 2);
+  assert.match(posts[1].text, /journaled, resumable workflow steps/);
+});
 
 // ── feed discovery + relevance tests ───────────────────────────────────────
 

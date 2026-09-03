@@ -30,9 +30,17 @@ survive `RESUME_RUN_ID`. A small v1 compatibility helper reactivates only
 descendants core `1.0.6` journaled as `skipped`; that version resets the failed
 step itself but otherwise leaves skipped descendants inert on resume. A
 deterministic final gate checks the exact batch key, story ids, and output
-bounds before the persona can consume the notes. Provider
+bounds before the persona can consume the notes. Curator and reviewer agents
+run from the batch artifact directory with restricted file grants (request →
+candidate → digest), no inherited workspace access, and no network access.
+The workflow dry run fails unless those grants resolve exactly. Provider
 writes and their exact Slack grounding records intentionally remain in the
 persona so existing delivery/recovery semantics do not move.
+
+Within a deployed worker, overlapping schedule deliveries are serialized per
+workspace/agent across the durable seen read, claim, workflow, and provider
+effects. The second delivery therefore re-reads the first delivery's claim
+instead of composing or posting the same batch from a stale snapshot.
 
 The invocation carries `relayflowVersion: v1`, while the current Cloud workflow
 request intentionally omits a runtime selector and therefore preserves the v1
@@ -55,9 +63,12 @@ You can also chat with it:
   a complete story title uses a conservative HN Algolia title match before
   hydration. Ambiguous or loose keyword matches are rejected.
 
+Before the threaded body is sent, the handler saves a state-finalization intent.
 If a delivered Slack digest cannot persist its exact grounding record, the run
-fails explicitly and emits `hn-monitor.post-grounding-persistence-failed`;
-semantic-memory failure alone remains a warning because exact state is primary.
+fails explicitly and emits `hn-monitor.post-grounding-persistence-failed`.
+The next serialized tick retries only exact state, then sees the retained claim,
+so it neither recomposes nor reposts the digest. Semantic-memory failure alone
+remains a warning because exact state is primary.
 
 Exact state currently follows the configured Slack channel. Telegram-only and
 relay-only follow-ups still use semantic memory plus the strict title fallback;

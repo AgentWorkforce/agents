@@ -117,7 +117,15 @@ interface PendingThreadBody {
   headerRefs: Array<{ provider: 'slack' | 'telegram'; draftRef: string; channel?: string; chatId?: string; threadTs?: string }>;
 }
 
+interface PendingPostState {
+  kind?: 'hn-monitor pending exact post state';
+  cleared?: boolean;
+  createdAt: string;
+  record: PostRecord;
+}
+
 const SCHEDULED_DIGEST_VERSION = 'v1' as const;
+const scheduledScanLocks = new Map<string, Promise<void>>();
 
 interface ScheduledScanDependencies {
   delivery?: DeliveryClient;
@@ -259,33 +267,59 @@ export async function runScheduledScan(
     return;
   }
 
-  // Pending thread body recovery — if a previous run posted the header but
-  // the threaded body failed, retry it before processing new stories.
-  if (await retryPendingThreadBody(ctx, delivery)) return;
+  // One deployed worker can receive overlapping at-least-once cron
+  // deliveries. Serialize the whole read/claim/effect path per workspace and
+  // agent so the second invocation re-reads the first invocation's durable
+  // claim instead of racing from the same stale snapshot.
+  await withScheduledScanLock(scheduledScanLockKey(ctx), async () => {
+    // A body recovery owns this tick because it can perform a provider effect.
+    if (await retryPendingThreadBody(ctx, delivery)) return;
+    // Exact-state recovery performs no provider write and may safely precede a
+    // new scan. It closes the body-delivered/state-write-failed window.
+    await retryPendingPostState(ctx);
 
-  const topics = list(input(ctx, 'TOPICS'));
-  const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
-  const maxStories = boundedPositiveInt(input(ctx, 'MAX_STORIES') ?? '8', 'MAX_STORIES', 20);
+    const topics = list(input(ctx, 'TOPICS'));
+    const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
+    const maxStories = boundedPositiveInt(input(ctx, 'MAX_STORIES') ?? '8', 'MAX_STORIES', 20);
 
-  const stories = await (deps.fetchStories ?? fetchHackerNewsFeeds)(lookbackHours);
-  const feedCounts = countFeeds(stories);
-  ctx.log(
-    'info',
-    `hn-monitor.feed-scan front_page=${feedCounts.front_page} show_hn=${feedCounts.show_hn} new=${feedCounts.new}`,
-    { stories: stories.length, lookbackHours }
-  );
-  const matches = selectRelevantStories(stories, topics, maxStories);
-  ctx.log('info', `hn-monitor.matched-agentic matched=${matches.length}`, { matched: matches.length, candidates: stories.length });
+    const stories = await (deps.fetchStories ?? fetchHackerNewsFeeds)(lookbackHours);
+    const feedCounts = countFeeds(stories);
+    ctx.log(
+      'info',
+      `hn-monitor.feed-scan front_page=${feedCounts.front_page} show_hn=${feedCounts.show_hn} new=${feedCounts.new}`,
+      { stories: stories.length, lookbackHours }
+    );
+    const matches = selectRelevantStories(stories, topics, maxStories);
+    ctx.log('info', `hn-monitor.matched-agentic matched=${matches.length}`, { matched: matches.length, candidates: stories.length });
 
-  const seen = await loadSeen(ctx);
-  const fresh = matches.filter((story) => !seen.includes(story.id));
-  ctx.log('info', `hn-monitor.fresh fresh=${fresh.length}`, { fresh: fresh.length });
-  if (fresh.length === 0) {
-    ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
-    return;
+    const seen = await loadSeen(ctx);
+    const fresh = matches.filter((story) => !seen.includes(story.id));
+    ctx.log('info', `hn-monitor.fresh fresh=${fresh.length}`, { fresh: fresh.length });
+    if (fresh.length === 0) {
+      ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
+      return;
+    }
+
+    await postFreshStories(ctx, delivery, seen, fresh);
+  });
+}
+
+function scheduledScanLockKey(ctx: WorkforceCtx): string {
+  return `${ctx.workspaceId ?? 'workspace'}:${ctx.agentName ?? 'hn-monitor'}`;
+}
+
+async function withScheduledScanLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const predecessor = scheduledScanLocks.get(key) ?? Promise.resolve();
+  let release = (): void => {};
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  scheduledScanLocks.set(key, current);
+  await predecessor.catch(() => {});
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (scheduledScanLocks.get(key) === current) scheduledScanLocks.delete(key);
   }
-
-  await postFreshStories(ctx, delivery, seen, fresh);
 }
 
 // ── Q&A handler ──────────────────────────────────────────────────────────
@@ -573,6 +607,20 @@ export async function postFreshStories(
       stories,
       headerRefs: saveHeaderRefs(heads)
     };
+    const postRecord: PostRecord = {
+      postedAt: pendingBase.createdAt,
+      digest: `${header}\n${body}`,
+      stories,
+      threadRefs: pendingBase.headerRefs
+    };
+
+    // Persist the state-finalization intent before the body effect. If the
+    // body lands but the exact Slack state write fails, the next serialized
+    // tick can restore grounding without publishing the digest again.
+    pending = pendingBase;
+    await savePendingPostState(ctx, postRecord).catch((error) => {
+      ctx.log('warn', 'hn-monitor.pending-post-state-unavailable', { error: String(error) });
+    });
 
     // Thread the body under each header, also non-blocking.
     const bodyResult = await delivery.send(body, { replyTo: heads, nonBlocking: true });
@@ -580,19 +628,15 @@ export async function postFreshStories(
     // Check that ALL attempted targets received refs — if any were lost, treat
     // as partial failure so the pending-recovery path saves state for retry.
     if (!bodyResult.ok || bodyResult.refs.length < delivery.targets.length) {
-      pending = pendingBase;
       throw new Error(`Threaded body failed on some targets`);
     }
+    pending = null;
     ctx.log('info', 'hn-monitor.posted', { targets: delivery.targets.join(',') });
 
     // Retain the digest for Q&A recall (~30 day rolling window via memory ttl).
-    const exactStateSaved = await savePost(ctx, {
-      postedAt: new Date().toISOString(),
-      digest: `${header}\n${body}`,
-      stories,
-      threadRefs: saveHeaderRefs(heads)
-    });
+    const exactStateSaved = await savePost(ctx, postRecord);
     if (!exactStateSaved) throw new ExactPostPersistenceError();
+    await clearPendingPostState(ctx);
   } catch (err) {
     if (!headerPosted) {
       // Nothing landed yet — release the provisional claim so the next tick
@@ -667,8 +711,12 @@ export async function retryPendingThreadBody(
     return true;
   }
 
+  // Clear the provider-effect retry before attempting exact-state recovery.
+  // If the following state write fails, the separate pending-post intent
+  // retries state only and cannot duplicate the threaded body.
+  await clearPendingThreadBody(ctx);
   const exactStateSaved = await savePost(ctx, {
-    postedAt: new Date().toISOString(),
+    postedAt: pending.createdAt,
     digest: `${pending.header}\n${pending.body}`,
     stories: pending.stories,
     threadRefs: pending.headerRefs
@@ -677,8 +725,24 @@ export async function retryPendingThreadBody(
     ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true });
     throw new ExactPostPersistenceError();
   }
-  await clearPendingThreadBody(ctx);
+  await clearPendingPostState(ctx);
   ctx.log('info', 'hn-monitor.pending-body-posted', { targets: configuredTargets });
+  return true;
+}
+
+/** Retry exact grounding state only; this path never calls a provider. */
+export async function retryPendingPostState(ctx: WorkforceCtx): Promise<boolean> {
+  const pending = await loadPendingPostState(ctx);
+  if (!pending) return false;
+  const exactStateSaved = await savePost(ctx, pending.record);
+  if (!exactStateSaved) {
+    ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true, stateOnly: true });
+    throw new ExactPostPersistenceError();
+  }
+  await clearPendingPostState(ctx);
+  ctx.log('info', 'hn-monitor.pending-post-state-saved', {
+    stories: pending.record.stories.map((story) => story.id)
+  });
   return true;
 }
 
@@ -1645,6 +1709,50 @@ async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<boolean>
   }
   return exactStateSaved;
 }
+
+async function loadPendingPostState(ctx: WorkforceCtx): Promise<PendingPostState | null> {
+  const items = await ctx.memory.recall('hn-monitor pending exact post state recovery', {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace',
+    limit: 10
+  });
+  for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
+    if (!item.content) continue;
+    try {
+      const pending = JSON.parse(item.content) as Partial<PendingPostState>;
+      if (pending.cleared) return null;
+      if (typeof pending.createdAt === 'string' && isPostRecord(pending.record)) {
+        return pending as PendingPostState;
+      }
+    } catch {
+      // try the next recalled version
+    }
+  }
+  return null;
+}
+
+async function savePendingPostState(ctx: WorkforceCtx, record: PostRecord): Promise<void> {
+  await ctx.memory.save(JSON.stringify({
+    kind: 'hn-monitor pending exact post state',
+    createdAt: new Date().toISOString(),
+    record
+  }), {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace'
+  });
+}
+
+async function clearPendingPostState(ctx: WorkforceCtx): Promise<void> {
+  await ctx.memory.save(JSON.stringify({
+    kind: 'hn-monitor pending exact post state',
+    cleared: true,
+    createdAt: new Date().toISOString()
+  }), {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace'
+  });
+}
+
 async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
   const items = await ctx.memory.recall('hn-monitor posted digest', {
     tags: ['hn-monitor:post'],

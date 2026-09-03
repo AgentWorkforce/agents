@@ -48,8 +48,10 @@ $ npm run test:hn
 ✔ defineAgent scan schedule invokes the durable Relayflow v1 digest before publishing
 ...
 ✔ pinned Relayflow v1 resumes a failed run without replaying completed HN step identities
-ℹ tests 33
-ℹ pass 33
+✔ v1 resume reactivation rejects non-failed runs and touches only named descendants
+✔ generated workflow dry run resolves least-privilege artifact grants and denies an unrelated secret
+ℹ tests 36
+ℹ pass 36
 ℹ fail 0
 ```
 
@@ -68,8 +70,15 @@ HN_DIGEST_NOTES_JSON:{"theme":"fixture","stories":[]}
 ```
 
 The compatibility helper exists because pinned core `1.0.6` resets failed
-steps but leaves their skipped descendants inert. It updates only skipped
-journal rows to pending; completed step rows and outputs are left untouched.
+steps but leaves their skipped descendants inert. It rejects running,
+completed, and wrong-workflow runs, and updates only the explicitly named
+skipped descendants; completed step rows and outputs are left untouched.
+
+The focused suite also starts two scheduled scans concurrently from delayed,
+stale memory snapshots and proves only one Relayflow and one header/body pair
+execute. A separate failure/recovery test makes exact Slack state unavailable
+after both messages are delivered, then proves the next scheduled tick restores
+state without a second workflow or provider write.
 
 ```text
 $ npm run typecheck
@@ -95,7 +104,7 @@ Execution Plan (4 steps, 4 waves):
   Wave 3: review-digest
   Wave 4: validate-digest
 Validation: PASS (0 errors, 0 warnings)
-HN_RELAYFLOW_DRY_RUN:{"name":"hn-monitor-scheduled-digest-v1-workflow","stepCount":4,"batchKey":"hn-monitor:v1:20"}
+HN_RELAYFLOW_DRY_RUN:{"name":"hn-monitor-scheduled-digest-v1-workflow","stepCount":4,"batchKey":"hn-monitor:v1:20","permissions":[{"agent":"curator","access":"restricted","readPaths":1,"writePaths":1,...},{"agent":"reviewer","access":"restricted","readPaths":2,"writePaths":1,...}]}
 ```
 
 The `.ts` file in that command is the runtime materialization of the tracked,
@@ -111,14 +120,16 @@ $ env WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=30000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_M
 Representative scheduled trace order:
 
 ```text
-06. [PREVIEW] memory.save tags=["hn-monitor:seen"]
-07. [PREVIEW] files.write path=workflows/hn-monitor-scheduled-digest-v1.ts bytes=12634
-08. [PREVIEW] compose.run name=hn-monitor-scheduled-digest-v1 relayflowVersion=v1 batchKey=hn-monitor:v1:1001,1002,1003
-09. [PREVIEW] provider.write slack.messages (header)
-10. [PREVIEW] provider.write slack.messages (thread body)
-11. [PREVIEW] files.write exact per-thread digest state
-12. [PREVIEW] files.write rolling digest index
-13. [PREVIEW] memory.save tags=["hn-monitor:post"]
+07. [PREVIEW] memory.save tags=["hn-monitor:seen"]
+08. [PREVIEW] files.write path=workflows/hn-monitor-scheduled-digest-v1.ts bytes=14095
+09. [PREVIEW] compose.run name=hn-monitor-scheduled-digest-v1 relayflowVersion=v1 batchKey=hn-monitor:v1:1001,1002,1003
+10. [PREVIEW] provider.write slack.messages (header)
+11. [PREVIEW] memory.save tags=["hn-monitor:pending-post-state"]
+12. [PREVIEW] provider.write slack.messages (thread body)
+13. [PREVIEW] files.write exact per-thread digest state
+14. [PREVIEW] files.write rolling digest index
+15. [PREVIEW] memory.save tags=["hn-monitor:post"]
+16. [PREVIEW] memory.save tags=["hn-monitor:pending-post-state"] (clear)
 ```
 
 The multi-turn fixture also proves the later Slack Q&A path still performs the
@@ -141,7 +152,7 @@ Captured RunRecord summary:
 {
   "status": "succeeded",
   "liveReads": ["show_hn:current", "front_page:current", "new:current"],
-  "workflowSource": {"status":"previewed","path":"workflows/hn-monitor-scheduled-digest-v1.ts","bytes":12634},
+  "workflowSource": {"status":"previewed","path":"workflows/hn-monitor-scheduled-digest-v1.ts","bytes":14095},
   "workflow": {"status":"previewed","name":"hn-monitor-scheduled-digest-v1","version":"v1","batchKey":"hn-monitor:v1:49534948,49535390,49536840,49539792,49542723,49545164,49546659,49546831"},
   "providerWrites": ["slack.messages:previewed", "slack.messages:previewed"]
 }
@@ -158,12 +169,12 @@ persona hn-monitor: 0 integration(s), 1 schedule(s)
 --dry-run: persona validated; exiting before any side effects
 ok: hn-monitor (dry-run)
 
-$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-check --no-prompt
-bundle: staged to .hn-bundle-check/runner.mjs
---bundle-out: bundle ready at .hn-bundle-check; skipping launch
+$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-review-i2 --no-prompt
+bundle: staged to .hn-bundle-review-i2/runner.mjs (668.5KB)
+--bundle-out: bundle ready at .hn-bundle-review-i2; skipping launch
 
-$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-check
-{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":12634,"posts":2,"saved":2}
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-review-i2
+{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14095,"posts":2,"stateSaves":4}
 ```
 
 The bundle smoke invokes `postFreshStories` from the emitted
@@ -175,8 +186,8 @@ the same header/thread pair, and saves seen/post state.
 
 ```text
 $ npm test
-ℹ tests 335
-ℹ pass 333
+ℹ tests 338
+ℹ pass 336
 ℹ fail 2
 ```
 
@@ -198,11 +209,31 @@ persona compile/deploy validation, and packaged-handler smoke are green.
 No credential values were added. Story titles are treated as untrusted data;
 agents are instructed not to follow title instructions or browse, and a
 deterministic gate requires the exact batch key and story IDs with bounded
-text. Agent processes run only inside the isolated Relayflow workflow sandbox;
-`.env` and secret-looking paths are denied.
+text. Each agent runs from the batch artifact directory with `restricted`
+access, no inherited workspace paths, no network, and only its request/input
+plus one output grant. The executable adversarial dry-run fixture places a
+credential-named unrelated file beside the workflow and fails unless Relayflow
+resolves exactly 1 read + 1 write path for the curator and 2 reads + 1 write
+path for the reviewer while denying unrelated paths.
 
 The persona sends `relayflowVersion: 'v1'` in invocation metadata while the
 current Cloud request intentionally omits a runtime selector, preserving its v1
 default. After Cloud v2 is proven, migration is limited to
 `SCHEDULED_DIGEST_VERSION`, the single workflow invocation, and removal of the
 documented core-1.0.6 resume compatibility helper. No v2 fallback exists now.
+
+## Independent review iteration 1
+
+The fresh Codex reviewer returned `VERDICT: FINDINGS` on `ff9c34e` with four
+items: a sequential-only dedupe test, no exact-state-only recovery after
+delivery, overly broad agent workspace access, and resume mutation allowed for
+running/all-skipped rows. The next candidate addresses each item with,
+respectively, a per-workspace/agent scheduled critical section plus concurrent
+stale-snapshot test; a pre-body finalization intent plus no-repost recovery
+test; restricted three-artifact/no-network permissions plus an adversarial
+permission-compiler test; and failed-only/named-descendant reactivation with
+running/completed/wrong-workflow rejection coverage.
+
+The iteration-1 Claude worker returned `BLOCKED` without reviewing because the
+broker scheduled it to a Linux node that did not contain the macOS repository.
+It is recorded as an infrastructure non-review and is not counted as signoff.

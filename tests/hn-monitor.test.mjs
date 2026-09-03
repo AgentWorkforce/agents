@@ -24,6 +24,8 @@ function fakeCtx({ llm, workflow } = {}) {
   const files = new Map();
   return {
     ctx: {
+      workspaceId: 'ws-test',
+      agentName: 'hn-monitor',
       log(level, message, attrs) { logs.push({ level, message, attrs }); },
       persona: {
         inputs: { SLACK_CHANNEL: 'C123' },
@@ -115,6 +117,15 @@ function isClearedPending(entry) {
   }
 }
 
+function isClearedPendingPost(entry) {
+  if (!entry?.opts?.tags?.includes('hn-monitor:pending-post-state')) return false;
+  try {
+    return JSON.parse(entry.content).cleared === true;
+  } catch {
+    return false;
+  }
+}
+
 const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
 
 test('defineAgent scan schedule invokes the durable Relayflow v1 digest before publishing', async () => {
@@ -173,13 +184,13 @@ test('defineAgent scan schedule invokes the durable Relayflow v1 digest before p
   assert.match(workflowCalls[0].source, /from '@relayflows\/core'/u);
   assert.match(workflowCalls[0].source, /\.step\(["']validate-digest["']/u);
   assert.doesNotMatch(workflowCalls[0].source, /from ['"]\.\/relayflow-v1-resume/u);
-  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save', 'save', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [20]);
   assert.equal(posts.length, 2);
   assert.match(posts[1].text, /journaled, resumable workflow steps/);
 });
 
-test('runScheduledScan dedupes a repeated story before starting a second Relayflow', async () => {
+test('runScheduledScan serializes concurrent claims before starting a second Relayflow', async () => {
   let workflowRuns = 0;
   let recalledSeenIds = [];
   const { ctx } = fakeCtx({
@@ -199,10 +210,13 @@ test('runScheduledScan dedupes a repeated story before starting a second Relayfl
     if (opts?.tags?.includes('hn-monitor:seen')) recalledSeenIds = JSON.parse(content).ids;
   };
   ctx.memory.recall = async (_query, opts) => {
-    if (!opts?.tags?.includes('hn-monitor:seen') || recalledSeenIds.length === 0) return [];
+    if (!opts?.tags?.includes('hn-monitor:seen')) return [];
+    const snapshot = [...recalledSeenIds];
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    if (snapshot.length === 0) return [];
     return [{
       id: 'seen-state',
-      content: JSON.stringify({ ids: recalledSeenIds }),
+      content: JSON.stringify({ ids: snapshot }),
       tags: ['hn-monitor:seen'],
       scope: 'workspace',
       createdAt: '2026-09-03T08:00:00.000Z',
@@ -218,10 +232,12 @@ test('runScheduledScan dedupes a repeated story before starting a second Relayfl
     }],
   };
 
-  await hnMonitor.runScheduledScan(ctx, deps);
-  await hnMonitor.runScheduledScan(ctx, deps);
+  await Promise.all([
+    hnMonitor.runScheduledScan(ctx, deps),
+    hnMonitor.runScheduledScan(ctx, deps),
+  ]);
 
-  assert.equal(workflowRuns, 1, 'the durable seen claim must suppress duplicate orchestration');
+  assert.equal(workflowRuns, 1, 'the serialized durable claim must suppress duplicate orchestration');
   assert.equal(posts.length, 2, 'only one header/body digest should be published');
 });
 
@@ -364,7 +380,7 @@ test('postFreshStories claims fresh ids before summarizing, then threads the dig
 
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save', 'save', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [10, 20]);
   assert.deepEqual(saved[0].opts, { tags: ['hn-monitor:seen'], scope: 'workspace' });
   assert.equal(posts.length, 2);
@@ -374,8 +390,9 @@ test('postFreshStories claims fresh ids before summarizing, then threads the dig
   assert.match(posts[1].text, /HN discussion/);
   assert.equal(posts[1].replyTo, 'ref-1');
 
-  assert.deepEqual(saved[1].opts, { tags: ['hn-monitor:post'], scope: 'workspace' });
-  const record = JSON.parse(saved[1].content);
+  const postSave = saved.find((entry) => entry.opts?.tags?.includes('hn-monitor:post'));
+  assert.deepEqual(postSave.opts, { tags: ['hn-monitor:post'], scope: 'workspace' });
+  const record = JSON.parse(postSave.content);
   assert.match(record.digest, /HN agentic radar/);
   assert.ok(typeof record.postedAt === 'string' && !Number.isNaN(Date.parse(record.postedAt)));
   assert.equal(record.stories[0].id, STORY.id);
@@ -395,7 +412,7 @@ test('postFreshStories falls back to plain digest when Relayflow throws', async 
 
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  assert.deepEqual(events, ['save', 'workflow.run', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'save', 'save', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [10, 20]);
   assert.equal(posts.length, 2);
   assert.match(posts[0].text, /HN agentic radar/);
@@ -403,7 +420,7 @@ test('postFreshStories falls back to plain digest when Relayflow throws', async 
   assert.match(posts[1].text, /example\.com\/20/);
   assert.equal(posts[1].replyTo, 'ref-1');
 
-  const record = JSON.parse(saved[1].content);
+  const record = JSON.parse(saved.find((entry) => entry.opts?.tags?.includes('hn-monitor:post')).content);
   assert.match(record.digest, /Agent Workforce cron leases/);
   assert.equal(record.stories[0].id, STORY.id);
   assert.equal(record.stories[0].rank, 1);
@@ -492,6 +509,62 @@ test('exact-state failure after Slack delivery rejects with an observable persis
   assert.equal(posts.length, 2, 'the already-delivered Slack digest must not be posted again in-process');
   assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.post-state-unavailable'));
   assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.post-grounding-persistence-failed'));
+});
+
+test('next scheduled tick repairs exact state after delivery without reposting', async () => {
+  const { ctx, saved, files, logs } = fakeCtx();
+  let exactWritesFail = true;
+  let workflowRuns = 0;
+  const originalWrite = ctx.files.write;
+  ctx.files.write = async (path, contents) => {
+    if (exactWritesFail && path.startsWith('/slack/')) throw new Error('relayfile unavailable');
+    await originalWrite(path, contents);
+  };
+  ctx.workflow.run = async () => {
+    workflowRuns += 1;
+    return {
+      runId: `wf-state-recovery-${workflowRuns}`,
+      async completion() { return { status: 'success', output: null }; },
+    };
+  };
+  ctx.memory.recall = async (_query, opts) => {
+    const tag = opts?.tags?.[0];
+    if (!tag) return [];
+    return saved
+      .filter((entry) => entry.opts?.tags?.includes(tag))
+      .map((entry, index) => ({
+        id: `${tag}-${index}`,
+        content: entry.content,
+        tags: [tag],
+        scope: 'workspace',
+        createdAt: new Date(Date.UTC(2026, 8, 3, 8, 0, index)).toISOString(),
+      }));
+  };
+  const posts = [];
+  const deps = {
+    delivery: fakeDelivery(posts),
+    fetchStories: async () => [{
+      ...STORY,
+      title: 'AgentWorkforce durable agent runtime orchestration',
+      feeds: ['front_page'],
+    }],
+  };
+
+  await assert.rejects(
+    () => hnMonitor.runScheduledScan(ctx, deps),
+    /deterministic HN grounding state could not be persisted/u,
+  );
+  assert.equal(posts.length, 2);
+  assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-post-state') && !isClearedPendingPost(entry)));
+
+  exactWritesFail = false;
+  await hnMonitor.runScheduledScan(ctx, deps);
+
+  assert.equal(posts.length, 2, 'state-only recovery must not repeat header or body effects');
+  assert.equal(workflowRuns, 1, 'the recovered seen claim must suppress a second orchestration');
+  assert.ok(files.has('/slack/channels/C123/hn-monitor/recent-digests.json'));
+  assert.ok(saved.some(isClearedPendingPost));
+  assert.ok(logs.some((entry) => entry.message === 'hn-monitor.pending-post-state-saved'));
 });
 
 test('Telegram-only delivery treats Slack exact-state persistence as a successful no-op', async () => {

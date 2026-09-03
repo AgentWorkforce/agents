@@ -78,12 +78,14 @@ assert.equal(workflowCall?.args.relayflowVersion, 'v1');
 assert.match(workflowCall?.source ?? '', /from '@relayflows\/core'/u);
 assert.doesNotMatch(workflowCall?.source ?? '', /from ['"]\.\/relayflow-v1-resume/u);
 assert.equal(posts.length, 2);
-assert.equal(saved.length, 2);
+assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:seen')).length, 1);
+assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length, 1);
+assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:pending-post-state')).length, 2);
 
 console.log(JSON.stringify({
   workflow: workflowCall.name,
   version: workflowCall.args.relayflowVersion,
   sourceBytes: workflowCall.source.length,
   posts: posts.length,
-  saved: saved.length,
+  stateSaves: saved.length,
 }));

@@ -38,12 +38,12 @@ neither.
 
 ---
 
-## 2. Get the two secrets
+## 2. Get the two values
 
-| Secret | What it is |
-| --- | --- |
-| `WORKFORCE_WORKSPACE_ID` | Which workspace to deploy into |
-| `WORKFORCE_WORKSPACE_TOKEN` | The token that authorises deploys into it |
+| Name | What it is | Where it goes |
+| --- | --- | --- |
+| `WORKFORCE_WORKSPACE_ID` | Which workspace to deploy into (a UUID; not sensitive) | Environment **variable** |
+| `WORKFORCE_WORKSPACE_TOKEN` | The token that authorises deploys into it (grants write; sensitive) | Environment **secret** |
 
 These are the deploy CLI's documented headless-auth pair: when both are set, the
 CLI skips the browser session entirely. That is the whole reason this works in
@@ -101,16 +101,19 @@ exactly:
 workforce
 ```
 
-Then add both secrets under **Environment secrets**:
+Then add:
 
-- `WORKFORCE_WORKSPACE_ID`
-- `WORKFORCE_WORKSPACE_TOKEN`
+- `WORKFORCE_WORKSPACE_ID` under **Environment variables** (the workspace UUID
+  is not sensitive; leaving it in variables keeps it visible in the run summary
+  for debugging).
+- `WORKFORCE_WORKSPACE_TOKEN` under **Environment secrets** (the token is
+  sensitive and must never appear in logs).
 
 The name `workforce` matters: the deploy job declares `environment: workforce`,
-and that declaration is what makes those secrets resolve. Get the name wrong and
-the job runs with *empty strings* rather than failing to start — which is why
-the workflow checks for empty values in a dedicated step and tells you exactly
-this.
+and that declaration is what makes both the variable and the secret resolve.
+Get the name wrong and the job runs with *empty strings* rather than failing to
+start — which is why the workflow checks for empty values in a dedicated step
+and tells you exactly this.
 
 An environment also gets you the optional extras: required reviewers before a
 deploy runs, and a branch rule limiting which refs can deploy.

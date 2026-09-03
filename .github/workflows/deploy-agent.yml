@@ -3,10 +3,11 @@ name: Deploy agent
 # Deploy one agent from this repo to YOUR Agent Workforce workspace.
 # Full setup instructions: docs/SELF-DEPLOY.md
 #
-# Required config (Settings -> Environments -> New environment named "workforce"
-# -> Environment secrets):
-#   WORKFORCE_WORKSPACE_ID     your workspace id
-#   WORKFORCE_WORKSPACE_TOKEN  that workspace's token
+# Required config (Settings -> Environments -> New environment named "workforce"):
+#   WORKFORCE_WORKSPACE_ID     your workspace id (Environment variable — not
+#                              sensitive; a UUID that identifies the workspace)
+#   WORKFORCE_WORKSPACE_TOKEN  that workspace's token (Environment secret —
+#                              sensitive; grants write access to the workspace)
 #
 # --- Why `workflow_dispatch` ONLY -------------------------------------------
 # This repo is PUBLIC, so anyone can open a pull request from a fork. Do NOT add
@@ -72,7 +73,7 @@ jobs:
         with:
           agent: ${{ inputs.agent }}
           dry-run: ${{ inputs.dry-run }}
-          workspace-id: ${{ secrets.WORKFORCE_WORKSPACE_ID }}
+          workspace-id: ${{ vars.WORKFORCE_WORKSPACE_ID }}
           workspace-token: ${{ secrets.WORKFORCE_WORKSPACE_TOKEN }}
           # Stacked lowest-precedence first; the deploy script lets later lines
           # win. So: AGENT_INPUTS variable = your standing defaults, AGENT_INPUTS

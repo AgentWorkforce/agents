@@ -530,7 +530,11 @@ test('concurrent digest posts preserve authoritative per-thread state for both S
 
 test('exact-state failure after Slack delivery rejects with an observable persistence error', async () => {
   const { ctx, logs } = fakeCtx();
-  ctx.files.write = async () => { throw new Error('relayfile unavailable'); };
+  const originalWrite = ctx.files.write;
+  ctx.files.write = async (path, contents) => {
+    if (path.startsWith('/slack/channels/')) throw new Error('relayfile unavailable');
+    return originalWrite(path, contents);
+  };
   const posts = [];
 
   await assert.rejects(
@@ -543,7 +547,7 @@ test('exact-state failure after Slack delivery rejects with an observable persis
   assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.post-grounding-persistence-failed'));
 });
 
-test('receiptless post-header checkpoint replays the same idempotent operation before sending the body', async () => {
+test('exact post-header checkpoint avoids replay when the audit-memory receipt is missing', async () => {
   const { ctx, saved } = fakeCtx();
   const originalSave = ctx.memory.save;
   let outboxSaves = 0;
@@ -585,9 +589,9 @@ test('receiptless post-header checkpoint replays the same idempotent operation b
   failCheckpoint = false;
   const recovered = await retryPendingThreadBody(ctx, delivery);
   assert.equal(recovered, true);
-  assert.equal(calls.length, 3, 'recovery replays the header operation, then sends the body');
-  assert.equal(calls[0].opts.idempotencyKey, calls[1].opts.idempotencyKey,
-    'a different cron delivery must reuse the provider idempotency key');
+  assert.equal(calls.length, 2, 'exact recovery state skips the already delivered header and sends only the body');
+  assert.notEqual(calls[0].opts.idempotencyKey, calls[1].opts.idempotencyKey,
+    'the recovered operation advances from the header key to the body key');
   assert.equal(logicalEffects.size, 2, 'provider dedupe yields one logical header and one body effect');
 });
 
@@ -737,6 +741,35 @@ test('production digest delivery writes stable provider idempotency keys and thr
   }
 });
 
+test('provider receipt creation metadata is not used as the delivered message identity', async () => {
+  const path = '/slack/channels/C123/messages/draft-operation.json';
+  setPreviewTransport({
+    async read() { return undefined; },
+    async list() { return []; },
+    async write() {
+      return {
+        path,
+        absolutePath: path,
+        deliveryStatus: 'confirmed',
+        receipt: {
+          created: '2026-09-03T10:30:00.000Z',
+          id: 'provider-message-id',
+        },
+      };
+    },
+  });
+  try {
+    const { ctx } = fakeCtx();
+    const delivery = createDigestDelivery(ctx);
+    const ref = await delivery.sendOperation('slack', 'header', { idempotencyKey: 'stable-header' });
+
+    assert.equal(ref.ts, 'provider-message-id');
+    assert.equal(ref.draftRef, path);
+  } finally {
+    clearPreviewTransport();
+  }
+});
+
 test('Telegram operation replay reuses one deterministic Relayfile draft identity', async () => {
   const preview = new PreviewTransport({ idFactory: (_request, sequence) => String(sequence) });
   setPreviewTransport(preview);
@@ -814,6 +847,82 @@ test('zero configured targets retire a pending outbox before the scheduled scan 
 
   assert.equal(fetches, 0, 'a no-target scan does not read HN after recovery');
   assert.ok(saved.some(isClearedOutbox), 'the disabled provider is omitted and the stale outbox is cleared');
+});
+
+test('an exact cleared outbox prevents replay when bounded memory recall returns an older checkpoint', async () => {
+  const { ctx, saved } = fakeCtx();
+  await assert.rejects(
+    () => postFreshStories(ctx, {
+      targets: ['slack'],
+      async sendOperation() { throw new Error('provider unavailable'); },
+    }, [], [STORY]),
+    /provider unavailable/u,
+  );
+
+  ctx.memory.recall = async (_query, opts) => saved
+    .filter((entry) => entry.opts?.tags?.includes(opts?.tags?.[0]))
+    .map((entry, index) => ({ ...entry, id: `m-${index}`, tags: entry.opts.tags, scope: 'workspace', createdAt: `${index}` }))
+    .reverse();
+  await hnMonitor.runScheduledScan(ctx, {
+    delivery: {
+      targets: [],
+      async sendOperation() { throw new Error('a removed provider must not be called'); },
+    },
+    fetchStories: async () => { throw new Error('recovery should own this tick'); },
+  });
+
+  const staleActive = saved.find((entry) => isDigestOutbox(entry) && !isClearedOutbox(entry));
+  ctx.memory.recall = async (_query, opts) => opts?.tags?.includes('hn-monitor:digest-outbox')
+    ? [{ ...staleActive, id: 'stale-active', tags: staleActive.opts.tags, scope: 'workspace', createdAt: '2026-09-03T09:00:00.000Z' }]
+    : [];
+  let sends = 0;
+  const recovered = await retryPendingThreadBody(ctx, {
+    targets: ['slack'],
+    async sendOperation(_provider, _text, options) {
+      sends += 1;
+      return { provider: 'slack', channel: 'C123', ts: '1.1', draftRef: options.idempotencyKey };
+    },
+  });
+
+  assert.equal(recovered, false);
+  assert.equal(sends, 0, 'an older semantic-memory checkpoint must not replay a cleared digest');
+});
+
+test('removed delivered providers do not append unchanged outbox checkpoints during state-only retry', async () => {
+  const { ctx, saved } = fakeCtx();
+  ctx.persona.inputs = { SLACK_CHANNEL: 'C123', TELEGRAM_CHAT: '456' };
+  const originalWrite = ctx.files.write;
+  ctx.files.write = async (path, contents) => {
+    if (path.startsWith('/slack/channels/')) throw new Error('exact Slack state unavailable');
+    return originalWrite(path, contents);
+  };
+  const delivery = {
+    targets: ['slack', 'telegram'],
+    async sendOperation(provider, _text, options) {
+      return provider === 'slack'
+        ? { provider, channel: 'C123', ts: '1.1', draftRef: options.idempotencyKey }
+        : { provider, chatId: '456', messageId: '7' };
+    },
+  };
+  await assert.rejects(
+    () => postFreshStories(ctx, delivery, [], [STORY]),
+    /grounding state could not be persisted/u,
+  );
+
+  const before = saved.filter(isDigestOutbox).length;
+  ctx.memory.recall = async (_query, opts) => saved
+    .filter((entry) => entry.opts?.tags?.includes(opts?.tags?.[0]))
+    .map((entry, index) => ({ ...entry, id: `m-${index}`, tags: entry.opts.tags, scope: 'workspace', createdAt: `${index}` }))
+    .reverse();
+  await assert.rejects(
+    () => retryPendingThreadBody(ctx, {
+      targets: ['slack'],
+      async sendOperation() { throw new Error('state-only retry must not deliver'); },
+    }),
+    /grounding state could not be persisted/u,
+  );
+
+  assert.equal(saved.filter(isDigestOutbox).length, before);
 });
 
 test('legacy pending exact-state intent migrates without replaying provider effects', async () => {

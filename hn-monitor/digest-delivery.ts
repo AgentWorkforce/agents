@@ -100,7 +100,10 @@ function telegramDraftId(idempotencyKey: string): string {
 
 function receiptId(receipt: Record<string, unknown> | undefined): string {
   if (!receipt) return '';
-  for (const value of [receipt.externalId, receipt.ts, receipt.messageId, receipt.message_id, receipt.created, receipt.id]) {
+  // `created` is creation metadata on some writeback receipts, not a provider
+  // message identity. Treating it as Slack ts / Telegram messageId can detach
+  // replies from their parent; wait for an actual provider/id field instead.
+  for (const value of [receipt.externalId, receipt.ts, receipt.messageId, receipt.message_id, receipt.id]) {
     if (typeof value === 'string' && value) return value;
     if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   }

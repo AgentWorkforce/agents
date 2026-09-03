@@ -669,9 +669,14 @@ async function resumeDigestOutbox(
   let changedForConfig = false;
   for (const [provider, state] of digestProviderEntries(outbox)) {
     if (delivery.targets.includes(provider)) continue;
-    if (state.header.status === 'pending') state.header.status = 'omitted';
-    if (state.body.status === 'pending') state.body.status = 'omitted';
-    changedForConfig = true;
+    if (state.header.status === 'pending') {
+      state.header.status = 'omitted';
+      changedForConfig = true;
+    }
+    if (state.body.status === 'pending') {
+      state.body.status = 'omitted';
+      changedForConfig = true;
+    }
   }
   if (changedForConfig) await saveDigestOutbox(ctx, outbox);
 
@@ -1728,23 +1733,15 @@ async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<boolean>
 }
 
 async function loadDigestOutbox(ctx: WorkforceCtx): Promise<DigestOutbox | null> {
-  const items = await ctx.memory.recall('hn-monitor durable digest outbox', {
-    tags: ['hn-monitor:digest-outbox'],
-    scope: 'workspace',
-    limit: 20,
-    failOnError: true
-  });
-  for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
-    if (!item.content) continue;
-    try {
-      const value = JSON.parse(item.content) as unknown;
-      if (isClearedDigestOutbox(value)) return null;
-      if (isDigestOutbox(value)) return value;
-    } catch {
-      // try the next recalled version
-    }
+  try {
+    const value = JSON.parse(await ctx.files.read(digestOutboxStatePath(ctx))) as unknown;
+    if (isClearedDigestOutbox(value)) return null;
+    if (isDigestOutbox(value)) return value;
+    throw new Error('HN digest outbox exact state is malformed');
+  } catch (error) {
+    if (isMissingFileError(error)) return null;
+    throw error;
   }
-  return null;
 }
 
 async function migrateLegacyDigestOutbox(
@@ -1981,23 +1978,45 @@ function isSafeIntegerArray(value: unknown): value is number[] {
 
 async function saveDigestOutbox(ctx: WorkforceCtx, outbox: DigestOutbox): Promise<void> {
   outbox.updatedAt = new Date().toISOString();
-  await saveCriticalMemory(ctx, JSON.stringify(outbox), {
+  const content = JSON.stringify(outbox);
+  // Relayflow recovery needs a current-value pointer, not a semantic query over
+  // an append-only checkpoint history whose result ordering is unspecified.
+  // Write the exact pointer before the audit-memory entry so any thrown memory
+  // receipt failure remains recoverable without a provider replay.
+  await ctx.files.write(digestOutboxStatePath(ctx), `${content}\n`);
+  await saveCriticalMemory(ctx, content, {
     tags: ['hn-monitor:digest-outbox'],
     scope: 'workspace'
   });
 }
 
 async function clearDigestOutbox(ctx: WorkforceCtx, batchKey: string): Promise<void> {
-  await saveCriticalMemory(ctx, JSON.stringify({
+  const cleared = JSON.stringify({
     kind: 'hn-monitor digest outbox',
     version: 1,
     cleared: true,
     batchKey,
     createdAt: new Date().toISOString()
-  }), {
+  });
+  // Exact state clears first: if the audit-memory receipt is unavailable, a
+  // later semantic recall still cannot resurrect an older active checkpoint.
+  await ctx.files.write(digestOutboxStatePath(ctx), `${cleared}\n`);
+  await saveCriticalMemory(ctx, cleared, {
     tags: ['hn-monitor:digest-outbox'],
     scope: 'workspace'
   });
+}
+
+function digestOutboxStatePath(ctx: WorkforceCtx): string {
+  const identity = scheduledScanLockKey(ctx);
+  const shard = createHash('sha256').update(identity).digest('hex').slice(0, 32);
+  return `hn-monitor/state/${shard}/digest-outbox.json`;
+}
+
+function isMissingFileError(error: unknown): boolean {
+  const record = asRecord(error);
+  const code = typeof record?.code === 'string' ? record.code : '';
+  return code === 'ENOENT' || /\b(?:ENOENT|404|not found)\b/iu.test(String(error));
 }
 
 async function saveCriticalMemory(

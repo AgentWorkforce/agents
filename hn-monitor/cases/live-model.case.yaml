@@ -38,7 +38,7 @@ http:
     file: ../fixtures/hn-item-1001.json
 expect:
   status: succeeded
-  eventSource: cron
+  eventSource: slack
   logsContain:
     - hn-monitor.feed-scan front_page=2 show_hn=2 new=4
     - hn-monitor.matched-agentic matched=3

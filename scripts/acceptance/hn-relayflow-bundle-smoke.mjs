@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { PreviewTransport, clearPreviewTransport, setPreviewTransport } from '@relayfile/relay-helpers';
 
 const bundleDir = process.argv[2];
 if (!bundleDir) throw new Error('usage: hn-relayflow-bundle-smoke.mjs <bundle-dir>');
@@ -12,17 +13,28 @@ if (!bundleDir) throw new Error('usage: hn-relayflow-bundle-smoke.mjs <bundle-di
 const bundle = await import(pathToFileURL(path.resolve(bundleDir, 'agent.bundle.mjs')).href);
 const saved = [];
 const files = new Map();
-const posts = [];
+const preview = new PreviewTransport({ idFactory: (_request, sequence) => String(sequence) });
 let workflowCall;
 
 const ctx = {
+  workspaceId: 'bundle-smoke-workspace',
+  agentName: 'hn-monitor',
   log() {},
   persona: {
-    inputs: { SLACK_CHANNEL: 'C123' },
-    inputSpecs: { SLACK_CHANNEL: { env: 'SLACK_CHANNEL', optional: true } },
+    inputs: { SLACK_CHANNEL: 'C123', TOPICS: 'agents,orchestration', LOOKBACK_HOURS: '24', MAX_STORIES: '8' },
+    inputSpecs: {
+      SLACK_CHANNEL: { env: 'SLACK_CHANNEL', optional: true },
+      TELEGRAM_CHAT: { env: 'TELEGRAM_CHAT', optional: true },
+      TOPICS: { env: 'TOPICS', default: 'agents,orchestration' },
+      LOOKBACK_HOURS: { env: 'LOOKBACK_HOURS', default: '24' },
+      MAX_STORIES: { env: 'MAX_STORIES', default: '8' },
+    },
   },
   memory: {
-    async save(content, opts) { saved.push({ content, opts }); },
+    async save(content, opts) {
+      saved.push({ content, opts });
+      return { id: `memory-${saved.length}` };
+    },
     async recall() { return []; },
   },
   files: {
@@ -50,22 +62,7 @@ const ctx = {
   },
 };
 
-const delivery = {
-  targets: ['slack'],
-  async publish(text) { return this.send(text, { nonBlocking: true }); },
-  async send(text, options) {
-    const ref = {
-      provider: 'slack',
-      channel: 'C123',
-      ts: options?.nonBlocking ? '' : `1.${posts.length + 1}`,
-      draftRef: `ref-${posts.length + 1}`,
-    };
-    posts.push({ text, options });
-    return { ok: true, refs: [ref] };
-  },
-};
-
-await bundle.postFreshStories(ctx, delivery, [], [{
+const fixtureStory = {
   id: 20,
   title: 'Show HN: Durable agent workflow journals',
   url: 'https://example.com/agent-workflows',
@@ -73,16 +70,29 @@ await bundle.postFreshStories(ctx, delivery, [], [{
   comments: 42,
   feeds: ['show_hn'],
   category: 'agent orchestration',
-}]);
+};
+
+setPreviewTransport(preview);
+try {
+  await bundle.runScheduledScan(ctx, { fetchStories: async () => [fixtureStory] });
+} finally {
+  clearPreviewTransport();
+}
+
+const posts = preview.actions.filter((action) => action.kind === 'provider.write' && action.provider === 'slack');
 
 assert.equal(workflowCall?.name, 'hn-monitor-scheduled-digest-v1');
 assert.equal(workflowCall?.args.relayflowVersion, 'v1');
 assert.match(workflowCall?.source ?? '', /from '@relayflows\/core'/u);
 assert.doesNotMatch(workflowCall?.source ?? '', /from ['"]\.\/relayflow-v1-resume/u);
 assert.equal(posts.length, 2);
+assert.ok(posts.every((post) => typeof post.body.idempotencyKey === 'string'));
+assert.equal(posts[1].body.parentRef, posts[0].path);
 assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:seen')).length, 1);
 assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length, 1);
-assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:pending-post-state')).length, 2);
+const outboxSaves = saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:digest-outbox'));
+assert.equal(outboxSaves.length, 7);
+assert.equal(JSON.parse(outboxSaves.at(-1).content).cleared, true);
 
 const sourceDir = await mkdtemp(path.resolve('.hn-relayflow-bundle-source-'));
 let sourceDryRun;

@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { JsonFileWorkflowDb, workflow } from '@relayflows/core';
+import { SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS } from '../.test-build/hn-monitor/agent.js';
 import {
   reactivateSkippedV1Steps,
   scheduledDigestJournalWorkflowName,
@@ -57,6 +58,14 @@ test('production resume guard uses the exact workflow name journaled by pinned R
 
   assert.equal(actualJournalName, scheduledDigestJournalWorkflowName(SCHEDULED_DIGEST_WORKFLOW_NAME));
   assert.match(scheduledDigestWorkflowSource(), /scheduledDigestJournalWorkflowName\d*\(WORKFLOW_NAME\)/u);
+});
+
+test('production Relayflow budget covers core v1 transient replays and caller overhead', async () => {
+  const source = scheduledDigestWorkflowSource();
+  // Focused tests use esbuild (`48e4`); the repository suite uses tsc (`480_000`).
+  assert.match(source, /const WORKFLOW_TIMEOUT_MS = (?:48e4|480_000);/u);
+  assert.match(source, /\.timeout\(WORKFLOW_TIMEOUT_MS\)/u);
+  assert.equal(SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS, 510_000);
 });
 
 test('pinned Relayflow v1 resumes a failed run without replaying completed HN step identities', async () => {
@@ -176,6 +185,61 @@ test('generated workflow dry run resolves least-privilege artifact grants and de
       ],
     );
     assert.ok(report.permissions.every((permission) => permission.denyPaths > 0));
+  } finally {
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});
+
+test('tracked TypeScript generator emits a self-contained Relayflow workflow', async () => {
+  const runtimeDir = await mkdtemp(path.resolve('.hn-relayflow-source-'));
+  try {
+    const workflowPath = path.join(runtimeDir, 'hn-workflow.ts');
+    const materializer = spawnSync(
+      path.resolve('node_modules/.bin/tsx'),
+      [
+        '--eval',
+        [
+          "import { writeFileSync } from 'node:fs';",
+          "import { scheduledDigestWorkflowSource } from './hn-monitor/workflows/scheduled-digest.ts';",
+          'writeFileSync(process.env.HN_WORKFLOW_PATH, scheduledDigestWorkflowSource());',
+        ].join('\n'),
+      ],
+      {
+        cwd: path.resolve('.'),
+        encoding: 'utf8',
+        env: { ...process.env, HN_WORKFLOW_PATH: workflowPath },
+      },
+    );
+    assert.equal(materializer.status, 0, `${materializer.stdout}\n${materializer.stderr}`);
+
+    const result = spawnSync(
+      path.resolve('node_modules/.bin/tsx'),
+      [workflowPath],
+      {
+        cwd: runtimeDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          DRY_RUN: '1',
+          invocationArgs: JSON.stringify({
+            relayflowVersion: 'v1',
+            batchKey: 'hn-monitor:v1:21',
+            stories: [{
+              id: 21,
+              title: 'Relayflow source fixture',
+              category: 'agent infrastructure',
+              points: 80,
+              comments: 12,
+              feeds: ['top'],
+              url: 'https://example.com/21',
+              hnUrl: 'https://news.ycombinator.com/item?id=21',
+            }],
+          }),
+        },
+      },
+    );
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /HN_RELAYFLOW_DRY_RUN:/u);
   } finally {
     await rm(runtimeDir, { recursive: true, force: true });
   }

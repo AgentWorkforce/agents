@@ -13,9 +13,9 @@
  *       story and top comments when the user asks for more detail
  *
  * Transport is configuration-driven. Set SLACK_CHANNEL, TELEGRAM_CHAT, or
- * both — the handler delivers to whichever targets are configured. Uses
- * @agentworkforce/delivery for unified messaging under the hood.
+ * both — the handler delivers to whichever targets are configured.
  */
+import { createHash } from 'node:crypto';
 import {
   defineAgent,
   isCronTickEvent,
@@ -30,7 +30,8 @@ import {
   withTimeout,
   fetchWithTimeout,
   type DeliveryClient,
-  type DeliveryResult
+  type DeliveryOptions,
+  type MessageRef
 } from '@agentworkforce/delivery';
 import { slackClient } from '@relayfile/relay-helpers';
 import {
@@ -41,6 +42,11 @@ import {
   materializeScheduledDigestWorkflow,
   SCHEDULED_DIGEST_WORKFLOW_NAME
 } from './workflows/materialize.js';
+import {
+  createDigestDelivery,
+  type DigestDeliveryClient,
+  type DigestProvider
+} from './digest-delivery.js';
 
 export type HnFeed = 'front_page' | 'show_hn' | 'new';
 
@@ -79,6 +85,8 @@ export interface PostRecord {
   }>;
 }
 
+type SavedHeaderRef = NonNullable<PostRecord['threadRefs']>[number];
+
 interface RecentDigestState {
   kind: 'hn-monitor exact recent digests';
   version: 1;
@@ -102,34 +110,59 @@ class ExactPostPersistenceError extends Error {
 
 type QaGroundingSource = 'exact_state' | 'memory' | 'thread_context' | 'algolia' | 'none';
 
-interface PendingThreadBody {
-  kind?: 'hn-monitor pending thread body';
+type DigestOutboxPhase = 'claim' | 'headers' | 'bodies' | 'state';
+type DigestEffectStatus = 'pending' | 'delivered' | 'omitted';
+
+interface DigestOutboxEffect {
+  status: DigestEffectStatus;
+  operationKey: string;
+  ref?: SavedHeaderRef;
+}
+
+interface DigestOutboxProvider {
+  header: DigestOutboxEffect;
+  body: DigestOutboxEffect;
+}
+
+interface DigestOutbox {
+  kind: 'hn-monitor digest outbox';
+  version: 1;
   cleared?: boolean;
-  /** Sorted, comma-separated targets for order-independent comparison. */
+  batchKey: string;
+  phase: DigestOutboxPhase;
+  createdAt: string;
+  updatedAt: string;
+  header: string;
+  body: string;
+  stories: PostedStory[];
+  seenBefore: number[];
+  seenClaim: number[];
+  providers: Partial<Record<DigestProvider, DigestOutboxProvider>>;
+  /** Upgrade bridge for the pre-outbox pending-body/pending-state records. */
+  legacyRecovery?: true;
+}
+
+interface LegacyPendingThreadBody {
+  cleared?: boolean;
   targets: string;
   header: string;
   body: string;
   createdAt: string;
   stories: PostedStory[];
-  /** Serialized DeliveryResult.refs from the header publish, for recovery.
-   *  The `draftRef` field holds the relay path for Slack refs and the messageId
-   *  for Telegram refs — see saveHeaderRefs() / rebuildHeaderRefs(). */
-  headerRefs: Array<{ provider: 'slack' | 'telegram'; draftRef: string; channel?: string; chatId?: string; threadTs?: string }>;
+  headerRefs: SavedHeaderRef[];
 }
 
-interface PendingPostState {
-  kind?: 'hn-monitor pending exact post state';
+interface LegacyPendingPostState {
   cleared?: boolean;
-  createdAt: string;
   record: PostRecord;
 }
 
 const SCHEDULED_DIGEST_VERSION = 'v1' as const;
-const SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS = 255_000;
+export const SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS = 510_000;
 const scheduledScanLocks = new Map<string, Promise<void>>();
 
 interface ScheduledScanDependencies {
-  delivery?: DeliveryClient;
+  delivery?: DigestDeliveryClient | DeliveryClient;
   fetchStories?: (lookbackHours: number) => Promise<Story[]>;
 }
 
@@ -262,22 +295,23 @@ export async function runScheduledScan(
   ctx: WorkforceCtx,
   deps: ScheduledScanDependencies = {}
 ): Promise<void> {
-  const delivery = deps.delivery ?? createDelivery(ctx);
-  if (delivery.targets.length === 0) {
-    ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
-    return;
-  }
+  const delivery = deps.delivery ?? createDigestDelivery(ctx);
 
   // One deployed worker can receive overlapping at-least-once cron
   // deliveries. Serialize the whole read/claim/effect path per workspace and
   // agent so the second invocation re-reads the first invocation's durable
   // claim instead of racing from the same stale snapshot.
   await withScheduledScanLock(scheduledScanLockKey(ctx), async () => {
-    // A body recovery owns this tick because it can perform a provider effect.
+    // A durable outbox recovery owns this tick. Stable provider operation keys
+    // make every replay safe across delivery ids and worker termination.
     if (await retryPendingThreadBody(ctx, delivery)) return;
-    // Exact-state recovery performs no provider write and may safely precede a
-    // new scan. It closes the body-delivered/state-write-failed window.
-    await retryPendingPostState(ctx);
+
+    // Recovery runs even after every provider is removed so an old partial
+    // digest cannot remain publishable if that provider is enabled again.
+    if (delivery.targets.length === 0) {
+      ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
+      return;
+    }
 
     const topics = list(input(ctx, 'TOPICS'));
     const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
@@ -565,218 +599,195 @@ export async function handleQaMessage(
 
 export async function postFreshStories(
   ctx: WorkforceCtx,
-  delivery: DeliveryClient,
+  delivery: DigestDeliveryClient | DeliveryClient,
   seen: number[],
   fresh: Story[]
 ): Promise<void> {
-  // Claim the stories as seen BEFORE the post. Cron delivery is at-least-once:
-  // a single tick can re-invoke this handler (cloud re-runs a delivery whose
-  // lease expires before it reports done). Claiming first means a concurrent
-  // re-invocation loads these ids as already-seen and stays silent.
-  await saveSeen(ctx, [...seen, ...fresh.map((s) => s.id)].slice(-200));
+  ctx.log('info', 'hn-monitor.summarizing', { fresh: fresh.length });
+  const { header, body, stories } = await summarize(ctx, fresh);
+  const batchKey = scheduledDigestBatchKey(fresh);
+  const outbox = newDigestOutbox(batchKey, header, body, stories, seen, delivery.targets);
 
-  let headerPosted = false;
-  let pending: PendingThreadBody | null = null;
-  try {
-    ctx.log('info', 'hn-monitor.summarizing', { fresh: fresh.length });
-    const { header, body, stories } = await summarize(ctx, fresh);
-    ctx.log('info', 'hn-monitor.posting', { targets: delivery.targets });
-
-    // Wait for the header receipt so its delivered Slack thread timestamp can
-    // be persisted for deterministic ordinal Q&A in older digest threads. The
-    // much larger body remains non-blocking and uses the returned draft ref.
-    const heads = ctx.sandbox?.cwd === '/simulated'
-      ? await delivery.publish(header)
-      : await delivery.send(header);
-    if (heads.refs.length === 0) {
-      throw new Error(`Header publish failed across all targets`);
-    }
-    headerPosted = true;
-    if (heads.refs.length < delivery.targets.length) {
-      throw new Error(`Header published on only ${heads.refs.length}/${delivery.targets.length} targets`);
-    }
-    ctx.log('info', 'hn-monitor.header-published', { refs: heads.refs.length });
-
-    // Build pending state BEFORE sending the body, so even if delivery.send()
-    // throws (hard failure, not just ok:false), the catch block can save state
-    // for recovery on the next cron tick.
-    const pendingBase = {
-      targets: [...delivery.targets].sort().join(','),
-      header,
-      body,
-      createdAt: new Date().toISOString(),
-      stories,
-      headerRefs: saveHeaderRefs(heads)
-    };
-    const postRecord: PostRecord = {
-      postedAt: pendingBase.createdAt,
-      digest: `${header}\n${body}`,
-      stories,
-      threadRefs: pendingBase.headerRefs
-    };
-
-    // Persist the state-finalization intent before the body effect. If the
-    // body lands but the exact Slack state write fails, the next serialized
-    // tick can restore grounding without publishing the digest again.
-    pending = pendingBase;
-    // This is a hard durability gate, not best-effort telemetry. Sending the
-    // body without this record would make a subsequent exact-state failure
-    // impossible to repair without replaying a provider effect.
-    await savePendingPostState(ctx, postRecord);
-
-    // Thread the body under each header, also non-blocking.
-    const bodyResult = await delivery.send(body, { replyTo: heads, nonBlocking: true });
-    // In non-blocking mode, ok=true means at least one target got a draft ref.
-    // Check that ALL attempted targets received refs — if any were lost, treat
-    // as partial failure so the pending-recovery path saves state for retry.
-    if (!bodyResult.ok || bodyResult.refs.length < delivery.targets.length) {
-      throw new Error(`Threaded body failed on some targets`);
-    }
-    pending = null;
-    ctx.log('info', 'hn-monitor.posted', { targets: delivery.targets.join(',') });
-
-    // Retain the digest for Q&A recall (~30 day rolling window via memory ttl).
-    const exactStateSaved = await savePost(ctx, postRecord);
-    if (!exactStateSaved) throw new ExactPostPersistenceError();
-    await clearPendingPostState(ctx);
-  } catch (err) {
-    if (!headerPosted) {
-      // Nothing landed yet — release the provisional claim so the next tick
-      // retries this digest, then rethrow.
-      await saveSeen(ctx, seen).catch(() => {});
-      throw err;
-    }
-    if (pending) {
-      await savePendingThreadBody(ctx, pending)
-        .catch((error) => ctx.log('error', 'hn-monitor.pending-save-failed', { error: String(error) }));
-    }
-    if (err instanceof ExactPostPersistenceError) {
-      ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { error: err.message });
-      throw err;
-    }
-    // The header already posted; releasing + rethrowing would duplicate it on
-    // the runtime's retry. Keep the claim and let the next scan retry the body.
-    ctx.log('error', 'hn-monitor.thread-incomplete', { error: err instanceof Error ? err.message : String(err) });
-  }
+  // The outbox is durable before the seen claim or any provider effect. If the
+  // claim write fails, a later tick resumes this same record instead of losing
+  // the batch. Every provider operation has a stable cross-tick idempotency key.
+  await saveDigestOutbox(ctx, outbox);
+  await resumeDigestOutbox(ctx, delivery, outbox);
 }
 
-/** Serialize DeliveryResult.refs into storable headerRefs. */
-function saveHeaderRefs(result: DeliveryResult): PendingThreadBody['headerRefs'] {
-  return result.refs
-    .filter(
-      (r): r is import('@agentworkforce/delivery').SlackRef | import('@agentworkforce/delivery').TelegramRef =>
-        r.provider === 'slack' || r.provider === 'telegram'
-    )
-    .map((r) => ({
-      provider: r.provider,
-      // For Slack: draftRef is the relay path (parentRef). For Telegram:
-      // store the messageId in draftRef so recovery can reconstruct threading.
-      draftRef: 'draftRef' in r ? r.draftRef : r.messageId,
-      channel: r.provider === 'slack' ? r.channel : undefined,
-      chatId: r.provider === 'telegram' ? r.chatId : undefined,
-      threadTs: r.provider === 'slack' ? r.ts : undefined
-    }));
-}
-
-// ── pending thread body recovery ─────────────────────────────────────────
+// ── durable digest outbox recovery ───────────────────────────────────────
 
 export async function retryPendingThreadBody(
   ctx: WorkforceCtx,
-  delivery: DeliveryClient
+  delivery: DigestDeliveryClient | DeliveryClient
 ): Promise<boolean> {
-  const pending = await loadPendingThreadBody(ctx);
-  if (!pending) return false;
-  // Compare targets with canonical ordering to avoid order-dependent mismatch.
-  const configuredTargets = [...delivery.targets].sort().join(',');
-  if (pending.targets !== configuredTargets) {
-    // Targets changed since the body was saved — clean up the stale record
-    // so it doesn't sit in memory until TTL expiry.
-    await clearPendingThreadBody(ctx).catch(() => {});
-    return false;
+  const outbox = await loadDigestOutbox(ctx) ?? await migrateLegacyDigestOutbox(ctx, delivery.targets);
+  if (!outbox) return false;
+  await resumeDigestOutbox(ctx, delivery, outbox);
+  return true;
+}
+
+function newDigestOutbox(
+  batchKey: string,
+  header: string,
+  body: string,
+  stories: PostedStory[],
+  seenBefore: number[],
+  targets: ReadonlyArray<string>
+): DigestOutbox {
+  const createdAt = new Date().toISOString();
+  const providers: DigestOutbox['providers'] = {};
+  for (const provider of targets) {
+    if (provider !== 'slack' && provider !== 'telegram') continue;
+    providers[provider] = {
+      header: { status: 'pending', operationKey: digestOperationKey(batchKey, provider, 'header') },
+      body: { status: 'pending', operationKey: digestOperationKey(batchKey, provider, 'body') }
+    };
+  }
+  if (Object.keys(providers).length === 0) throw new Error('HN digest outbox requires Slack or Telegram');
+  return {
+    kind: 'hn-monitor digest outbox',
+    version: 1,
+    batchKey,
+    phase: 'claim',
+    createdAt,
+    updatedAt: createdAt,
+    header,
+    body,
+    stories,
+    seenBefore,
+    seenClaim: [...seenBefore, ...stories.map((story) => story.id)].slice(-200),
+    providers
+  };
+}
+
+async function resumeDigestOutbox(
+  ctx: WorkforceCtx,
+  delivery: DigestDeliveryClient | DeliveryClient,
+  outbox: DigestOutbox
+): Promise<void> {
+  let changedForConfig = false;
+  for (const [provider, state] of digestProviderEntries(outbox)) {
+    if (delivery.targets.includes(provider)) continue;
+    if (state.header.status === 'pending') {
+      state.header.status = 'omitted';
+      changedForConfig = true;
+    }
+    if (state.body.status === 'pending') {
+      state.body.status = 'omitted';
+      changedForConfig = true;
+    }
+  }
+  if (changedForConfig) await saveDigestOutbox(ctx, outbox);
+
+  if (outbox.phase === 'claim') {
+    await saveSeen(ctx, outbox.seenClaim);
+    outbox.phase = 'headers';
+    await saveDigestOutbox(ctx, outbox);
   }
 
-  // Reconstruct replyTo from saved headerRefs for proper threading on retry.
-  const bodyOpts = pending.headerRefs?.length
-    ? {
-        nonBlocking: true as const,
-        replyTo: {
-          ok: true,
-          refs: rebuildHeaderRefs(pending.headerRefs)
-        }
+  if (outbox.phase === 'headers') {
+    for (const [provider, state] of digestProviderEntries(outbox)) {
+      if (state.header.status !== 'pending') continue;
+      const ref = await sendDigestOperation(delivery, provider, outbox.header, {
+        idempotencyKey: state.header.operationKey
+      });
+      state.header.ref = saveMessageRef(ref);
+      state.header.status = 'delivered';
+      await saveDigestOutbox(ctx, outbox);
+    }
+    outbox.phase = 'bodies';
+    await saveDigestOutbox(ctx, outbox);
+  }
+
+  if (outbox.phase === 'bodies') {
+    for (const [provider, state] of digestProviderEntries(outbox)) {
+      if (state.body.status !== 'pending') continue;
+      if (state.header.status !== 'delivered' || !state.header.ref) {
+        state.body.status = 'omitted';
+        await saveDigestOutbox(ctx, outbox);
+        continue;
       }
-    : { nonBlocking: true as const };
+      await sendDigestOperation(delivery, provider, outbox.body, {
+        idempotencyKey: state.body.operationKey,
+        nonBlocking: true,
+        replyTo: rebuildMessageRef(state.header.ref)
+      });
+      state.body.status = 'delivered';
+      await saveDigestOutbox(ctx, outbox);
+    }
+    outbox.phase = 'state';
+    await saveDigestOutbox(ctx, outbox);
+  }
 
   const postRecord: PostRecord = {
-    postedAt: pending.createdAt,
-    digest: `${pending.header}\n${pending.body}`,
-    stories: pending.stories,
-    threadRefs: pending.headerRefs
+    postedAt: outbox.createdAt,
+    digest: `${outbox.header}\n${outbox.body}`,
+    stories: outbox.stories,
+    threadRefs: digestProviderEntries(outbox)
+      .map(([, state]) => state.header.ref)
+      .filter((ref): ref is SavedHeaderRef => Boolean(ref))
   };
-
-  // A prior attempt may have stopped specifically because this intent could
-  // not be persisted. Re-establish the same hard gate before retrying the
-  // provider effect; otherwise the recovery path would reopen the original
-  // body-delivered/state-unrecoverable window.
-  await savePendingPostState(ctx, postRecord);
-
-  const bodyResult = await delivery.send(pending.body, bodyOpts);
-  // Match postFreshStories: ALL targets must receive refs for success.
-  if (!bodyResult.ok || bodyResult.refs.length < delivery.targets.length) {
-    ctx.log('error', 'hn-monitor.pending-body-retry-failed', { targets: configuredTargets });
-    return true;
-  }
-
-  // Clear the provider-effect retry before attempting exact-state recovery.
-  // If the following state write fails, the separate pending-post intent
-  // retries state only and cannot duplicate the threaded body.
-  await clearPendingThreadBody(ctx);
   const exactStateSaved = await savePost(ctx, postRecord);
   if (!exactStateSaved) {
-    ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true });
+    ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true, phase: outbox.phase });
     throw new ExactPostPersistenceError();
   }
-  await clearPendingPostState(ctx);
-  ctx.log('info', 'hn-monitor.pending-body-posted', { targets: configuredTargets });
-  return true;
+  if (outbox.legacyRecovery) await clearLegacyRecoveryMarkers(ctx);
+  await clearDigestOutbox(ctx, outbox.batchKey);
+  ctx.log('info', 'hn-monitor.posted', {
+    targets: digestProviderEntries(outbox).map(([provider]) => provider).join(',')
+  });
+  ctx.log('info', 'hn-monitor.outbox-completed', {
+    batchKey: outbox.batchKey,
+    providers: digestProviderEntries(outbox).map(([provider]) => provider)
+  });
 }
 
-/** Retry exact grounding state only; this path never calls a provider. */
-export async function retryPendingPostState(ctx: WorkforceCtx): Promise<boolean> {
-  const pending = await loadPendingPostState(ctx);
-  if (!pending) return false;
-  const exactStateSaved = await savePost(ctx, pending.record);
-  if (!exactStateSaved) {
-    ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true, stateOnly: true });
-    throw new ExactPostPersistenceError();
+async function sendDigestOperation(
+  delivery: DigestDeliveryClient | DeliveryClient,
+  provider: DigestProvider,
+  text: string,
+  options: { idempotencyKey: string; nonBlocking?: boolean; replyTo?: MessageRef }
+): Promise<MessageRef> {
+  if ('sendOperation' in delivery) {
+    return delivery.sendOperation(provider, text, options);
   }
-  await clearPendingPostState(ctx);
-  ctx.log('info', 'hn-monitor.pending-post-state-saved', {
-    stories: pending.record.stories.map((story) => story.id)
-  });
-  return true;
+  if (delivery.targets.length !== 1 || delivery.targets[0] !== provider) {
+    throw new Error('multi-target HN digest tests must provide sendOperation for per-provider recovery');
+  }
+  const legacyOptions: DeliveryOptions = {
+    ...(options.nonBlocking ? { nonBlocking: true } : {}),
+    ...(options.replyTo ? { replyTo: { ok: true, refs: [options.replyTo] } } : {})
+  };
+  const result = await delivery.send(text, legacyOptions);
+  const ref = result.refs.find((candidate) => candidate.provider === provider);
+  if (!result.ok || !ref) throw new Error(`HN digest ${provider} operation failed`);
+  return ref;
 }
 
-/** Reconstruct MessageRefs from stored headerRefs, with correct threading ids. */
-function rebuildHeaderRefs(
-  stored: PendingThreadBody['headerRefs']
-): Array<import('@agentworkforce/delivery').MessageRef> {
-  return stored.map((r) => {
-    if (r.provider === 'telegram') {
-      // For Telegram, draftRef stores the original messageId — use it for
-      // reply_to_message_id threading on retry.
-      return {
-        provider: 'telegram' as const,
-        chatId: r.chatId ?? '',
-        messageId: r.draftRef
-      };
-    }
-    return {
-      provider: 'slack' as const,
-      channel: r.channel ?? '',
-      ts: r.threadTs ?? '',
-      draftRef: r.draftRef
-    };
-  });
+function digestProviderEntries(outbox: DigestOutbox): Array<[DigestProvider, DigestOutboxProvider]> {
+  return (['slack', 'telegram'] as const)
+    .flatMap((provider) => outbox.providers[provider] ? [[provider, outbox.providers[provider] as DigestOutboxProvider]] : []);
+}
+
+function digestOperationKey(batchKey: string, provider: DigestProvider, phase: 'header' | 'body'): string {
+  const batchHash = createHash('sha256').update(batchKey).digest('hex').slice(0, 32);
+  return `hn-monitor:${batchHash}:${provider}:${phase}`;
+}
+
+function saveMessageRef(ref: MessageRef): SavedHeaderRef {
+  if (ref.provider === 'telegram') {
+    return { provider: 'telegram', chatId: ref.chatId, draftRef: ref.messageId };
+  }
+  if (ref.provider !== 'slack') throw new Error(`unsupported HN digest provider ${ref.provider}`);
+  return { provider: 'slack', channel: ref.channel, threadTs: ref.ts, draftRef: ref.draftRef };
+}
+
+function rebuildMessageRef(ref: SavedHeaderRef): MessageRef {
+  return ref.provider === 'telegram'
+    ? { provider: 'telegram', chatId: ref.chatId ?? '', messageId: ref.draftRef }
+    : { provider: 'slack', channel: ref.channel ?? '', ts: ref.threadTs ?? '', draftRef: ref.draftRef };
 }
 
 // ── HN fetching ──────────────────────────────────────────────────────────
@@ -1665,7 +1676,8 @@ async function loadSeen(ctx: WorkforceCtx): Promise<number[]> {
   const items = await ctx.memory.recall('hn-monitor seen story ids already posted', {
     tags: ['hn-monitor:seen'],
     scope: 'workspace',
-    limit: 20
+    limit: 20,
+    failOnError: true
   });
   for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
     try {
@@ -1679,7 +1691,7 @@ async function loadSeen(ctx: WorkforceCtx): Promise<number[]> {
   return [];
 }
 async function saveSeen(ctx: WorkforceCtx, ids: number[]): Promise<void> {
-  await ctx.memory.save(JSON.stringify({ kind: 'hn-monitor seen story ids already posted', ids }), {
+  await saveCriticalMemory(ctx, JSON.stringify({ kind: 'hn-monitor seen story ids already posted', ids }), {
     tags: ['hn-monitor:seen'],
     scope: 'workspace'
   });
@@ -1720,19 +1732,127 @@ async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<boolean>
   return exactStateSaved;
 }
 
-async function loadPendingPostState(ctx: WorkforceCtx): Promise<PendingPostState | null> {
-  const items = await ctx.memory.recall('hn-monitor pending exact post state recovery', {
-    tags: ['hn-monitor:pending-post-state'],
+async function loadDigestOutbox(ctx: WorkforceCtx): Promise<DigestOutbox | null> {
+  try {
+    const value = JSON.parse(await ctx.files.read(digestOutboxStatePath(ctx))) as unknown;
+    if (isClearedDigestOutbox(value)) return null;
+    if (isDigestOutbox(value)) return value;
+    throw new Error('HN digest outbox exact state is malformed');
+  } catch (error) {
+    if (isMissingFileError(error)) return null;
+    throw error;
+  }
+}
+
+async function migrateLegacyDigestOutbox(
+  ctx: WorkforceCtx,
+  configuredTargets: ReadonlyArray<string>
+): Promise<DigestOutbox | null> {
+  const [pendingBody, pendingState] = await Promise.all([
+    loadLegacyPendingThreadBody(ctx),
+    loadLegacyPendingPostState(ctx)
+  ]);
+  if (pendingBody) {
+    const targets = supportedDigestTargets(pendingBody.targets.split(','));
+    if (targets.length === 0) return null;
+    const batchKey = scheduledDigestBatchKey(pendingBody.stories);
+    const outbox = newDigestOutbox(
+      batchKey,
+      pendingBody.header,
+      pendingBody.body,
+      pendingBody.stories,
+      [],
+      targets
+    );
+    outbox.phase = 'bodies';
+    outbox.createdAt = pendingBody.createdAt;
+    outbox.legacyRecovery = true;
+    for (const [provider, state] of digestProviderEntries(outbox)) {
+      const ref = pendingBody.headerRefs.find((candidate) => candidate.provider === provider);
+      state.header.status = ref ? 'delivered' : 'omitted';
+      state.header.ref = ref;
+      if (!ref) state.body.status = 'omitted';
+    }
+    await saveDigestOutbox(ctx, outbox);
+    ctx.log('info', 'hn-monitor.legacy-recovery-migrated', { phase: 'bodies', batchKey });
+    return outbox;
+  }
+  if (pendingState) {
+    const configured = supportedDigestTargets(configuredTargets);
+    const recorded = supportedDigestTargets((pendingState.record.threadRefs ?? []).map((ref) => ref.provider));
+    const targets = recorded.length > 0 ? recorded : configured;
+    if (targets.length === 0) return null;
+    const batchKey = scheduledDigestBatchKey(pendingState.record.stories);
+    const lines = pendingState.record.digest.split('\n');
+    const outbox = newDigestOutbox(
+      batchKey,
+      lines[0] ?? pendingState.record.digest,
+      lines.slice(1).join('\n'),
+      pendingState.record.stories,
+      [],
+      targets
+    );
+    outbox.phase = 'state';
+    outbox.createdAt = pendingState.record.postedAt;
+    outbox.legacyRecovery = true;
+    for (const [provider, state] of digestProviderEntries(outbox)) {
+      const ref = pendingState.record.threadRefs?.find((candidate) => candidate.provider === provider);
+      state.header.status = ref ? 'delivered' : 'omitted';
+      state.header.ref = ref;
+      state.body.status = ref ? 'delivered' : 'omitted';
+    }
+    await saveDigestOutbox(ctx, outbox);
+    ctx.log('info', 'hn-monitor.legacy-recovery-migrated', { phase: 'state', batchKey });
+    return outbox;
+  }
+  return null;
+}
+
+async function loadLegacyPendingThreadBody(ctx: WorkforceCtx): Promise<LegacyPendingThreadBody | null> {
+  const items = await ctx.memory.recall('hn-monitor pending threaded digest body', {
+    tags: ['hn-monitor:pending-thread-body'],
     scope: 'workspace',
-    limit: 10
+    limit: 20,
+    failOnError: true
   });
   for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
-    if (!item.content) continue;
     try {
-      const pending = JSON.parse(item.content) as Partial<PendingPostState>;
-      if (pending.cleared) return null;
-      if (typeof pending.createdAt === 'string' && isPostRecord(pending.record)) {
-        return pending as PendingPostState;
+      const record = asRecord(JSON.parse(item.content));
+      if (record?.cleared === true) return null;
+      if (
+        record &&
+        typeof record.targets === 'string' &&
+        typeof record.header === 'string' &&
+        typeof record.body === 'string' &&
+        typeof record.createdAt === 'string' &&
+        Array.isArray(record.stories) && record.stories.every(isPostedStory) &&
+        Array.isArray(record.headerRefs) && record.headerRefs.every(isSavedHeaderRef)
+      ) return record as unknown as LegacyPendingThreadBody;
+    } catch {
+      // try the next recalled version
+    }
+  }
+  return null;
+}
+
+async function loadLegacyPendingPostState(ctx: WorkforceCtx): Promise<LegacyPendingPostState | null> {
+  const items = await ctx.memory.recall('hn-monitor pending exact post state', {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace',
+    limit: 20,
+    failOnError: true
+  });
+  for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
+    try {
+      const record = asRecord(JSON.parse(item.content));
+      if (record?.cleared === true) return null;
+      if (
+        record &&
+        isPostRecord(record.record) &&
+        record.record.stories.every(isPostedStory) &&
+        (record.record.threadRefs ?? []).every(isSavedHeaderRef)
+      ) {
+        return { record: record.record };
       }
     } catch {
       // try the next recalled version
@@ -1741,19 +1861,29 @@ async function loadPendingPostState(ctx: WorkforceCtx): Promise<PendingPostState
   return null;
 }
 
-async function savePendingPostState(ctx: WorkforceCtx, record: PostRecord): Promise<void> {
-  await ctx.memory.save(JSON.stringify({
-    kind: 'hn-monitor pending exact post state',
-    createdAt: new Date().toISOString(),
-    record
-  }), {
-    tags: ['hn-monitor:pending-post-state'],
-    scope: 'workspace'
-  });
+function supportedDigestTargets(values: ReadonlyArray<string>): DigestProvider[] {
+  return [...new Set(values.filter((value): value is DigestProvider => value === 'slack' || value === 'telegram'))];
 }
 
-async function clearPendingPostState(ctx: WorkforceCtx): Promise<void> {
-  await ctx.memory.save(JSON.stringify({
+function isSavedHeaderRef(value: unknown): value is SavedHeaderRef {
+  const ref = asRecord(value);
+  return Boolean(
+    ref &&
+    (ref.provider === 'slack' || ref.provider === 'telegram') &&
+    typeof ref.draftRef === 'string' && ref.draftRef.length > 0
+  );
+}
+
+async function clearLegacyRecoveryMarkers(ctx: WorkforceCtx): Promise<void> {
+  await saveCriticalMemory(ctx, JSON.stringify({
+    kind: 'hn-monitor pending thread body',
+    cleared: true,
+    createdAt: new Date().toISOString()
+  }), {
+    tags: ['hn-monitor:pending-thread-body'],
+    scope: 'workspace'
+  });
+  await saveCriticalMemory(ctx, JSON.stringify({
     kind: 'hn-monitor pending exact post state',
     cleared: true,
     createdAt: new Date().toISOString()
@@ -1761,6 +1891,141 @@ async function clearPendingPostState(ctx: WorkforceCtx): Promise<void> {
     tags: ['hn-monitor:pending-post-state'],
     scope: 'workspace'
   });
+}
+
+function isClearedDigestOutbox(value: unknown): boolean {
+  const record = asRecord(value);
+  return record?.kind === 'hn-monitor digest outbox' &&
+    record.version === 1 &&
+    record.cleared === true &&
+    typeof record.batchKey === 'string' &&
+    /^hn-monitor:v1:\d+(?:,\d+)*$/u.test(record.batchKey);
+}
+
+function isDigestOutbox(value: unknown): value is DigestOutbox {
+  const record = asRecord(value);
+  if (
+    record?.kind !== 'hn-monitor digest outbox' ||
+    record.version !== 1 ||
+    record.cleared === true ||
+    typeof record.batchKey !== 'string' ||
+    !/^hn-monitor:v1:\d+(?:,\d+)*$/u.test(record.batchKey) ||
+    !['claim', 'headers', 'bodies', 'state'].includes(String(record.phase)) ||
+    typeof record.createdAt !== 'string' ||
+    typeof record.updatedAt !== 'string' ||
+    typeof record.header !== 'string' ||
+    typeof record.body !== 'string' ||
+    !Array.isArray(record.stories) ||
+    !record.stories.every((story) => isPostedStory(story)) ||
+    !isSafeIntegerArray(record.seenBefore) ||
+    !isSafeIntegerArray(record.seenClaim) ||
+    (record.legacyRecovery !== undefined && record.legacyRecovery !== true)
+  ) return false;
+
+  const storyIds = record.stories.map((story) => (story as PostedStory).id);
+  if (new Set(storyIds).size !== storyIds.length) return false;
+  const expectedBatchKey = `hn-monitor:v1:${storyIds.sort((a, b) => a - b).join(',')}`;
+  if (record.batchKey !== expectedBatchKey) return false;
+  const phase = String(record.phase) as DigestOutboxPhase;
+  const providers = asRecord(record.providers);
+  if (!providers) return false;
+  let count = 0;
+  for (const provider of ['slack', 'telegram'] as const) {
+    if (providers[provider] === undefined) continue;
+    const state = asRecord(providers[provider]);
+    const header = asRecord(state?.header);
+    const body = asRecord(state?.body);
+    if (
+      !isDigestOutboxEffect(header, digestOperationKey(record.batchKey, provider, 'header'), provider) ||
+      !isDigestOutboxEffect(body, digestOperationKey(record.batchKey, provider, 'body'), provider)
+    ) return false;
+    if ((phase === 'bodies' || phase === 'state') && header?.status === 'pending') return false;
+    if (phase === 'state' && body?.status === 'pending') return false;
+    count += 1;
+  }
+  return count > 0;
+}
+
+function isDigestOutboxEffect(
+  value: Record<string, unknown> | null,
+  operationKey: string,
+  provider: DigestProvider
+): boolean {
+  if (
+    !value ||
+    !['pending', 'delivered', 'omitted'].includes(String(value.status)) ||
+    value.operationKey !== operationKey
+  ) return false;
+  if (value.ref === undefined) return true;
+  const ref = asRecord(value.ref);
+  return ref?.provider === provider && typeof ref.draftRef === 'string' && ref.draftRef.length > 0;
+}
+
+function isPostedStory(value: unknown): value is PostedStory {
+  const story = asRecord(value);
+  return Boolean(
+    story &&
+    Number.isSafeInteger(story.id) && Number(story.id) > 0 &&
+    Number.isSafeInteger(story.rank) && Number(story.rank) > 0 &&
+    typeof story.title === 'string' && story.title.length > 0 &&
+    typeof story.url === 'string' && story.url.length > 0
+  );
+}
+
+function isSafeIntegerArray(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((item) => Number.isSafeInteger(item));
+}
+
+async function saveDigestOutbox(ctx: WorkforceCtx, outbox: DigestOutbox): Promise<void> {
+  outbox.updatedAt = new Date().toISOString();
+  const content = JSON.stringify(outbox);
+  // Relayflow recovery needs a current-value pointer, not a semantic query over
+  // an append-only checkpoint history whose result ordering is unspecified.
+  // Write the exact pointer before the audit-memory entry so any thrown memory
+  // receipt failure remains recoverable without a provider replay.
+  await ctx.files.write(digestOutboxStatePath(ctx), `${content}\n`);
+  await saveCriticalMemory(ctx, content, {
+    tags: ['hn-monitor:digest-outbox'],
+    scope: 'workspace'
+  });
+}
+
+async function clearDigestOutbox(ctx: WorkforceCtx, batchKey: string): Promise<void> {
+  const cleared = JSON.stringify({
+    kind: 'hn-monitor digest outbox',
+    version: 1,
+    cleared: true,
+    batchKey,
+    createdAt: new Date().toISOString()
+  });
+  // Exact state clears first: if the audit-memory receipt is unavailable, a
+  // later semantic recall still cannot resurrect an older active checkpoint.
+  await ctx.files.write(digestOutboxStatePath(ctx), `${cleared}\n`);
+  await saveCriticalMemory(ctx, cleared, {
+    tags: ['hn-monitor:digest-outbox'],
+    scope: 'workspace'
+  });
+}
+
+function digestOutboxStatePath(ctx: WorkforceCtx): string {
+  const identity = scheduledScanLockKey(ctx);
+  const shard = createHash('sha256').update(identity).digest('hex').slice(0, 32);
+  return `hn-monitor/state/${shard}/digest-outbox.json`;
+}
+
+function isMissingFileError(error: unknown): boolean {
+  const record = asRecord(error);
+  const code = typeof record?.code === 'string' ? record.code : '';
+  return code === 'ENOENT' || /\b(?:ENOENT|404|not found)\b/iu.test(String(error));
+}
+
+async function saveCriticalMemory(
+  ctx: WorkforceCtx,
+  content: string,
+  opts: { tags: string[]; scope: 'workspace' }
+): Promise<void> {
+  const receipt = await ctx.memory.save(content, opts);
+  if (!receipt?.id) throw new Error(`durable memory write returned no receipt (${opts.tags.join(',')})`);
 }
 
 async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
@@ -1779,36 +2044,4 @@ async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
     }
   }
   return posts.sort((a, b) => (b.postedAt ?? '').localeCompare(a.postedAt ?? ''));
-}
-
-async function loadPendingThreadBody(ctx: WorkforceCtx): Promise<PendingThreadBody | null> {
-  const items = await ctx.memory.recall('hn-monitor pending thread body delivery recovery', {
-    tags: ['hn-monitor:pending-thread-body'],
-    scope: 'workspace',
-    limit: 10
-  });
-  for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
-    if (!item.content) continue;
-    try {
-      const pending = JSON.parse(item.content) as PendingThreadBody | null;
-      if (pending === null || pending.cleared) return null;
-      if (pending.targets && pending.header && pending.body) return pending;
-    } catch {
-      // try the next recalled version
-    }
-  }
-  return null;
-}
-async function savePendingThreadBody(ctx: WorkforceCtx, pending: PendingThreadBody): Promise<void> {
-  await ctx.memory.save(JSON.stringify({ kind: 'hn-monitor pending thread body', ...pending }), {
-    tags: ['hn-monitor:pending-thread-body'],
-    scope: 'workspace'
-  });
-}
-async function clearPendingThreadBody(ctx: WorkforceCtx): Promise<void> {
-  await ctx.memory.save(JSON.stringify({
-    kind: 'hn-monitor pending thread body',
-    cleared: true,
-    clearedAt: new Date().toISOString()
-  }), { tags: ['hn-monitor:pending-thread-body'], scope: 'workspace' });
 }

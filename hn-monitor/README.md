@@ -18,9 +18,9 @@ HN discussion, points/comments, feed provenance, category, and a short “why it
 matters” note.
 
 The deployed `defineAgent` schedule remains the product entrypoint. After the
-existing HN fetch, relevance ranking, channel-scoped seen check, and provisional
-dedupe claim, it invokes `workflows/hn-monitor-scheduled-digest-v1.ts` through
-`ctx.workflow.run()` and waits for completion before delivery. The current
+existing HN fetch, relevance ranking, and channel-scoped seen check, it invokes
+`workflows/hn-monitor-scheduled-digest-v1.ts` through `ctx.workflow.run()` and
+waits for completion before staging the dedupe claim and delivery. The current
 four-file deploy format does not carry auxiliary workflow files, so the handler
 materializes that file through `ctx.files` from its bundled, typechecked source
 generator immediately before the runtime uploads it. That Relayflow
@@ -32,10 +32,17 @@ step itself but otherwise leaves skipped descendants inert on resume. A
 deterministic final gate checks the exact batch key, story ids, and output
 bounds before the persona can consume the notes. Curator and reviewer agents
 run from the batch artifact directory with restricted file grants (request →
-candidate → digest), no inherited workspace access, and no network access.
-The workflow dry run fails unless those grants resolve exactly. Provider
-writes and their exact Slack grounding records intentionally remain in the
-persona so existing delivery/recovery semantics do not move.
+candidate → digest), no inherited workspace access, and a `network: false`
+declaration. The workflow dry run fails unless those grants resolve exactly;
+enforcement beyond Relayflow's compiled permission policy remains the hosting
+runtime's responsibility. Provider writes and their exact Slack grounding
+records intentionally remain in the persona so existing delivery and
+conversation semantics do not move.
+
+Pinned core v1.0.6 can perform two additional same-attempt agent replays for a
+transient network failure. The supported worst case is therefore about 451
+seconds. The workflow timeout is 480 seconds, the handler completion wait is
+510 seconds, and the persona harness timeout is 600 seconds.
 
 Within a deployed worker, overlapping schedule deliveries are serialized per
 workspace/agent across the durable seen read, claim, workflow, and provider
@@ -63,14 +70,26 @@ You can also chat with it:
   a complete story title uses a conservative HN Algolia title match before
   hydration. Ambiguous or loose keyword matches are rejected.
 
-Before the threaded body is sent, the handler must save a state-finalization
-intent. If that durability gate is unavailable, the body is not sent and the
-already-published header/body pair stays queued for a later tick; the recovery
-path re-establishes the same intent before it retries the provider effect.
+Before the seen claim or any provider write, the handler saves a durable digest
+outbox. It advances through `claim`, `headers`, `bodies`, and `state`, recording
+Slack and Telegram independently after every effect. The current outbox value is
+an exact, workspace/agent-sharded Relayfile pointer; append-only memory entries
+remain its audit history but are never queried to choose the current checkpoint.
+The exact pointer is written before each audit entry, so a missing memory receipt
+can fail closed without losing the state needed to resume. Critical seen and
+legacy-marker reads fail closed, and critical memory writes require a receipt. Each provider
+header and body carries a stable key derived from the canonical HN batch. Slack
+consumes it as provider idempotency; Telegram, which has no native idempotency
+key, uses it as both draft metadata and a deterministic Relayfile item path so a
+replay rewrites the same draft identity. A partial multi-provider failure
+retries only the missing provider phase; a removed provider is marked omitted.
+The first run after upgrade also translates the previous pending-body or
+pending-state marker into this outbox before clearing the legacy records.
+
 If a delivered Slack digest cannot persist its exact grounding record, the run
 fails explicitly and emits `hn-monitor.post-grounding-persistence-failed`.
-The next serialized tick retries only exact state, then sees the retained claim,
-so it neither recomposes nor reposts the digest. A failure to save the separate
+The next serialized tick resumes the outbox at `state`, performs no provider
+write, and then clears the durable intent. A failure to save the separate
 semantic post-history record remains a warning because exact state is primary.
 
 Exact state currently follows the configured Slack channel. Telegram-only and
@@ -89,6 +108,7 @@ Platform developer loop:
 
 ```sh
 agentworkforce invoke ./hn-monitor/agent.ts --case ./hn-monitor/cases/scheduled-scan.case.yaml
+agentworkforce invoke ./hn-monitor/agent.ts --case ./hn-monitor/cases/live-model.case.yaml
 agentworkforce invoke ./hn-monitor/agent.ts --schedule scan --reads live --model stub --input SLACK_CHANNEL=C123
 agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --dry-run
 ```
@@ -96,8 +116,11 @@ agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --dry-run
 Local invocation always previews Slack actions; it never sends them. The
 scheduled preview records the `compose.run` request without launching the
 remote workflow, so the rendered preview uses the same deterministic fallback
-as an unavailable orchestration run. The `live-model.case.yaml` fixture keeps
-live-model coverage on the conversational follow-up path. `npm run evals:hn`
+as an unavailable orchestration run. The explicit `live-model.case.yaml`
+command exercises the live-model request and grounded fallback on the
+conversational Slack follow-up path;
+its final event source is `slack`, while its scheduled turn remains a Relayflow
+compose preview. `npm run evals:hn`
 and `npm run preview:hn` are thin wrappers
 around the platform invoke surface and fail closed until the Workforce CLI
 ships the required `--case` / `--schedule --reads --model` closure flags.

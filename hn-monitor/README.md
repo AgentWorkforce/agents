@@ -18,7 +18,7 @@ HN discussion, points/comments, feed provenance, category, and a short “why it
 matters” note.
 
 Fresh scheduled batches run through the checked-in Relayflow v1 DAG in
-`../workflows/hn-monitor-scheduled-batch.ts`. Its durable steps are
+`../workflows/hn-monitor-scheduled-batch-v1.ts`. Its durable steps are
 `analyze-batch`, `review-batch`, `repair-batch`, and `validate-batch`; its
 idempotency key and canonical invocation order are derived from the sorted HN
 story ids. The persona remains the side-effect owner: it fetches and filters

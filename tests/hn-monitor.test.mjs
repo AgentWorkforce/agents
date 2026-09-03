@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import test from 'node:test';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
@@ -208,6 +209,11 @@ test('fresh cron batch invokes and awaits the checked-in Relayflow with stable i
   const idempotencyKey = createHnBatchIdempotencyKey(sortedIds);
   assert.equal(workflowCalls.length, 1);
   assert.equal(workflowCalls[0].name, 'hn-monitor-scheduled-batch-v1');
+  assert.equal(
+    existsSync(new URL(`../workflows/${workflowCalls[0].name}.ts`, import.meta.url)),
+    true,
+    'ctx.workflow.run name must resolve to a checked-in workflows/<name>.ts source',
+  );
   assert.equal(workflowCalls[0].args.relayflowVersion, 'v1');
   assert.equal(workflowCalls[0].args.idempotencyKey, idempotencyKey);
   assert.deepEqual(workflowCalls[0].args.storyIds, sortedIds);
@@ -251,7 +257,7 @@ test('checked-in HN Relayflow v1 has a valid four-step production DAG and one pi
   process.env.HN_MONITOR_WORKFLOW_CONFIG_ONLY = '1';
   let workflowModule;
   try {
-    workflowModule = await import(`../.test-build/workflows/hn-monitor-scheduled-batch.js?test=${Date.now()}`);
+    workflowModule = await import(`../.test-build/workflows/hn-monitor-scheduled-batch-v1.js?test=${Date.now()}`);
   } finally {
     if (previousArgs === undefined) delete process.env.invocationArgs;
     else process.env.invocationArgs = previousArgs;

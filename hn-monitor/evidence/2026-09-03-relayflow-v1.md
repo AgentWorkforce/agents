@@ -88,8 +88,9 @@ $ npm run test:hn
 ✔ generated workflow dry run resolves least-privilege artifact grants and denies an unrelated secret
 ✔ tracked TypeScript generator emits a self-contained Relayflow workflow
 ✔ production Relayflow budget covers core v1 transient replays and caller overhead
-ℹ tests 45
-ℹ pass 45
+✔ zero configured targets retire a pending outbox before the scheduled scan returns
+ℹ tests 46
+ℹ pass 46
 ℹ fail 0
 ```
 
@@ -198,7 +199,7 @@ The first cold start timed out before readiness at 30 seconds. The same command
 with a 60-second readiness allowance completed:
 
 ```text
-$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-final-091be58.run.json
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-final-65506ed.run.json
 preview: 1 run(s) — 1 ok, 0 failed
 policy: reads=live writes=preview model=stub shell=simulate compose=preview
 ```
@@ -216,7 +217,7 @@ Captured RunRecord summary:
 ```
 
 The RunRecord was moved to the recoverable Trash path
-`/Users/khaliqgant/.Trash/hn-monitor-live-read-final-091be58.run.json` after
+`/Users/khaliqgant/.Trash/hn-monitor-live-read-final-65506ed.run.json` after
 extracting this evidence. No provider write had status `executed`, and no
 deployment was performed.
 
@@ -228,11 +229,11 @@ persona hn-monitor: 0 integration(s), 1 schedule(s)
 --dry-run: persona validated; exiting before any side effects
 ok: hn-monitor (dry-run)
 
-$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-final-091be58 --no-prompt
-bundle: staged to .hn-bundle-final-091be58/runner.mjs (705.7KB)
---bundle-out: bundle ready at .hn-bundle-final-091be58; skipping launch
+$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-final-65506ed --no-prompt
+bundle: staged to .hn-bundle-final-65506ed/runner.mjs (705.9KB)
+--bundle-out: bundle ready at .hn-bundle-final-65506ed; skipping launch
 
-$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-091be58
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-65506ed
 {"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14470,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
 ```
 
@@ -243,14 +244,14 @@ workflow before `ctx.workflow.run`, consumes a validated result, publishes the
 same header/thread pair through the production digest-delivery seam with stable
 keys, and completes the seen/outbox/exact-state transition.
 The inspected bundle was then moved to the recoverable Trash path
-`/Users/khaliqgant/.Trash/hn-bundle-final-091be58`.
+`/Users/khaliqgant/.Trash/hn-bundle-final-65506ed`.
 
 ## Repository regression result
 
 ```text
 $ npm test
-ℹ tests 347
-ℹ pass 345
+ℹ tests 348
+ℹ pass 346
 ℹ fail 2
 ```
 
@@ -470,3 +471,64 @@ source test then failed red on its stale import (`MODULE_NOT_FOUND`), was update
 to the persona-local path, and returned to 45/45. Deterministic E2E, live HN
 read/preview-only delivery, deploy dry-run, and emitted-bundle/source smoke were
 rerun on merge-clean checkpoint `091be58`; PR #132 reports mergeable.
+
+## Automated PR finding and final review preflight
+
+Automated PR review found that `runScheduledScan` returned immediately when no
+delivery targets were configured. If an earlier run had left a pending outbox,
+temporarily removing all targets therefore prevented the outbox from being
+retired; re-enabling a provider later could publish the stale digest. The
+product-path regression was added first and failed:
+
+```text
+$ npm run test:hn
+✖ zero configured targets retire a pending outbox before the scheduled scan returns
+tests 46; pass 45; fail 1
+```
+
+The scheduled critical section now performs pending-outbox recovery before the
+zero-target return. Recovery marks removed providers omitted and clears the
+outbox without a provider effect. The unchanged regression then passed:
+
+```text
+$ npm run test:hn
+tests 46; pass 46; fail 0
+
+$ npm run typecheck
+> tsc --noEmit
+(exit 0)
+
+$ node scripts/test.mjs tests/hn-monitor-cases.test.mjs
+tests 14; pass 14; fail 0
+```
+
+The first deterministic E2E attempt used the default five-second local-preview
+readiness timeout and failed while the worker was cold under concurrent machine
+load. The same exact code completed with the documented readiness allowance:
+
+```text
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run evals:hn
+(exit 0; every checked-in non-live HN case passed)
+```
+
+The final current-HN preview on `65506ed` made three live GETs and kept the
+workflow, exact-state files, and both Slack messages in preview status. The
+deploy dry-run again reported zero integrations and one schedule, then exited
+before side effects. The emitted bundle executed the exact captured workflow
+source and reported:
+
+```text
+{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14470,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
+```
+
+The repository-wide result on the same code is:
+
+```text
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm test
+tests 348; pass 346; fail 2
+```
+
+The only failures remain the two sibling-checkout acceptance prerequisites
+listed above. Code checkpoint `65506ed207990de83a823a69b0e9da5021c3a3de`
+contains the zero-target repair. A documentation-only checkpoint follows so
+fresh Claude and Codex reviewers can inspect one exact code-and-evidence SHA.

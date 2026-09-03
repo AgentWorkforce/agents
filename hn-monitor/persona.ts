@@ -66,7 +66,10 @@ export default definePersona({
     }
   },
 
-  useSubscription: true,
+  // No useSubscription: inference is workforce-billed (Claude per harness/model
+  // below). useSubscription:true would route through your own LLM provider, but
+  // the CLI deploy path doesn't supply a subscription resolver, so it can't deploy.
+  // Same pattern as internal-agents/linear-assistant (commit ab1f943e22).
   harness: 'claude',
   model: 'claude-haiku-4-5-20251001',
   systemPrompt: [

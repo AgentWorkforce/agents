@@ -5,7 +5,7 @@
  *     → fetch Front Page, Show HN, and the last 24h of New HN
  *     → score stories against an agent-infrastructure interest profile
  *     → drop ones already posted (durable memory)
- *     → add concise "why it matters" notes with ctx.llm
+ *     → curate concise "why it matters" notes in a durable Relayflow v1 run
  *     → post digest to Slack, Telegram, or both
  *
  *   Slack mention / Telegram message / relay inbox DM
@@ -37,6 +37,10 @@ import {
   readTelegramMessage,
   skipReason as telegramSkipReason
 } from '../shared/telegram.js';
+import {
+  materializeScheduledDigestWorkflow,
+  SCHEDULED_DIGEST_WORKFLOW_NAME
+} from './scheduled-digest-workflow.js';
 
 export type HnFeed = 'front_page' | 'show_hn' | 'new';
 
@@ -111,6 +115,21 @@ interface PendingThreadBody {
    *  The `draftRef` field holds the relay path for Slack refs and the messageId
    *  for Telegram refs — see saveHeaderRefs() / rebuildHeaderRefs(). */
   headerRefs: Array<{ provider: 'slack' | 'telegram'; draftRef: string; channel?: string; chatId?: string; threadTs?: string }>;
+}
+
+interface PendingPostState {
+  kind?: 'hn-monitor pending exact post state';
+  cleared?: boolean;
+  createdAt: string;
+  record: PostRecord;
+}
+
+const SCHEDULED_DIGEST_VERSION = 'v1' as const;
+const scheduledScanLocks = new Map<string, Promise<void>>();
+
+interface ScheduledScanDependencies {
+  delivery?: DeliveryClient;
+  fetchStories?: (lookbackHours: number) => Promise<Story[]>;
 }
 
 // ── message parsing ──────────────────────────────────────────────────────
@@ -229,21 +248,41 @@ export default defineAgent({
     // Cron path
     if (!isCronTickEvent(event as unknown as AgentEvent)) return;
 
-    const delivery = createDelivery(ctx);
-    if (delivery.targets.length === 0) {
-      ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
-      return;
-    }
+    await runScheduledScan(ctx);
+  }
+});
 
-    // Pending thread body recovery — if a previous run posted the header but
-    // the threaded body failed, retry it before processing new stories.
+/**
+ * Product schedule boundary. The deployed defineAgent handler delegates every
+ * cron tick here; dependencies are injectable only so the exact product path
+ * can be exercised without live HN reads or provider writes.
+ */
+export async function runScheduledScan(
+  ctx: WorkforceCtx,
+  deps: ScheduledScanDependencies = {}
+): Promise<void> {
+  const delivery = deps.delivery ?? createDelivery(ctx);
+  if (delivery.targets.length === 0) {
+    ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
+    return;
+  }
+
+  // One deployed worker can receive overlapping at-least-once cron
+  // deliveries. Serialize the whole read/claim/effect path per workspace and
+  // agent so the second invocation re-reads the first invocation's durable
+  // claim instead of racing from the same stale snapshot.
+  await withScheduledScanLock(scheduledScanLockKey(ctx), async () => {
+    // A body recovery owns this tick because it can perform a provider effect.
     if (await retryPendingThreadBody(ctx, delivery)) return;
+    // Exact-state recovery performs no provider write and may safely precede a
+    // new scan. It closes the body-delivered/state-write-failed window.
+    await retryPendingPostState(ctx);
 
     const topics = list(input(ctx, 'TOPICS'));
     const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
     const maxStories = boundedPositiveInt(input(ctx, 'MAX_STORIES') ?? '8', 'MAX_STORIES', 20);
 
-    const stories = await fetchHackerNewsFeeds(lookbackHours);
+    const stories = await (deps.fetchStories ?? fetchHackerNewsFeeds)(lookbackHours);
     const feedCounts = countFeeds(stories);
     ctx.log(
       'info',
@@ -254,7 +293,7 @@ export default defineAgent({
     ctx.log('info', `hn-monitor.matched-agentic matched=${matches.length}`, { matched: matches.length, candidates: stories.length });
 
     const seen = await loadSeen(ctx);
-    const fresh = matches.filter((s) => !seen.includes(s.id));
+    const fresh = matches.filter((story) => !seen.includes(story.id));
     ctx.log('info', `hn-monitor.fresh fresh=${fresh.length}`, { fresh: fresh.length });
     if (fresh.length === 0) {
       ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
@@ -262,8 +301,26 @@ export default defineAgent({
     }
 
     await postFreshStories(ctx, delivery, seen, fresh);
+  });
+}
+
+function scheduledScanLockKey(ctx: WorkforceCtx): string {
+  return `${ctx.workspaceId ?? 'workspace'}:${ctx.agentName ?? 'hn-monitor'}`;
+}
+
+async function withScheduledScanLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const predecessor = scheduledScanLocks.get(key) ?? Promise.resolve();
+  let release = (): void => {};
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  scheduledScanLocks.set(key, current);
+  await predecessor.catch(() => {});
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (scheduledScanLocks.get(key) === current) scheduledScanLocks.delete(key);
   }
-});
+}
 
 // ── Q&A handler ──────────────────────────────────────────────────────────
 
@@ -550,6 +607,20 @@ export async function postFreshStories(
       stories,
       headerRefs: saveHeaderRefs(heads)
     };
+    const postRecord: PostRecord = {
+      postedAt: pendingBase.createdAt,
+      digest: `${header}\n${body}`,
+      stories,
+      threadRefs: pendingBase.headerRefs
+    };
+
+    // Persist the state-finalization intent before the body effect. If the
+    // body lands but the exact Slack state write fails, the next serialized
+    // tick can restore grounding without publishing the digest again.
+    pending = pendingBase;
+    await savePendingPostState(ctx, postRecord).catch((error) => {
+      ctx.log('warn', 'hn-monitor.pending-post-state-unavailable', { error: String(error) });
+    });
 
     // Thread the body under each header, also non-blocking.
     const bodyResult = await delivery.send(body, { replyTo: heads, nonBlocking: true });
@@ -557,19 +628,15 @@ export async function postFreshStories(
     // Check that ALL attempted targets received refs — if any were lost, treat
     // as partial failure so the pending-recovery path saves state for retry.
     if (!bodyResult.ok || bodyResult.refs.length < delivery.targets.length) {
-      pending = pendingBase;
       throw new Error(`Threaded body failed on some targets`);
     }
+    pending = null;
     ctx.log('info', 'hn-monitor.posted', { targets: delivery.targets.join(',') });
 
     // Retain the digest for Q&A recall (~30 day rolling window via memory ttl).
-    const exactStateSaved = await savePost(ctx, {
-      postedAt: new Date().toISOString(),
-      digest: `${header}\n${body}`,
-      stories,
-      threadRefs: saveHeaderRefs(heads)
-    });
+    const exactStateSaved = await savePost(ctx, postRecord);
     if (!exactStateSaved) throw new ExactPostPersistenceError();
+    await clearPendingPostState(ctx);
   } catch (err) {
     if (!headerPosted) {
       // Nothing landed yet — release the provisional claim so the next tick
@@ -644,8 +711,12 @@ export async function retryPendingThreadBody(
     return true;
   }
 
+  // Clear the provider-effect retry before attempting exact-state recovery.
+  // If the following state write fails, the separate pending-post intent
+  // retries state only and cannot duplicate the threaded body.
+  await clearPendingThreadBody(ctx);
   const exactStateSaved = await savePost(ctx, {
-    postedAt: new Date().toISOString(),
+    postedAt: pending.createdAt,
     digest: `${pending.header}\n${pending.body}`,
     stories: pending.stories,
     threadRefs: pending.headerRefs
@@ -654,8 +725,24 @@ export async function retryPendingThreadBody(
     ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true });
     throw new ExactPostPersistenceError();
   }
-  await clearPendingThreadBody(ctx);
+  await clearPendingPostState(ctx);
   ctx.log('info', 'hn-monitor.pending-body-posted', { targets: configuredTargets });
+  return true;
+}
+
+/** Retry exact grounding state only; this path never calls a provider. */
+export async function retryPendingPostState(ctx: WorkforceCtx): Promise<boolean> {
+  const pending = await loadPendingPostState(ctx);
+  if (!pending) return false;
+  const exactStateSaved = await savePost(ctx, pending.record);
+  if (!exactStateSaved) {
+    ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true, stateOnly: true });
+    throw new ExactPostPersistenceError();
+  }
+  await clearPendingPostState(ctx);
+  ctx.log('info', 'hn-monitor.pending-post-state-saved', {
+    stories: pending.record.stories.map((story) => story.id)
+  });
   return true;
 }
 
@@ -904,31 +991,60 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
     hnUrl: story.hnUrl
   }));
   let notes: DigestNotes = { theme: fallbackTheme(stories), whyById: new Map() };
+  const batchKey = scheduledDigestBatchKey(stories);
   try {
-    const output = await withTimeout(
-      ctx.llm.complete(
-        [
-          'You are curating Hacker News for the Agent Relay team, which builds agent messaging, multi-agent orchestration, agent runtimes, cloud sandboxes, coding-agent workflows, and developer infrastructure.',
-          'Return ONLY compact JSON with this shape:',
-          '{"theme":"one specific sentence about the batch","stories":[{"id":123,"why":"one specific sentence, <= 160 characters"}]}',
-          'Keep every supplied story. Explain why each matters to builders of agentic developer tools; avoid generic hype and do not invent facts beyond the title/metadata.',
-          '',
-          JSON.stringify(storyData)
-        ].join('\n'),
-        { maxTokens: 900 }
-      ),
-      45_000,
-      'ctx.llm.complete'
+    await materializeScheduledDigestWorkflow(ctx);
+    const run = await withTimeout(
+      ctx.workflow.run(SCHEDULED_DIGEST_WORKFLOW_NAME, {
+        relayflowVersion: SCHEDULED_DIGEST_VERSION,
+        batchKey,
+        stories: storyData
+      }),
+      30_000,
+      `ctx.workflow.run(${SCHEDULED_DIGEST_WORKFLOW_NAME})`
     );
-    notes = parseDigestNotes(output, stories);
+    ctx.log('info', 'hn-monitor.relayflow-started', { batchKey, runId: run.runId, version: SCHEDULED_DIGEST_VERSION });
+    const completion = await withTimeout(
+      run.completion(),
+      195_000,
+      `ctx.workflow.completion(${run.runId})`
+    );
+    if (completion.status !== 'success') {
+      throw new Error(`Relayflow ${run.runId} completed with status ${completion.status}`);
+    }
+    if (completion.output !== null && completion.output !== undefined) {
+      notes = parseDigestNotes(workflowOutputText(completion.output), stories);
+    }
+    ctx.log('info', 'hn-monitor.relayflow-completed', {
+      batchKey,
+      runId: run.runId,
+      usedFallback: completion.output === null || completion.output === undefined
+    });
   } catch (error) {
-    ctx.log('warn', 'hn-monitor.llm-fallback', { error: String(error) });
+    // Keep the existing delivery semantics: orchestration/model unavailability
+    // degrades to a deterministic digest rather than suppressing fresh stories.
+    ctx.log('warn', 'hn-monitor.relayflow-fallback', { batchKey, error: String(error) });
   }
   return renderDigest(stories, notes);
 }
 
+export function scheduledDigestBatchKey(stories: Story[]): string {
+  const ids = [...new Set(stories.map((story) => story.id))].sort((a, b) => a - b);
+  return `hn-monitor:${SCHEDULED_DIGEST_VERSION}:${ids.join(',')}`;
+}
+
+function workflowOutputText(output: unknown): string {
+  if (typeof output === 'string') return output;
+  try {
+    return JSON.stringify(output);
+  } catch {
+    return String(output);
+  }
+}
+
 function parseDigestNotes(output: string, stories: Story[]): DigestNotes {
-  const json = output.match(/\{[\s\S]*\}/u)?.[0] ?? output;
+  const marked = output.match(/HN_DIGEST_NOTES_JSON:\s*(\{[^\n\r]*\})/gu)?.at(-1);
+  const json = marked?.slice(marked.indexOf('{')) ?? output.match(/\{[\s\S]*\}/u)?.[0] ?? output;
   try {
     const parsed = JSON.parse(json) as { theme?: unknown; stories?: Array<{ id?: unknown; why?: unknown }> };
     const whyById = new Map<number, string>();
@@ -1593,6 +1709,50 @@ async function savePost(ctx: WorkforceCtx, record: PostRecord): Promise<boolean>
   }
   return exactStateSaved;
 }
+
+async function loadPendingPostState(ctx: WorkforceCtx): Promise<PendingPostState | null> {
+  const items = await ctx.memory.recall('hn-monitor pending exact post state recovery', {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace',
+    limit: 10
+  });
+  for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
+    if (!item.content) continue;
+    try {
+      const pending = JSON.parse(item.content) as Partial<PendingPostState>;
+      if (pending.cleared) return null;
+      if (typeof pending.createdAt === 'string' && isPostRecord(pending.record)) {
+        return pending as PendingPostState;
+      }
+    } catch {
+      // try the next recalled version
+    }
+  }
+  return null;
+}
+
+async function savePendingPostState(ctx: WorkforceCtx, record: PostRecord): Promise<void> {
+  await ctx.memory.save(JSON.stringify({
+    kind: 'hn-monitor pending exact post state',
+    createdAt: new Date().toISOString(),
+    record
+  }), {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace'
+  });
+}
+
+async function clearPendingPostState(ctx: WorkforceCtx): Promise<void> {
+  await ctx.memory.save(JSON.stringify({
+    kind: 'hn-monitor pending exact post state',
+    cleared: true,
+    createdAt: new Date().toISOString()
+  }), {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace'
+  });
+}
+
 async function loadPosts(ctx: WorkforceCtx): Promise<PostRecord[]> {
   const items = await ctx.memory.recall('hn-monitor posted digest', {
     tags: ['hn-monitor:post'],

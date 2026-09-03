@@ -17,6 +17,37 @@ level and a richer digest lives in its thread. Every story includes the article,
 HN discussion, points/comments, feed provenance, category, and a short “why it
 matters” note.
 
+The deployed `defineAgent` schedule remains the product entrypoint. After the
+existing HN fetch, relevance ranking, channel-scoped seen check, and provisional
+dedupe claim, it invokes `workflows/hn-monitor-scheduled-digest-v1.ts` through
+`ctx.workflow.run()` and waits for completion before delivery. The current
+four-file deploy format does not carry auxiliary workflow files, so the handler
+materializes that file through `ctx.files` from its bundled, typechecked source
+generator immediately before the runtime uploads it. That Relayflow
+uses the v1 journal with stable `prepare-input`, `analyze-stories`,
+`review-digest`, and `validate-digest` step identities. Completed step outputs
+survive `RESUME_RUN_ID`. A small v1 compatibility helper reactivates only
+descendants core `1.0.6` journaled as `skipped`; that version resets the failed
+step itself but otherwise leaves skipped descendants inert on resume. A
+deterministic final gate checks the exact batch key, story ids, and output
+bounds before the persona can consume the notes. Curator and reviewer agents
+run from the batch artifact directory with restricted file grants (request →
+candidate → digest), no inherited workspace access, and no network access.
+The workflow dry run fails unless those grants resolve exactly. Provider
+writes and their exact Slack grounding records intentionally remain in the
+persona so existing delivery/recovery semantics do not move.
+
+Within a deployed worker, overlapping schedule deliveries are serialized per
+workspace/agent across the durable seen read, claim, workflow, and provider
+effects. The second delivery therefore re-reads the first delivery's claim
+instead of composing or posting the same batch from a stale snapshot.
+
+The invocation carries `relayflowVersion: v1`, while the current Cloud workflow
+request intentionally omits a runtime selector and therefore preserves the v1
+default. After Cloud v2 is proven, the narrow migration seam is the
+`SCHEDULED_DIGEST_VERSION` constant plus the single `ctx.workflow.run()` call;
+there is no v2 fallback in this workflow today.
+
 You can also chat with it:
 
 - Reply in a digest thread and `@mention` the bot with a story number or title.
@@ -32,9 +63,12 @@ You can also chat with it:
   a complete story title uses a conservative HN Algolia title match before
   hydration. Ambiguous or loose keyword matches are rejected.
 
+Before the threaded body is sent, the handler saves a state-finalization intent.
 If a delivered Slack digest cannot persist its exact grounding record, the run
-fails explicitly and emits `hn-monitor.post-grounding-persistence-failed`;
-semantic-memory failure alone remains a warning because exact state is primary.
+fails explicitly and emits `hn-monitor.post-grounding-persistence-failed`.
+The next serialized tick retries only exact state, then sees the retained claim,
+so it neither recomposes nor reposts the digest. Semantic-memory failure alone
+remains a warning because exact state is primary.
 
 Exact state currently follows the configured Slack channel. Telegram-only and
 relay-only follow-ups still use semantic memory plus the strict title fallback;
@@ -53,12 +87,15 @@ Platform developer loop:
 ```sh
 agentworkforce invoke ./hn-monitor/agent.ts --case ./hn-monitor/cases/scheduled-scan.case.yaml
 agentworkforce invoke ./hn-monitor/agent.ts --schedule scan --reads live --model stub --input SLACK_CHANNEL=C123
-agentworkforce invoke ./hn-monitor/agent.ts --schedule scan --reads live --model live --input SLACK_CHANNEL=C123
-agentworkforce deploy ./hn-monitor/agent.ts --mode cloud --dry-run
+agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --dry-run
 ```
 
 Local invocation always previews Slack actions; it never sends them. The
-`npm run evals:hn` and `npm run preview:hn` scripts are now thin wrappers
+scheduled preview records the `compose.run` request without launching the
+remote workflow, so the rendered preview uses the same deterministic fallback
+as an unavailable orchestration run. The `live-model.case.yaml` fixture keeps
+live-model coverage on the conversational follow-up path. `npm run evals:hn`
+and `npm run preview:hn` are thin wrappers
 around the platform invoke surface and fail closed until the Workforce CLI
 ships the required `--case` / `--schedule --reads --model` closure flags.
 

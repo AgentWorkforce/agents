@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 
+import hnMonitorAgent, * as hnMonitor from '../.test-build/hn-monitor/agent.js';
 import {
   fetchHackerNewsFeeds,
   findStoryByExactTitle,
@@ -16,13 +17,15 @@ import {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-function fakeCtx({ llm } = {}) {
+function fakeCtx({ llm, workflow } = {}) {
   const events = [];
   const saved = [];
   const logs = [];
   const files = new Map();
   return {
     ctx: {
+      workspaceId: 'ws-test',
+      agentName: 'hn-monitor',
       log(level, message, attrs) { logs.push({ level, message, attrs }); },
       persona: {
         inputs: { SLACK_CHANNEL: 'C123' },
@@ -56,6 +59,18 @@ function fakeCtx({ llm } = {}) {
         async complete() {
           events.push('llm');
           return 'digest body';
+        },
+      },
+      workflow: workflow ?? {
+        async run() {
+          events.push('workflow.run');
+          return {
+            runId: 'wf-preview',
+            async completion() {
+              events.push('workflow.completion');
+              return { status: 'success', output: null };
+            },
+          };
         },
       },
     },
@@ -102,7 +117,149 @@ function isClearedPending(entry) {
   }
 }
 
+function isClearedPendingPost(entry) {
+  if (!entry?.opts?.tags?.includes('hn-monitor:pending-post-state')) return false;
+  try {
+    return JSON.parse(entry.content).cleared === true;
+  } catch {
+    return false;
+  }
+}
+
 const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
+
+test('defineAgent scan schedule invokes the durable Relayflow v1 digest before publishing', async () => {
+  assert.deepEqual(hnMonitorAgent.schedules, [
+    { name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' },
+  ]);
+  assert.equal(
+    typeof hnMonitor.runScheduledScan,
+    'function',
+    'the product schedule handler must delegate to an executable scheduled-scan seam',
+  );
+
+  const workflowCalls = [];
+  const { ctx, events, saved, files } = fakeCtx({
+    llm: {
+      async complete() {
+        throw new Error('the scheduled product path must not call ctx.llm directly');
+      },
+    },
+  });
+  ctx.workflow.run = async (name, args) => {
+    events.push('workflow.run');
+    const source = files.get(`workflows/${name}.ts`);
+    assert.equal(typeof source, 'string', 'the deployable workflow source must exist before ctx.workflow.run');
+    workflowCalls.push({ name, args, source });
+    return {
+      runId: 'wf-hn-v1-20',
+      async completion() {
+        events.push('workflow.completion');
+        return {
+          status: 'success',
+          output: JSON.stringify({
+            theme: 'Durable orchestration is moving into the product path.',
+            stories: [{ id: 20, why: 'The scan now has journaled, resumable workflow steps.' }],
+          }),
+        };
+      },
+    };
+  };
+  const posts = [];
+
+  await hnMonitor.runScheduledScan(ctx, {
+    delivery: fakeDelivery(posts),
+    fetchStories: async () => [{
+      ...STORY,
+      title: 'AgentWorkforce durable agent runtime orchestration',
+      feeds: ['front_page'],
+    }],
+  });
+
+  assert.equal(workflowCalls.length, 1);
+  assert.equal(workflowCalls[0].name, 'hn-monitor-scheduled-digest-v1');
+  assert.equal(workflowCalls[0].args.relayflowVersion, 'v1');
+  assert.equal(workflowCalls[0].args.batchKey, 'hn-monitor:v1:20');
+  assert.deepEqual(workflowCalls[0].args.stories.map((story) => story.id), [20]);
+  assert.match(workflowCalls[0].source, /from '@relayflows\/core'/u);
+  assert.match(workflowCalls[0].source, /\.step\(["']validate-digest["']/u);
+  assert.doesNotMatch(workflowCalls[0].source, /from ['"]\.\/relayflow-v1-resume/u);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save', 'save', 'save']);
+  assert.deepEqual(savedSeenIds(saved[0]), [20]);
+  assert.equal(posts.length, 2);
+  assert.match(posts[1].text, /journaled, resumable workflow steps/);
+});
+
+test('runScheduledScan serializes concurrent claims before starting a second Relayflow', async () => {
+  let workflowRuns = 0;
+  let recalledSeenIds = [];
+  const { ctx } = fakeCtx({
+    workflow: {
+      async run() {
+        workflowRuns += 1;
+        return {
+          runId: `wf-dedupe-${workflowRuns}`,
+          async completion() { return { status: 'success', output: null }; },
+        };
+      },
+    },
+  });
+  const originalSave = ctx.memory.save;
+  ctx.memory.save = async (content, opts) => {
+    await originalSave(content, opts);
+    if (opts?.tags?.includes('hn-monitor:seen')) recalledSeenIds = JSON.parse(content).ids;
+  };
+  ctx.memory.recall = async (_query, opts) => {
+    if (!opts?.tags?.includes('hn-monitor:seen')) return [];
+    const snapshot = [...recalledSeenIds];
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    if (snapshot.length === 0) return [];
+    return [{
+      id: 'seen-state',
+      content: JSON.stringify({ ids: snapshot }),
+      tags: ['hn-monitor:seen'],
+      scope: 'workspace',
+      createdAt: '2026-09-03T08:00:00.000Z',
+    }];
+  };
+  const posts = [];
+  const deps = {
+    delivery: fakeDelivery(posts),
+    fetchStories: async () => [{
+      ...STORY,
+      title: 'AgentWorkforce durable agent runtime orchestration',
+      feeds: ['front_page'],
+    }],
+  };
+
+  await Promise.all([
+    hnMonitor.runScheduledScan(ctx, deps),
+    hnMonitor.runScheduledScan(ctx, deps),
+  ]);
+
+  assert.equal(workflowRuns, 1, 'the serialized durable claim must suppress duplicate orchestration');
+  assert.equal(posts.length, 2, 'only one header/body digest should be published');
+});
+
+test('postFreshStories degrades deterministically when Relayflow completion fails', async () => {
+  const { ctx, logs } = fakeCtx({
+    workflow: {
+      async run() {
+        return {
+          runId: 'wf-failed',
+          async completion() { return { status: 'failure', output: 'review failed' }; },
+        };
+      },
+    },
+  });
+  const posts = [];
+
+  await postFreshStories(ctx, fakeDelivery(posts), [], [STORY]);
+
+  assert.equal(posts.length, 2);
+  assert.match(posts[1].text, /Worth tracking for agent ecosystem/);
+  assert.ok(logs.some((entry) => entry.message === 'hn-monitor.relayflow-fallback'));
+});
 
 // ── feed discovery + relevance tests ───────────────────────────────────────
 
@@ -223,7 +380,7 @@ test('postFreshStories claims fresh ids before summarizing, then threads the dig
 
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save', 'save', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [10, 20]);
   assert.deepEqual(saved[0].opts, { tags: ['hn-monitor:seen'], scope: 'workspace' });
   assert.equal(posts.length, 2);
@@ -233,8 +390,9 @@ test('postFreshStories claims fresh ids before summarizing, then threads the dig
   assert.match(posts[1].text, /HN discussion/);
   assert.equal(posts[1].replyTo, 'ref-1');
 
-  assert.deepEqual(saved[1].opts, { tags: ['hn-monitor:post'], scope: 'workspace' });
-  const record = JSON.parse(saved[1].content);
+  const postSave = saved.find((entry) => entry.opts?.tags?.includes('hn-monitor:post'));
+  assert.deepEqual(postSave.opts, { tags: ['hn-monitor:post'], scope: 'workspace' });
+  const record = JSON.parse(postSave.content);
   assert.match(record.digest, /HN agentic radar/);
   assert.ok(typeof record.postedAt === 'string' && !Number.isNaN(Date.parse(record.postedAt)));
   assert.equal(record.stories[0].id, STORY.id);
@@ -243,16 +401,18 @@ test('postFreshStories claims fresh ids before summarizing, then threads the dig
   assert.match(record.stories[0].why, /agent ecosystem/i);
 });
 
-test('postFreshStories falls back to plain digest when LLM throws', async () => {
-  const { ctx, events, saved } = fakeCtx({
-    llm: { async complete() { events.push('llm'); throw new Error('llm exploded'); } },
-  });
+test('postFreshStories falls back to plain digest when Relayflow throws', async () => {
+  const { ctx, events, saved } = fakeCtx();
+  ctx.workflow.run = async () => {
+    events.push('workflow.run');
+    throw new Error('Relayflow exploded');
+  };
   const posts = [];
   const delivery = fakeDelivery(posts);
 
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'save', 'save', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [10, 20]);
   assert.equal(posts.length, 2);
   assert.match(posts[0].text, /HN agentic radar/);
@@ -260,7 +420,7 @@ test('postFreshStories falls back to plain digest when LLM throws', async () => 
   assert.match(posts[1].text, /example\.com\/20/);
   assert.equal(posts[1].replyTo, 'ref-1');
 
-  const record = JSON.parse(saved[1].content);
+  const record = JSON.parse(saved.find((entry) => entry.opts?.tags?.includes('hn-monitor:post')).content);
   assert.match(record.digest, /Agent Workforce cron leases/);
   assert.equal(record.stories[0].id, STORY.id);
   assert.equal(record.stories[0].rank, 1);
@@ -351,6 +511,62 @@ test('exact-state failure after Slack delivery rejects with an observable persis
   assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.post-grounding-persistence-failed'));
 });
 
+test('next scheduled tick repairs exact state after delivery without reposting', async () => {
+  const { ctx, saved, files, logs } = fakeCtx();
+  let exactWritesFail = true;
+  let workflowRuns = 0;
+  const originalWrite = ctx.files.write;
+  ctx.files.write = async (path, contents) => {
+    if (exactWritesFail && path.startsWith('/slack/')) throw new Error('relayfile unavailable');
+    await originalWrite(path, contents);
+  };
+  ctx.workflow.run = async () => {
+    workflowRuns += 1;
+    return {
+      runId: `wf-state-recovery-${workflowRuns}`,
+      async completion() { return { status: 'success', output: null }; },
+    };
+  };
+  ctx.memory.recall = async (_query, opts) => {
+    const tag = opts?.tags?.[0];
+    if (!tag) return [];
+    return saved
+      .filter((entry) => entry.opts?.tags?.includes(tag))
+      .map((entry, index) => ({
+        id: `${tag}-${index}`,
+        content: entry.content,
+        tags: [tag],
+        scope: 'workspace',
+        createdAt: new Date(Date.UTC(2026, 8, 3, 8, 0, index)).toISOString(),
+      }));
+  };
+  const posts = [];
+  const deps = {
+    delivery: fakeDelivery(posts),
+    fetchStories: async () => [{
+      ...STORY,
+      title: 'AgentWorkforce durable agent runtime orchestration',
+      feeds: ['front_page'],
+    }],
+  };
+
+  await assert.rejects(
+    () => hnMonitor.runScheduledScan(ctx, deps),
+    /deterministic HN grounding state could not be persisted/u,
+  );
+  assert.equal(posts.length, 2);
+  assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-post-state') && !isClearedPendingPost(entry)));
+
+  exactWritesFail = false;
+  await hnMonitor.runScheduledScan(ctx, deps);
+
+  assert.equal(posts.length, 2, 'state-only recovery must not repeat header or body effects');
+  assert.equal(workflowRuns, 1, 'the recovered seen claim must suppress a second orchestration');
+  assert.ok(files.has('/slack/channels/C123/hn-monitor/recent-digests.json'));
+  assert.ok(saved.some(isClearedPendingPost));
+  assert.ok(logs.some((entry) => entry.message === 'hn-monitor.pending-post-state-saved'));
+});
+
 test('Telegram-only delivery treats Slack exact-state persistence as a successful no-op', async () => {
   const { ctx, logs } = fakeCtx();
   ctx.persona.inputs = { TELEGRAM_CHAT: '456' };
@@ -388,7 +604,7 @@ test('postFreshStories releases claim when header publish fails', async () => {
     /Header publish failed/,
   );
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
   assert.deepEqual(saved.map(savedSeenIds), [[10, 20], [10]]);
 });
 

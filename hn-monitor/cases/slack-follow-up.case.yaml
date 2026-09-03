@@ -43,6 +43,7 @@ expect:
     - hn-monitor.qa.slack-replied
   effectsContain:
     - memory.save
+    - compose.run
     - model.complete
     - provider.write
   providerActions:

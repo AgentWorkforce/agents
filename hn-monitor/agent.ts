@@ -37,6 +37,21 @@ import {
   readTelegramMessage,
   skipReason as telegramSkipReason
 } from '../shared/telegram.js';
+import {
+  createHnBatchIdempotencyKey,
+  createHnBatchWorkflowInput,
+  HN_BATCH_STEP_IDS,
+  HN_BATCH_WORKFLOW_NAME,
+  runHnBatchWorkflow,
+  type HnBatchWorkflowHooks,
+  type HnBatchWorkflowResult
+} from './lib/batch-workflow.js';
+
+export {
+  createHnBatchIdempotencyKey,
+  HN_BATCH_STEP_IDS,
+  runHnBatchWorkflow
+} from './lib/batch-workflow.js';
 
 export type HnFeed = 'front_page' | 'show_hn' | 'new';
 
@@ -194,6 +209,74 @@ async function resolveRelaySender(event: AgentEvent, expandedFull: unknown): Pro
 
 // ── agent definition ─────────────────────────────────────────────────────
 
+type HnBatchRunner = (
+  storyIds: readonly number[],
+  hooks: HnBatchWorkflowHooks<PostedStory>
+) => Promise<HnBatchWorkflowResult<PostedStory>>;
+
+interface HnMonitorHandlerDeps {
+  createDelivery: (ctx: WorkforceCtx) => DeliveryClient;
+  fetchFeeds: (lookbackHours: number) => Promise<Story[]>;
+  runBatchWorkflow: HnBatchRunner;
+}
+
+export function createHnMonitorHandler(
+  overrides: Partial<HnMonitorHandlerDeps> = {}
+): (ctx: WorkforceCtx, event: AgentEvent) => Promise<void> {
+  const deps: HnMonitorHandlerDeps = {
+    createDelivery: (ctx) => createDelivery(ctx),
+    fetchFeeds: fetchHackerNewsFeeds,
+    runBatchWorkflow: (storyIds, hooks) => runHnBatchWorkflow(storyIds, hooks),
+    ...overrides
+  };
+
+  return async (ctx, event) => {
+    if (isRelaycastMessageEvent(event)) {
+      await handleQaMessage(ctx, event, 'relay');
+      return;
+    }
+    if (typeof event.type === 'string' && event.type.startsWith('telegram.')) {
+      await handleQaMessage(ctx, event, 'telegram');
+      return;
+    }
+    if (typeof event.type === 'string' && event.type.startsWith('slack.')) {
+      await handleQaMessage(ctx, event, 'slack');
+      return;
+    }
+    if (!isCronTickEvent(event)) return;
+
+    const delivery = deps.createDelivery(ctx);
+    if (delivery.targets.length === 0) {
+      ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
+      return;
+    }
+    if (await retryPendingThreadBody(ctx, delivery)) return;
+
+    const topics = list(input(ctx, 'TOPICS'));
+    const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
+    const maxStories = boundedPositiveInt(input(ctx, 'MAX_STORIES') ?? '8', 'MAX_STORIES', 20);
+    const stories = await deps.fetchFeeds(lookbackHours);
+    const feedCounts = countFeeds(stories);
+    ctx.log(
+      'info',
+      `hn-monitor.feed-scan front_page=${feedCounts.front_page} show_hn=${feedCounts.show_hn} new=${feedCounts.new}`,
+      { stories: stories.length, lookbackHours }
+    );
+    const matches = selectRelevantStories(stories, topics, maxStories);
+    ctx.log('info', `hn-monitor.matched-agentic matched=${matches.length}`, { matched: matches.length, candidates: stories.length });
+
+    const seen = await loadSeen(ctx);
+    const fresh = matches.filter((story) => !seen.includes(story.id));
+    ctx.log('info', `hn-monitor.fresh fresh=${fresh.length}`, { fresh: fresh.length });
+    if (fresh.length === 0) {
+      ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
+      return;
+    }
+
+    await postFreshStories(ctx, delivery, seen, fresh, deps.runBatchWorkflow);
+  };
+}
+
 export default defineAgent({
   schedules: [{ name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' }],
   triggers: {
@@ -210,59 +293,7 @@ export default defineAgent({
     slack: [{ on: 'message.created', paths: ['/slack/channels/${SLACK_CHANNEL}/**'], match: '@mention' }],
     telegram: [{ on: 'message' }]
   },
-  handler: async (ctx, event) => {
-    // Q&A path: relay inbox DM
-    if (isRelaycastMessageEvent(event as unknown as AgentEvent)) {
-      await handleQaMessage(ctx, event as unknown as AgentEvent, 'relay');
-      return;
-    }
-    // Q&A path: telegram message
-    if (typeof event.type === 'string' && event.type.startsWith('telegram.')) {
-      await handleQaMessage(ctx, event as unknown as AgentEvent, 'telegram');
-      return;
-    }
-    // Q&A path: a Slack @mention, usually in a digest thread.
-    if (typeof event.type === 'string' && event.type.startsWith('slack.')) {
-      await handleQaMessage(ctx, event as unknown as AgentEvent, 'slack');
-      return;
-    }
-    // Cron path
-    if (!isCronTickEvent(event as unknown as AgentEvent)) return;
-
-    const delivery = createDelivery(ctx);
-    if (delivery.targets.length === 0) {
-      ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
-      return;
-    }
-
-    // Pending thread body recovery — if a previous run posted the header but
-    // the threaded body failed, retry it before processing new stories.
-    if (await retryPendingThreadBody(ctx, delivery)) return;
-
-    const topics = list(input(ctx, 'TOPICS'));
-    const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
-    const maxStories = boundedPositiveInt(input(ctx, 'MAX_STORIES') ?? '8', 'MAX_STORIES', 20);
-
-    const stories = await fetchHackerNewsFeeds(lookbackHours);
-    const feedCounts = countFeeds(stories);
-    ctx.log(
-      'info',
-      `hn-monitor.feed-scan front_page=${feedCounts.front_page} show_hn=${feedCounts.show_hn} new=${feedCounts.new}`,
-      { stories: stories.length, lookbackHours }
-    );
-    const matches = selectRelevantStories(stories, topics, maxStories);
-    ctx.log('info', `hn-monitor.matched-agentic matched=${matches.length}`, { matched: matches.length, candidates: stories.length });
-
-    const seen = await loadSeen(ctx);
-    const fresh = matches.filter((s) => !seen.includes(s.id));
-    ctx.log('info', `hn-monitor.fresh fresh=${fresh.length}`, { fresh: fresh.length });
-    if (fresh.length === 0) {
-      ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
-      return;
-    }
-
-    await postFreshStories(ctx, delivery, seen, fresh);
-  }
+  handler: createHnMonitorHandler()
 });
 
 // ── Q&A handler ──────────────────────────────────────────────────────────
@@ -509,7 +540,8 @@ export async function postFreshStories(
   ctx: WorkforceCtx,
   delivery: DeliveryClient,
   seen: number[],
-  fresh: Story[]
+  fresh: Story[],
+  batchRunner: HnBatchRunner = (storyIds, hooks) => runHnBatchWorkflow(storyIds, hooks)
 ): Promise<void> {
   // Claim the stories as seen BEFORE the post. Cron delivery is at-least-once:
   // a single tick can re-invoke this handler (cloud re-runs a delivery whose
@@ -520,8 +552,29 @@ export async function postFreshStories(
   let headerPosted = false;
   let pending: PendingThreadBody | null = null;
   try {
-    ctx.log('info', 'hn-monitor.summarizing', { fresh: fresh.length });
-    const { header, body, stories } = await summarize(ctx, fresh);
+    const workflowInput = createHnBatchWorkflowInput(fresh.map((story) => story.id));
+    ctx.log('info', 'hn-monitor.batch-workflow-started', {
+      workflowName: HN_BATCH_WORKFLOW_NAME,
+      idempotencyKey: workflowInput.idempotencyKey,
+      storyIds: workflowInput.storyIds,
+      stepIds: [...HN_BATCH_STEP_IDS]
+    });
+    const workflowResult = await batchRunner(fresh.map((story) => story.id), {
+      analyze: async () => {
+        ctx.log('info', 'hn-monitor.summarizing', { fresh: fresh.length });
+        return summarize(ctx, fresh);
+      },
+      repair: async () => renderDigest(fresh, {
+        theme: fallbackTheme(fresh),
+        whyById: new Map()
+      })
+    });
+    ctx.log('info', 'hn-monitor.batch-workflow-completed', {
+      idempotencyKey: workflowResult.input.idempotencyKey,
+      runId: workflowResult.runId,
+      status: workflowResult.status
+    });
+    const { header, body, stories } = workflowResult.batch;
     ctx.log('info', 'hn-monitor.posting', { targets: delivery.targets });
 
     // Wait for the header receipt so its delivered Slack thread timestamp can

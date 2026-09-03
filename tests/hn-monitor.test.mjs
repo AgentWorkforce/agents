@@ -4,12 +4,16 @@ import test from 'node:test';
 import { envelopeToAgentEvent } from '@agentworkforce/runtime';
 
 import {
+  createHnBatchIdempotencyKey,
+  createHnMonitorHandler,
   fetchHackerNewsFeeds,
   findStoryByExactTitle,
   handleQaMessage,
+  HN_BATCH_STEP_IDS,
   postFreshStories,
   renderDigest,
   retryPendingThreadBody,
+  runHnBatchWorkflow,
   selectQuestionStories,
   selectRelevantStories,
 } from '../.test-build/hn-monitor/agent.js';
@@ -103,6 +107,200 @@ function isClearedPending(entry) {
 }
 
 const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
+
+function cronEvent() {
+  return envelopeToAgentEvent({
+    id: 'evt-hn-monitor-scan',
+    workspace: 'ws-test',
+    type: 'cron.tick',
+    occurredAt: '2026-09-03T07:00:00.000Z',
+    name: 'scan',
+    cron: '0 9,17 * * *',
+  });
+}
+
+test('fresh cron batch invokes and awaits the real Relayflow with stable inputs, then publishes and persists once', async () => {
+  let releaseAnalysis;
+  let markAnalysisStarted;
+  const analysisStarted = new Promise((resolve) => { markAnalysisStarted = resolve; });
+  const analysisGate = new Promise((resolve) => { releaseAnalysis = resolve; });
+  const { ctx, saved, logs, files } = fakeCtx({
+    llm: {
+      async complete() {
+        markAnalysisStarted();
+        return analysisGate;
+      },
+    },
+  });
+  ctx.persona.inputs = {
+    SLACK_CHANNEL: 'C123',
+    TOPICS: 'agents,agent orchestration,agent memory',
+    LOOKBACK_HOURS: '24',
+    MAX_STORIES: '8',
+  };
+  ctx.persona.inputSpecs = {
+    SLACK_CHANNEL: { env: 'SLACK_CHANNEL', description: '', optional: true },
+    TELEGRAM_CHAT: { env: 'TELEGRAM_CHAT', description: '', optional: true },
+    TOPICS: { env: 'TOPICS', description: '', default: 'agents' },
+    LOOKBACK_HOURS: { env: 'LOOKBACK_HOURS', description: '', default: '24' },
+    MAX_STORIES: { env: 'MAX_STORIES', description: '', default: '8' },
+  };
+
+  const posts = [];
+  const stories = [
+    { id: 30, title: 'Show HN: Durable memory for coding agents', url: 'https://example.com/30', points: 31, comments: 8, feeds: ['show_hn'] },
+    { id: 20, title: 'Multi-agent orchestration runtime', url: 'https://example.com/20', points: 52, comments: 13, feeds: ['front_page'] },
+  ];
+  const handler = createHnMonitorHandler({
+    createDelivery: () => fakeDelivery(posts),
+    fetchFeeds: async () => stories,
+  });
+
+  let settled = false;
+  const run = handler(ctx, cronEvent()).then(() => { settled = true; });
+  await analysisStarted;
+
+  assert.equal(settled, false, 'cron handler must await Relayflow completion');
+  assert.equal(posts.length, 0, 'publishing must not begin while batch analysis is running');
+  assert.equal(
+    saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length,
+    0,
+    'digest persistence must not begin while the workflow is running',
+  );
+
+  releaseAnalysis('digest body');
+  await run;
+
+  const sortedIds = [20, 30];
+  const idempotencyKey = createHnBatchIdempotencyKey(sortedIds);
+  const started = logs.find((entry) => entry.message === 'hn-monitor.batch-workflow-started');
+  const completed = logs.find((entry) => entry.message === 'hn-monitor.batch-workflow-completed');
+  assert.deepEqual(started?.attrs?.storyIds, sortedIds);
+  assert.equal(started?.attrs?.idempotencyKey, idempotencyKey);
+  assert.deepEqual(started?.attrs?.stepIds, HN_BATCH_STEP_IDS);
+  assert.equal(completed?.attrs?.idempotencyKey, idempotencyKey);
+  assert.equal(completed?.attrs?.status, 'completed');
+  assert.equal(posts.length, 2, 'one digest is one header plus one threaded body');
+  assert.equal(
+    saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length,
+    1,
+    'the digest memory record must be appended once',
+  );
+  assert.ok(files.has('/slack/channels/C123/hn-monitor/recent-digests.json'));
+});
+
+test('HN batch Relayflow keeps its story-id key order independent and runs the four static durable steps', async () => {
+  assert.equal(
+    createHnBatchIdempotencyKey([30, 20, 30]),
+    createHnBatchIdempotencyKey([20, 30]),
+  );
+  const events = [];
+  const draft = {
+    header: 'header',
+    body: 'body',
+    stories: [{ id: 30 }, { id: 20 }],
+  };
+
+  const result = await runHnBatchWorkflow(
+    [30, 20],
+    {
+      analyze: async () => draft,
+      repair: async () => { throw new Error('valid draft must not need repair'); },
+    },
+    { onEvent: (event) => events.push(event) },
+  );
+
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(
+    events.filter((event) => event.type === 'step:started').map((event) => event.stepName),
+    HN_BATCH_STEP_IDS,
+  );
+  assert.deepEqual(result.input.storyIds, [20, 30]);
+});
+
+test('HN batch Relayflow retries one transient analysis failure and completes with one validated result', async () => {
+  let attempts = 0;
+  const events = [];
+  const result = await runHnBatchWorkflow(
+    [9102, 9101],
+    {
+      analyze: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('transient analysis failure');
+        return { header: 'header', body: 'body', stories: [{ id: 9102 }, { id: 9101 }] };
+      },
+      repair: async () => { throw new Error('valid retry result must not need repair'); },
+    },
+    { onEvent: (event) => events.push(event) },
+  );
+
+  assert.equal(result.status, 'completed');
+  assert.equal(attempts, 2);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'step:retrying').map((event) => event.stepName),
+    ['analyze-batch'],
+  );
+});
+
+test('HN batch Relayflow repairs a review finding before final validation', async () => {
+  let repairs = 0;
+  const result = await runHnBatchWorkflow(
+    [9151],
+    {
+      analyze: async () => ({ header: 'header', body: '', stories: [{ id: 9151 }] }),
+      repair: async (_draft, findings) => {
+        repairs += 1;
+        assert.deepEqual(findings, ['body is empty']);
+        return { header: 'header', body: 'repaired body', stories: [{ id: 9151 }] };
+      },
+    },
+  );
+
+  assert.equal(repairs, 1);
+  assert.equal(result.batch.body, 'repaired body');
+  assert.equal(result.status, 'completed');
+});
+
+test('HN batch Relayflow pins retry exhaustion as failed completion, and failed cron analysis cannot publish or persist', async () => {
+  let attempts = 0;
+  const events = [];
+  await assert.rejects(
+    () => runHnBatchWorkflow(
+      [9201],
+      {
+        analyze: async () => {
+          attempts += 1;
+          throw new Error('permanent analysis failure');
+        },
+        repair: async (draft) => draft,
+      },
+      { onEvent: (event) => events.push(event) },
+    ),
+    /Step "analyze-batch" failed/u,
+  );
+  assert.equal(attempts, 2, 'one initial attempt plus one configured retry');
+  assert.ok(events.some((event) => event.type === 'run:failed'));
+
+  const { ctx, saved } = fakeCtx();
+  const posts = [];
+  await assert.rejects(
+    () => postFreshStories(
+      ctx,
+      fakeDelivery(posts),
+      [10],
+      [STORY],
+      async () => { throw new Error('workflow failed completion'); },
+    ),
+    /workflow failed completion/u,
+  );
+  assert.equal(posts.length, 0);
+  assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length, 0);
+  assert.deepEqual(
+    saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:seen')).map(savedSeenIds),
+    [[10, 20], [10]],
+    'the provisional claim is released when no delivery landed',
+  );
+});
 
 // ── feed discovery + relevance tests ───────────────────────────────────────
 

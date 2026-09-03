@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { JsonFileWorkflowDb, workflow } from '@relayflows/core';
+import { SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS } from '../.test-build/hn-monitor/agent.js';
 import {
   reactivateSkippedV1Steps,
   scheduledDigestJournalWorkflowName,
@@ -57,6 +58,14 @@ test('production resume guard uses the exact workflow name journaled by pinned R
 
   assert.equal(actualJournalName, scheduledDigestJournalWorkflowName(SCHEDULED_DIGEST_WORKFLOW_NAME));
   assert.match(scheduledDigestWorkflowSource(), /scheduledDigestJournalWorkflowName\d*\(WORKFLOW_NAME\)/u);
+});
+
+test('production Relayflow budget covers core v1 transient replays and caller overhead', async () => {
+  const source = scheduledDigestWorkflowSource();
+  // The generated program is bundled by esbuild, which emits 480_000 as 48e4.
+  assert.match(source, /const WORKFLOW_TIMEOUT_MS = 48e4;/u);
+  assert.match(source, /\.timeout\(WORKFLOW_TIMEOUT_MS\)/u);
+  assert.equal(SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS, 510_000);
 });
 
 test('pinned Relayflow v1 resumes a failed run without replaying completed HN step identities', async () => {

@@ -85,10 +85,12 @@ function workflowProgram({
 }: WorkflowProgramDependencies): void {
 const WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 const OUTPUT_MARKER = 'HN_DIGEST_NOTES_JSON:';
-// Worst supported path is 210s: prepare 10s + two 60s agent steps +
-// validator 10s + reviewer repair 60s + validator retry 10s. The remaining
-// 30s covers retry delay and runner overhead; the persona waits another 15s.
-const WORKFLOW_TIMEOUT_MS = 240_000;
+// Core v1.0.6 may replay each nominal agent attempt twice for a transient
+// network failure even when step retries are zero. The worst supported path is
+// therefore ~451s: prepare 10s + curator 3*60s + reviewer 3*60s + validator
+// 10s + reviewer repair 60s + validator retry 10s + retry delay. The 480s
+// fallback step budget and 510s caller wait leave bounded runner overhead.
+const WORKFLOW_TIMEOUT_MS = 480_000;
 
 interface DigestStoryInput {
   id: number;

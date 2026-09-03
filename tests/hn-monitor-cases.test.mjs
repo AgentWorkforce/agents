@@ -171,6 +171,7 @@ test('live-model case composes the scheduled digest and reserves the live model 
   assert.ok(liveModel.inputs?.SLACK_CHANNEL, 'live-model must have SLACK_CHANNEL input (agent exits early otherwise)');
   assert.equal(liveModel.turns?.[0]?.type, 'cron.tick');
   assert.equal(liveModel.turns?.[1]?.type, 'slack.app_mention');
+  assert.equal(liveModel.expect?.eventSource, 'slack', 'the final turn determines the case event source');
   assert.deepEqual(
     liveModel.http?.slice(0, 3).map((fixture) => fixture.match),
     ['tags=front_page', 'tags=show_hn', 'tags=story'],

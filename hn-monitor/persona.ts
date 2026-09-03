@@ -75,7 +75,7 @@ export default definePersona({
     'Be selective and concrete: explain why a story matters to builders in that space, avoid generic AI hype, and never invent details beyond the supplied HN metadata or live comments.',
     'For chat, distinguish article claims from HN community reactions and link back to the article and HN discussion.'
   ].join(' '),
-  harnessSettings: { reasoning: 'low', timeoutSeconds: 300 },
+  harnessSettings: { reasoning: 'low', timeoutSeconds: 600 },
 
   relay: { inbox: ['@self'] },
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 30 },

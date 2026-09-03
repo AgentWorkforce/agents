@@ -125,6 +125,7 @@ interface PendingPostState {
 }
 
 const SCHEDULED_DIGEST_VERSION = 'v1' as const;
+const SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS = 255_000;
 const scheduledScanLocks = new Map<string, Promise<void>>();
 
 interface ScheduledScanDependencies {
@@ -618,9 +619,10 @@ export async function postFreshStories(
     // body lands but the exact Slack state write fails, the next serialized
     // tick can restore grounding without publishing the digest again.
     pending = pendingBase;
-    await savePendingPostState(ctx, postRecord).catch((error) => {
-      ctx.log('warn', 'hn-monitor.pending-post-state-unavailable', { error: String(error) });
-    });
+    // This is a hard durability gate, not best-effort telemetry. Sending the
+    // body without this record would make a subsequent exact-state failure
+    // impossible to repair without replaying a provider effect.
+    await savePendingPostState(ctx, postRecord);
 
     // Thread the body under each header, also non-blocking.
     const bodyResult = await delivery.send(body, { replyTo: heads, nonBlocking: true });
@@ -704,6 +706,19 @@ export async function retryPendingThreadBody(
       }
     : { nonBlocking: true as const };
 
+  const postRecord: PostRecord = {
+    postedAt: pending.createdAt,
+    digest: `${pending.header}\n${pending.body}`,
+    stories: pending.stories,
+    threadRefs: pending.headerRefs
+  };
+
+  // A prior attempt may have stopped specifically because this intent could
+  // not be persisted. Re-establish the same hard gate before retrying the
+  // provider effect; otherwise the recovery path would reopen the original
+  // body-delivered/state-unrecoverable window.
+  await savePendingPostState(ctx, postRecord);
+
   const bodyResult = await delivery.send(pending.body, bodyOpts);
   // Match postFreshStories: ALL targets must receive refs for success.
   if (!bodyResult.ok || bodyResult.refs.length < delivery.targets.length) {
@@ -715,12 +730,7 @@ export async function retryPendingThreadBody(
   // If the following state write fails, the separate pending-post intent
   // retries state only and cannot duplicate the threaded body.
   await clearPendingThreadBody(ctx);
-  const exactStateSaved = await savePost(ctx, {
-    postedAt: pending.createdAt,
-    digest: `${pending.header}\n${pending.body}`,
-    stories: pending.stories,
-    threadRefs: pending.headerRefs
-  });
+  const exactStateSaved = await savePost(ctx, postRecord);
   if (!exactStateSaved) {
     ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true });
     throw new ExactPostPersistenceError();
@@ -1006,7 +1016,7 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
     ctx.log('info', 'hn-monitor.relayflow-started', { batchKey, runId: run.runId, version: SCHEDULED_DIGEST_VERSION });
     const completion = await withTimeout(
       run.completion(),
-      195_000,
+      SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS,
       `ctx.workflow.completion(${run.runId})`
     );
     if (completion.status !== 'success') {

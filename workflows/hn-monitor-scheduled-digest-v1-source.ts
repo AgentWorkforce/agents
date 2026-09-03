@@ -5,6 +5,11 @@ interface JournalRun {
 
 export const SCHEDULED_DIGEST_WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 
+/** Core v1 journals the builder's executable workflow definition with this suffix. */
+export function scheduledDigestJournalWorkflowName(publicName: string): string {
+  return `${publicName}-workflow`;
+}
+
 interface JournalStep {
   id: string;
   stepName: string;
@@ -64,6 +69,7 @@ interface WorkflowProgramDependencies {
   workflow: typeof import('@relayflows/core').workflow;
   JsonFileWorkflowDb: typeof import('@relayflows/core').JsonFileWorkflowDb;
   reactivateSkippedV1Steps: typeof reactivateSkippedV1Steps;
+  scheduledDigestJournalWorkflowName: typeof scheduledDigestJournalWorkflowName;
 }
 
 function workflowProgram({
@@ -75,9 +81,14 @@ function workflowProgram({
   workflow,
   JsonFileWorkflowDb,
   reactivateSkippedV1Steps,
+  scheduledDigestJournalWorkflowName,
 }: WorkflowProgramDependencies): void {
 const WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 const OUTPUT_MARKER = 'HN_DIGEST_NOTES_JSON:';
+// Worst supported path is 210s: prepare 10s + two 60s agent steps +
+// validator 10s + reviewer repair 60s + validator retry 10s. The remaining
+// 30s covers retry delay and runner overhead; the persona waits another 15s.
+const WORKFLOW_TIMEOUT_MS = 240_000;
 
 interface DigestStoryInput {
   id: number;
@@ -118,7 +129,7 @@ async function main(): Promise<void> {
     .description('Curate and independently validate one HN scheduled digest')
     .pattern('pipeline')
     .maxConcurrency(1)
-    .timeout(180_000)
+    .timeout(WORKFLOW_TIMEOUT_MS)
     .trajectories({ enabled: true, autoDecisions: true })
     .agent('curator', {
       cli: 'claude',
@@ -126,7 +137,6 @@ async function main(): Promise<void> {
       preset: 'worker',
       role: 'Curate supplied HN metadata into concise builder-relevant notes.',
       interactive: false,
-      retries: 1,
       timeoutMs: 60_000,
       maxTokens: 1_800,
       cwd: artifactDir,
@@ -146,7 +156,6 @@ async function main(): Promise<void> {
       preset: 'reviewer',
       role: 'Independently check factual grounding and repair the digest artifact.',
       interactive: false,
-      retries: 1,
       timeoutMs: 60_000,
       maxTokens: 1_800,
       cwd: artifactDir,
@@ -171,6 +180,7 @@ async function main(): Promise<void> {
       captureOutput: true,
       failOnError: true,
       timeoutMs: 10_000,
+      retries: 0,
     })
     .step('analyze-stories', {
       agent: 'curator',
@@ -186,7 +196,7 @@ async function main(): Promise<void> {
       ].join('\n'),
       verification: { type: 'file_exists', value: candidatePath },
       timeoutMs: 60_000,
-      retries: 1,
+      retries: 0,
     })
     .step('review-digest', {
       agent: 'reviewer',
@@ -201,7 +211,7 @@ async function main(): Promise<void> {
       ].join('\n'),
       verification: { type: 'file_exists', value: digestPath },
       timeoutMs: 60_000,
-      retries: 1,
+      retries: 0,
     })
     .step('validate-digest', {
       type: 'deterministic',
@@ -211,6 +221,7 @@ async function main(): Promise<void> {
       failOnError: true,
       verification: { type: 'output_contains', value: OUTPUT_MARKER },
       timeoutMs: 10_000,
+      retries: 1,
     })
     .repairable({
       maxRetries: 1,
@@ -249,7 +260,7 @@ async function main(): Promise<void> {
   if (requestedResumeRunId) {
     await reactivateSkippedV1Steps(
       requestedResumeRunId,
-      WORKFLOW_NAME,
+      scheduledDigestJournalWorkflowName(WORKFLOW_NAME),
       path.join(process.cwd(), '.agent-relay', 'workflow-runs.jsonl'),
       (filePath) => new JsonFileWorkflowDb(filePath),
       ['analyze-stories', 'review-digest', 'validate-digest'],
@@ -395,7 +406,8 @@ export function scheduledDigestWorkflowSource(): string {
     "import path from 'node:path';",
     "import { JsonFileWorkflowDb, workflow } from '@relayflows/core';",
     `const reactivateSkippedV1Steps = (${reactivateSkippedV1Steps.toString()});`,
-    `(${workflowProgram.toString()})({ readFile, mkdir, writeFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps });`,
+    `const scheduledDigestJournalWorkflowName = (${scheduledDigestJournalWorkflowName.toString()});`,
+    `(${workflowProgram.toString()})({ readFile, mkdir, writeFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps, scheduledDigestJournalWorkflowName });`,
     '',
   ].join('\n');
 }

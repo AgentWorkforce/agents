@@ -27,7 +27,7 @@ generator immediately before the runtime uploads it. That Relayflow
 uses the v1 journal with stable `prepare-input`, `analyze-stories`,
 `review-digest`, and `validate-digest` step identities. Completed step outputs
 survive `RESUME_RUN_ID`. A small v1 compatibility helper reactivates only
-descendants core `1.0.6` journaled as `skipped`; that version resets the failed
+descendants on core `1.0.6` journaled as `skipped`; that version resets the failed
 step itself but otherwise leaves skipped descendants inert on resume. A
 deterministic final gate checks the exact batch key, story ids, and output
 bounds before the persona can consume the notes. Curator and reviewer agents
@@ -63,12 +63,15 @@ You can also chat with it:
   a complete story title uses a conservative HN Algolia title match before
   hydration. Ambiguous or loose keyword matches are rejected.
 
-Before the threaded body is sent, the handler saves a state-finalization intent.
+Before the threaded body is sent, the handler must save a state-finalization
+intent. If that durability gate is unavailable, the body is not sent and the
+already-published header/body pair stays queued for a later tick; the recovery
+path re-establishes the same intent before it retries the provider effect.
 If a delivered Slack digest cannot persist its exact grounding record, the run
 fails explicitly and emits `hn-monitor.post-grounding-persistence-failed`.
 The next serialized tick retries only exact state, then sees the retained claim,
-so it neither recomposes nor reposts the digest. Semantic-memory failure alone
-remains a warning because exact state is primary.
+so it neither recomposes nor reposts the digest. A failure to save the separate
+semantic post-history record remains a warning because exact state is primary.
 
 Exact state currently follows the configured Slack channel. Telegram-only and
 relay-only follow-ups still use semantic memory plus the strict title fallback;

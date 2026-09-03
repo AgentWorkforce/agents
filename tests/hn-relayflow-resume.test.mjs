@@ -8,7 +8,9 @@ import test from 'node:test';
 import { JsonFileWorkflowDb, workflow } from '@relayflows/core';
 import {
   reactivateSkippedV1Steps,
+  scheduledDigestJournalWorkflowName,
   scheduledDigestWorkflowSource,
+  SCHEDULED_DIGEST_WORKFLOW_NAME,
 } from '../.test-build/workflows/hn-monitor-scheduled-digest-v1-source.js';
 
 function resumeFixture() {
@@ -46,6 +48,16 @@ function resumeFixture() {
     })
     .onError('fail-fast', { maxRetries: 0 });
 }
+
+test('production resume guard uses the exact workflow name journaled by pinned Relayflow v1', () => {
+  const config = workflow(SCHEDULED_DIGEST_WORKFLOW_NAME)
+    .step('name-contract', { type: 'deterministic', command: 'true' })
+    .toConfig();
+  const actualJournalName = config.workflows?.[0]?.name;
+
+  assert.equal(actualJournalName, scheduledDigestJournalWorkflowName(SCHEDULED_DIGEST_WORKFLOW_NAME));
+  assert.match(scheduledDigestWorkflowSource(), /scheduledDigestJournalWorkflowName\d*\(WORKFLOW_NAME\)/u);
+});
 
 test('pinned Relayflow v1 resumes a failed run without replaying completed HN step identities', async () => {
   const runtimeDir = await mkdtemp(path.resolve('.hn-relayflow-resume-'));
@@ -96,7 +108,7 @@ test('v1 resume reactivation rejects non-failed runs and touches only named desc
     { id: 'validate-row', stepName: 'validate-digest', status: 'skipped' },
   ];
   const updates = [];
-  const journal = (status, workflowName = 'hn-monitor-scheduled-digest-v1') => ({
+  const journal = (status, workflowName = 'hn-monitor-scheduled-digest-v1-workflow') => ({
     async getRun() { return { status, workflowName }; },
     async getStepsByRunId() { return steps; },
     async updateStep(id, patch) { updates.push({ id, patch }); },
@@ -104,17 +116,17 @@ test('v1 resume reactivation rejects non-failed runs and touches only named desc
 
   for (const status of ['running', 'completed']) {
     await assert.rejects(
-      () => reactivateSkippedV1Steps('run-1', 'hn-monitor-scheduled-digest-v1', 'journal', () => journal(status), ['validate-digest']),
+      () => reactivateSkippedV1Steps('run-1', 'hn-monitor-scheduled-digest-v1-workflow', 'journal', () => journal(status), ['validate-digest']),
       new RegExp(`non-resumable status ${status}`, 'u'),
     );
   }
   await assert.rejects(
-    () => reactivateSkippedV1Steps('run-1', 'hn-monitor-scheduled-digest-v1', 'journal', () => journal('failed', 'other-workflow'), ['validate-digest']),
+    () => reactivateSkippedV1Steps('run-1', 'hn-monitor-scheduled-digest-v1-workflow', 'journal', () => journal('failed', 'other-workflow'), ['validate-digest']),
     /belongs to other-workflow/u,
   );
 
   assert.equal(
-    await reactivateSkippedV1Steps('run-1', 'hn-monitor-scheduled-digest-v1', 'journal', () => journal('failed'), ['validate-digest']),
+    await reactivateSkippedV1Steps('run-1', 'hn-monitor-scheduled-digest-v1-workflow', 'journal', () => journal('failed'), ['validate-digest']),
     1,
   );
   assert.deepEqual(updates.map((update) => update.id), ['validate-row']);

@@ -189,3 +189,58 @@ test('generated workflow dry run resolves least-privilege artifact grants and de
     await rm(runtimeDir, { recursive: true, force: true });
   }
 });
+
+test('tracked TypeScript generator emits a self-contained Relayflow workflow', async () => {
+  const runtimeDir = await mkdtemp(path.resolve('.hn-relayflow-source-'));
+  try {
+    const workflowPath = path.join(runtimeDir, 'hn-workflow.ts');
+    const materializer = spawnSync(
+      path.resolve('node_modules/.bin/tsx'),
+      [
+        '--eval',
+        [
+          "import { writeFileSync } from 'node:fs';",
+          "import { scheduledDigestWorkflowSource } from './workflows/hn-monitor-scheduled-digest-v1-source.ts';",
+          'writeFileSync(process.env.HN_WORKFLOW_PATH, scheduledDigestWorkflowSource());',
+        ].join('\n'),
+      ],
+      {
+        cwd: path.resolve('.'),
+        encoding: 'utf8',
+        env: { ...process.env, HN_WORKFLOW_PATH: workflowPath },
+      },
+    );
+    assert.equal(materializer.status, 0, `${materializer.stdout}\n${materializer.stderr}`);
+
+    const result = spawnSync(
+      path.resolve('node_modules/.bin/tsx'),
+      [workflowPath],
+      {
+        cwd: runtimeDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          DRY_RUN: '1',
+          invocationArgs: JSON.stringify({
+            relayflowVersion: 'v1',
+            batchKey: 'hn-monitor:v1:21',
+            stories: [{
+              id: 21,
+              title: 'Relayflow source fixture',
+              category: 'agent infrastructure',
+              points: 80,
+              comments: 12,
+              feeds: ['top'],
+              url: 'https://example.com/21',
+              hnUrl: 'https://news.ycombinator.com/item?id=21',
+            }],
+          }),
+        },
+      },
+    );
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /HN_RELAYFLOW_DRY_RUN:/u);
+  } finally {
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});

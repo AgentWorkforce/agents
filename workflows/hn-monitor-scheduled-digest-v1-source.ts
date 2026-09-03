@@ -407,6 +407,9 @@ export function scheduledDigestWorkflowSource(): string {
     "import { createHash } from 'node:crypto';",
     "import path from 'node:path';",
     "import { JsonFileWorkflowDb, workflow } from '@relayflows/core';",
+    // esbuild/tsx can add this helper inside Function#toString() output. The
+    // uploaded workflow is a new module, so carry the tiny helper with it.
+    'const __name = (target) => target;',
     `const reactivateSkippedV1Steps = (${reactivateSkippedV1Steps.toString()});`,
     `const scheduledDigestJournalWorkflowName = (${scheduledDigestJournalWorkflowName.toString()});`,
     `(${workflowProgram.toString()})({ readFile, mkdir, writeFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps, scheduledDigestJournalWorkflowName });`,

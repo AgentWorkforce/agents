@@ -40,7 +40,7 @@ import {
 import {
   materializeScheduledDigestWorkflow,
   SCHEDULED_DIGEST_WORKFLOW_NAME
-} from './scheduled-digest-workflow.js';
+} from './workflows/materialize.js';
 
 export type HnFeed = 'front_page' | 'show_hn' | 'new';
 

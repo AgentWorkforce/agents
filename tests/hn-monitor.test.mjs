@@ -119,6 +119,20 @@ function isClearedPending(entry) {
   }
 }
 
+async function withinTestTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
 
 function cronEvent() {
@@ -182,8 +196,15 @@ test('fresh cron batch invokes and awaits the checked-in Relayflow with stable i
   });
 
   let settled = false;
-  const run = handler(ctx, cronEvent()).then(() => { settled = true; });
-  await completionStarted;
+  const run = handler(ctx, cronEvent()).finally(() => { settled = true; });
+  await withinTestTimeout(
+    Promise.race([
+      completionStarted,
+      run.then(() => { throw new Error('cron handler settled before awaiting workflow completion'); }),
+    ]),
+    5_000,
+    'timeout: cron handler never awaited workflow completion',
+  );
 
   assert.equal(settled, false, 'cron handler must await Relayflow completion');
   assert.equal(posts.length, 0, 'publishing must not begin while Relayflow is running');

@@ -4,8 +4,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 
-import { workflow } from '@relayflows/core';
-import { reactivateSkippedV1Steps } from '../.test-build/workflows/relayflow-v1-resume.js';
+import { JsonFileWorkflowDb, workflow } from '@relayflows/core';
+import { reactivateSkippedV1Steps } from '../.test-build/workflows/hn-monitor-scheduled-digest-v1-source.js';
 
 function resumeFixture() {
   return workflow('hn-monitor-v1-resume-fixture')
@@ -55,7 +55,12 @@ test('pinned Relayflow v1 resumes a failed run without replaying completed HN st
 
     process.env.RESUME_RUN_ID = first.id;
     assert.equal(
-      await reactivateSkippedV1Steps(first.id, 'hn-monitor-v1-resume-fixture-workflow', runtimeDir),
+      await reactivateSkippedV1Steps(
+        first.id,
+        'hn-monitor-v1-resume-fixture-workflow',
+        path.join(runtimeDir, '.agent-relay', 'workflow-runs.jsonl'),
+        (filePath) => new JsonFileWorkflowDb(filePath),
+      ),
       1,
       'the v1 compatibility seam must reactivate the skipped validator',
     );

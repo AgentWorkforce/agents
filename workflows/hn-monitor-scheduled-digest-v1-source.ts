@@ -1,10 +1,74 @@
-import { readFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
-import path from 'node:path';
+interface JournalRun {
+  workflowName: string;
+  status: string;
+}
 
-import { workflow } from '@relayflows/core';
-import { reactivateSkippedV1Steps } from './relayflow-v1-resume.js';
+export const SCHEDULED_DIGEST_WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 
+interface JournalStep {
+  id: string;
+  status: string;
+}
+
+interface V1Journal {
+  getRun(runId: string): Promise<JournalRun | null>;
+  getStepsByRunId(runId: string): Promise<JournalStep[]>;
+  updateStep(stepId: string, patch: Record<string, unknown>): Promise<void>;
+}
+
+/**
+ * Relayflow core v1.0.6 only resets failed steps when resuming. Descendants
+ * journaled as skipped stay skipped, which can otherwise produce a completed
+ * run without its terminal artifact. Reactivate only those descendants before
+ * the v1 runner reloads the journal; completed steps remain immutable.
+ */
+export async function reactivateSkippedV1Steps(
+  runId: string,
+  workflowName: string,
+  journalPath: string,
+  createJournal: (filePath: string) => V1Journal,
+): Promise<number> {
+  const db = createJournal(journalPath);
+  const run = await db.getRun(runId);
+  if (!run) throw new Error(`Relayflow resume run ${runId} was not found`);
+  if (run.workflowName !== workflowName) {
+    throw new Error(`Relayflow resume run ${runId} belongs to ${run.workflowName}, not ${workflowName}`);
+  }
+  if (run.status !== 'failed' && run.status !== 'running') {
+    throw new Error(`Relayflow resume run ${runId} has non-resumable status ${run.status}`);
+  }
+
+  let count = 0;
+  for (const step of await db.getStepsByRunId(runId)) {
+    if (step.status !== 'skipped') continue;
+    await db.updateStep(step.id, {
+      status: 'pending',
+      error: undefined,
+      completionReason: undefined,
+      completedAt: undefined,
+    });
+    count += 1;
+  }
+  return count;
+}
+
+interface WorkflowProgramDependencies {
+  readFile: typeof import('node:fs/promises').readFile;
+  createHash: typeof import('node:crypto').createHash;
+  path: typeof import('node:path');
+  workflow: typeof import('@relayflows/core').workflow;
+  JsonFileWorkflowDb: typeof import('@relayflows/core').JsonFileWorkflowDb;
+  reactivateSkippedV1Steps: typeof reactivateSkippedV1Steps;
+}
+
+function workflowProgram({
+  readFile,
+  createHash,
+  path,
+  workflow,
+  JsonFileWorkflowDb,
+  reactivateSkippedV1Steps,
+}: WorkflowProgramDependencies): void {
 const WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 const OUTPUT_MARKER = 'HN_DIGEST_NOTES_JSON:';
 
@@ -151,7 +215,12 @@ async function main(): Promise<void> {
 
   const requestedResumeRunId = process.env.RESUME_RUN_ID?.trim();
   if (requestedResumeRunId) {
-    await reactivateSkippedV1Steps(requestedResumeRunId, WORKFLOW_NAME);
+    await reactivateSkippedV1Steps(
+      requestedResumeRunId,
+      WORKFLOW_NAME,
+      path.join(process.cwd(), '.agent-relay', 'workflow-runs.jsonl'),
+      (filePath) => new JsonFileWorkflowDb(filePath),
+    );
   }
   const run = await builder.run({ renderer: false });
   if (run.status !== 'completed') {
@@ -268,3 +337,21 @@ main().catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
   process.exitCode = 1;
 });
+}
+
+/**
+ * The deploy bundle contains this generator. The scheduled persona writes its
+ * result to workflows/<name>.ts immediately before ctx.workflow.run uploads
+ * that one self-contained source file to Cloud.
+ */
+export function scheduledDigestWorkflowSource(): string {
+  return [
+    "import { readFile } from 'node:fs/promises';",
+    "import { createHash } from 'node:crypto';",
+    "import path from 'node:path';",
+    "import { JsonFileWorkflowDb, workflow } from '@relayflows/core';",
+    `const reactivateSkippedV1Steps = (${reactivateSkippedV1Steps.toString()});`,
+    `(${workflowProgram.toString()})({ readFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps });`,
+    '',
+  ].join('\n');
+}

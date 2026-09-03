@@ -20,6 +20,8 @@ memory/workspace/.relay/
 # Eval run artifacts
 .evals/
 .workflow-artifacts/
+# Materialized from the bundled HN workflow source at scheduled runtime.
+/workflows/hn-monitor-scheduled-digest-v1.ts
 # Safety net: stray provider draft trees a mis-pointed mount root can leave behind
 /slack/
 /linear/

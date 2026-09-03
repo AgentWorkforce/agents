@@ -208,11 +208,12 @@ test('slack-follow-up case keeps memory and grounding assertions without claimin
 
 test('scheduled product handler is backed by a resumable, repairable Relayflow v1 DAG', () => {
   const agentSource = readFileSync(resolve('hn-monitor/agent.ts'), 'utf8');
-  const workflowSource = readFileSync(resolve('workflows/hn-monitor-scheduled-digest-v1.ts'), 'utf8');
+  const materializerSource = readFileSync(resolve('hn-monitor/scheduled-digest-workflow.ts'), 'utf8');
+  const workflowSource = readFileSync(resolve('workflows/hn-monitor-scheduled-digest-v1-source.ts'), 'utf8');
   const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf8'));
 
   assert.match(agentSource, /if \(!isCronTickEvent[\s\S]*await runScheduledScan\(ctx\);/u);
-  assert.match(agentSource, /ctx\.workflow\.run\(SCHEDULED_DIGEST_WORKFLOW/u);
+  assert.match(agentSource, /await materializeScheduledDigestWorkflow\(ctx\);[\s\S]*ctx\.workflow\.run\(SCHEDULED_DIGEST_WORKFLOW_NAME/u);
   assert.match(agentSource, /relayflowVersion:\s*SCHEDULED_DIGEST_VERSION/u);
   assert.equal(pkg.dependencies['@relayflows/core'], '^1.0.6');
 
@@ -227,6 +228,8 @@ test('scheduled product handler is backed by a resumable, repairable Relayflow v
   assert.match(workflowSource, /\.agent\('curator'/u);
   assert.match(workflowSource, /\.agent\('reviewer'/u);
   assert.doesNotMatch(workflowSource, /relayflowVersion:\s*'v2'/u);
+  assert.match(materializerSource, /scheduledDigestWorkflowSource\(\)/u);
+  assert.match(materializerSource, /ctx\.files\.write\(target, scheduledDigestWorkflowSource\(\)\)/u);
 });
 
 test('HN eval and preview scripts are thin platform-invoke wrappers', () => {

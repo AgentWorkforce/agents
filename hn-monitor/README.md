@@ -20,7 +20,10 @@ matters” note.
 The deployed `defineAgent` schedule remains the product entrypoint. After the
 existing HN fetch, relevance ranking, channel-scoped seen check, and provisional
 dedupe claim, it invokes `workflows/hn-monitor-scheduled-digest-v1.ts` through
-`ctx.workflow.run()` and waits for completion before delivery. That Relayflow
+`ctx.workflow.run()` and waits for completion before delivery. The current
+four-file deploy format does not carry auxiliary workflow files, so the handler
+materializes that file through `ctx.files` from its bundled, typechecked source
+generator immediately before the runtime uploads it. That Relayflow
 uses the v1 journal with stable `prepare-input`, `analyze-stories`,
 `review-digest`, and `validate-digest` step identities. Completed step outputs
 survive `RESUME_RUN_ID`. A small v1 compatibility helper reactivates only
@@ -73,7 +76,7 @@ Platform developer loop:
 ```sh
 agentworkforce invoke ./hn-monitor/agent.ts --case ./hn-monitor/cases/scheduled-scan.case.yaml
 agentworkforce invoke ./hn-monitor/agent.ts --schedule scan --reads live --model stub --input SLACK_CHANNEL=C123
-agentworkforce deploy ./hn-monitor/agent.ts --mode cloud --dry-run
+agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --dry-run
 ```
 
 Local invocation always previews Slack actions; it never sends them. The

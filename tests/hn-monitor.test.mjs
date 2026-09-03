@@ -128,32 +128,32 @@ test('defineAgent scan schedule invokes the durable Relayflow v1 digest before p
   );
 
   const workflowCalls = [];
-  const { ctx, events, saved } = fakeCtx({
+  const { ctx, events, saved, files } = fakeCtx({
     llm: {
       async complete() {
         throw new Error('the scheduled product path must not call ctx.llm directly');
       },
     },
-    workflow: {
-      async run(name, args) {
-        events.push('workflow.run');
-        workflowCalls.push({ name, args });
+  });
+  ctx.workflow.run = async (name, args) => {
+    events.push('workflow.run');
+    const source = files.get(`workflows/${name}.ts`);
+    assert.equal(typeof source, 'string', 'the deployable workflow source must exist before ctx.workflow.run');
+    workflowCalls.push({ name, args, source });
+    return {
+      runId: 'wf-hn-v1-20',
+      async completion() {
+        events.push('workflow.completion');
         return {
-          runId: 'wf-hn-v1-20',
-          async completion() {
-            events.push('workflow.completion');
-            return {
-              status: 'success',
-              output: JSON.stringify({
-                theme: 'Durable orchestration is moving into the product path.',
-                stories: [{ id: 20, why: 'The scan now has journaled, resumable workflow steps.' }],
-              }),
-            };
-          },
+          status: 'success',
+          output: JSON.stringify({
+            theme: 'Durable orchestration is moving into the product path.',
+            stories: [{ id: 20, why: 'The scan now has journaled, resumable workflow steps.' }],
+          }),
         };
       },
-    },
-  });
+    };
+  };
   const posts = [];
 
   await hnMonitor.runScheduledScan(ctx, {
@@ -170,6 +170,9 @@ test('defineAgent scan schedule invokes the durable Relayflow v1 digest before p
   assert.equal(workflowCalls[0].args.relayflowVersion, 'v1');
   assert.equal(workflowCalls[0].args.batchKey, 'hn-monitor:v1:20');
   assert.deepEqual(workflowCalls[0].args.stories.map((story) => story.id), [20]);
+  assert.match(workflowCalls[0].source, /from '@relayflows\/core'/u);
+  assert.match(workflowCalls[0].source, /\.step\("validate-digest"/u);
+  assert.doesNotMatch(workflowCalls[0].source, /from ['"]\.\/relayflow-v1-resume/u);
   assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [20]);
   assert.equal(posts.length, 2);

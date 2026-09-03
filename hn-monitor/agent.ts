@@ -37,6 +37,10 @@ import {
   readTelegramMessage,
   skipReason as telegramSkipReason
 } from '../shared/telegram.js';
+import {
+  materializeScheduledDigestWorkflow,
+  SCHEDULED_DIGEST_WORKFLOW_NAME
+} from './scheduled-digest-workflow.js';
 
 export type HnFeed = 'front_page' | 'show_hn' | 'new';
 
@@ -113,7 +117,6 @@ interface PendingThreadBody {
   headerRefs: Array<{ provider: 'slack' | 'telegram'; draftRef: string; channel?: string; chatId?: string; threadTs?: string }>;
 }
 
-const SCHEDULED_DIGEST_WORKFLOW = 'hn-monitor-scheduled-digest-v1';
 const SCHEDULED_DIGEST_VERSION = 'v1' as const;
 
 interface ScheduledScanDependencies {
@@ -926,14 +929,15 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
   let notes: DigestNotes = { theme: fallbackTheme(stories), whyById: new Map() };
   const batchKey = scheduledDigestBatchKey(stories);
   try {
+    await materializeScheduledDigestWorkflow(ctx);
     const run = await withTimeout(
-      ctx.workflow.run(SCHEDULED_DIGEST_WORKFLOW, {
+      ctx.workflow.run(SCHEDULED_DIGEST_WORKFLOW_NAME, {
         relayflowVersion: SCHEDULED_DIGEST_VERSION,
         batchKey,
         stories: storyData
       }),
       30_000,
-      `ctx.workflow.run(${SCHEDULED_DIGEST_WORKFLOW})`
+      `ctx.workflow.run(${SCHEDULED_DIGEST_WORKFLOW_NAME})`
     );
     ctx.log('info', 'hn-monitor.relayflow-started', { batchKey, runId: run.runId, version: SCHEDULED_DIGEST_VERSION });
     const completion = await withTimeout(

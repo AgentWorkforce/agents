@@ -12,7 +12,7 @@ import {
   scheduledDigestJournalWorkflowName,
   scheduledDigestWorkflowSource,
   SCHEDULED_DIGEST_WORKFLOW_NAME,
-} from '../.test-build/workflows/hn-monitor-scheduled-digest-v1-source.js';
+} from '../.test-build/hn-monitor/workflows/scheduled-digest.js';
 
 function resumeFixture() {
   return workflow('hn-monitor-v1-resume-fixture')
@@ -200,7 +200,7 @@ test('tracked TypeScript generator emits a self-contained Relayflow workflow', a
         '--eval',
         [
           "import { writeFileSync } from 'node:fs';",
-          "import { scheduledDigestWorkflowSource } from './workflows/hn-monitor-scheduled-digest-v1-source.ts';",
+          "import { scheduledDigestWorkflowSource } from './hn-monitor/workflows/scheduled-digest.ts';",
           'writeFileSync(process.env.HN_WORKFLOW_PATH, scheduledDigestWorkflowSource());',
         ].join('\n'),
       ],

@@ -3,7 +3,7 @@ import type { WorkforceCtx } from '@agentworkforce/runtime';
 import {
   SCHEDULED_DIGEST_WORKFLOW_NAME,
   scheduledDigestWorkflowSource,
-} from '../workflows/hn-monitor-scheduled-digest-v1-source.js';
+} from './scheduled-digest.js';
 
 export { SCHEDULED_DIGEST_WORKFLOW_NAME };
 

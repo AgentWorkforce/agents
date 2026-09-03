@@ -81,6 +81,8 @@ test('scheduled scan case keeps the reference policy and Slack thread assertion'
     compose: 'preview',
   });
   assert.ok(scan.expect.logsContain.includes('hn-monitor.feed-scan'));
+  assert.ok(scan.expect.logsContain.includes('hn-monitor.batch-workflow-started'));
+  assert.ok(scan.expect.logsContain.includes('hn-monitor.batch-workflow-completed'));
   assert.ok(scan.expect.effectsContain.includes('model.complete'));
   assert.ok(scan.expect.effectsContain.includes('provider.write'));
   assert.deepEqual(scan.expect.providerActions[0], {
@@ -104,6 +106,8 @@ test('deterministic feed case preserves story-selection and memory coverage', ()
     ),
   );
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.matched-agentic matched=3'));
+  assert.ok(deterministic.expect.logsContain.includes('hn-monitor.batch-workflow-started'));
+  assert.ok(deterministic.expect.logsContain.includes('hn-monitor.batch-workflow-completed'));
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.posted'));
   assert.ok(deterministic.expect.effectsContain.includes('memory.save'));
 });
@@ -119,6 +123,8 @@ test('legacy eval JSONL keeps the HN deterministic feed-count contract in sync',
     legacyEntry.expect.logsAny.includes('hn-monitor.feed-scan front_page=2 show_hn=2 new=4'),
     'legacy JSONL feed-count contract drifted from the YAML case',
   );
+  assert.ok(legacyEntry.expect.logsAny.includes('hn-monitor.batch-workflow-started'));
+  assert.ok(legacyEntry.expect.logsAny.includes('hn-monitor.batch-workflow-completed'));
 });
 
 test('Slack provider-trigger case is multi-turn and shares the HN detail fixture', () => {

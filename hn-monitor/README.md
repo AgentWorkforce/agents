@@ -17,6 +17,15 @@ level and a richer digest lives in its thread. Every story includes the article,
 HN discussion, points/comments, feed provenance, category, and a short “why it
 matters” note.
 
+Fresh scheduled batches run through the checked-in Relayflow v1 DAG in
+`lib/batch-workflow.ts`. Its durable steps are `analyze-batch`, `review-batch`,
+`repair-batch`, and `validate-batch`; the batch idempotency key is derived from
+the sorted HN story ids. The persona remains the side-effect owner: it fetches
+and filters feeds, claims ids before posting, calls its configured model, sends
+the Slack/Telegram digest, and appends exact and semantic memory only after the
+workflow completes. A workflow failure exhausts one retry, releases the
+provisional claim when nothing was delivered, and never reaches publication.
+
 You can also chat with it:
 
 - Reply in a digest thread and `@mention` the bot with a story number or title.

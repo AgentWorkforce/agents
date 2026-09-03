@@ -222,7 +222,7 @@ interface HnMonitorHandlerDeps {
 
 export function createHnMonitorHandler(
   overrides: Partial<HnMonitorHandlerDeps> = {}
-): (ctx: WorkforceCtx, event: AgentEvent) => Promise<void> {
+): (ctx: WorkforceCtx, event: unknown) => Promise<void> {
   const deps: HnMonitorHandlerDeps = {
     createDelivery: (ctx) => createDelivery(ctx),
     fetchFeeds: fetchHackerNewsFeeds,
@@ -231,19 +231,21 @@ export function createHnMonitorHandler(
   };
 
   return async (ctx, event) => {
-    if (isRelaycastMessageEvent(event)) {
-      await handleQaMessage(ctx, event, 'relay');
+    const agentEvent = event as AgentEvent;
+    const eventType = str(asRecord(event)?.type) ?? '';
+    if (isRelaycastMessageEvent(agentEvent)) {
+      await handleQaMessage(ctx, agentEvent, 'relay');
       return;
     }
-    if (typeof event.type === 'string' && event.type.startsWith('telegram.')) {
-      await handleQaMessage(ctx, event, 'telegram');
+    if (eventType.startsWith('telegram.')) {
+      await handleQaMessage(ctx, agentEvent, 'telegram');
       return;
     }
-    if (typeof event.type === 'string' && event.type.startsWith('slack.')) {
-      await handleQaMessage(ctx, event, 'slack');
+    if (eventType.startsWith('slack.')) {
+      await handleQaMessage(ctx, agentEvent, 'slack');
       return;
     }
-    if (!isCronTickEvent(event)) return;
+    if (!isCronTickEvent(agentEvent)) return;
 
     const delivery = deps.createDelivery(ctx);
     if (delivery.targets.length === 0) {

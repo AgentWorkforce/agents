@@ -24,6 +24,8 @@ expect:
   eventSource: cron
   logsContain:
     - hn-monitor.feed-scan
+    - hn-monitor.batch-workflow-started
+    - hn-monitor.batch-workflow-completed
   effectsContain:
     - model.complete
     - provider.write

@@ -8,7 +8,7 @@
   "scripts": {
     "test": "rm -rf .test-build && tsc --noEmit false --outDir .test-build && node --test tests/*.test.mjs; status=$?; rm -rf .test-build; exit $status",
     "test:review": "node scripts/test.mjs tests/review-agent.test.mjs",
-    "test:hn": "node scripts/test.mjs tests/hn-monitor.test.mjs",
+    "test:hn": "node scripts/test.mjs tests/hn-monitor.test.mjs tests/hn-relayflow-resume.test.mjs",
     "preview:hn": "node scripts/run-hn-platform-preview.mjs",
     "acceptance:composable-runtime-closure": "node scripts/acceptance/composable-runtime-closure.mjs",
     "typecheck": "tsc --noEmit",

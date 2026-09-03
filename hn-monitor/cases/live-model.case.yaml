@@ -1,9 +1,17 @@
 schemaVersion: 1
 id: hn-monitor.live-model
 agent: ../agent.ts
-kind: scheduled
-event:
-  schedule: scan
+kind: chat
+turns:
+  - type: cron.tick
+    name: scan
+    cron: 0 9,17 * * *
+  - type: slack.app_mention
+    channel: C123
+    ts: "400.2"
+    thread_ts: "400.1"
+    text: <@UBOT> tell me more about story 1 and its HN comments
+    user: U1
 inputs:
   SLACK_CHANNEL: C123
   TOPICS: agents,ai,typescript
@@ -25,6 +33,9 @@ http:
   - method: GET
     match: tags=story
     file: ../fixtures/hn-new.json
+  - method: GET
+    match: /api/v1/items/1001
+    file: ../fixtures/hn-item-1001.json
 expect:
   status: succeeded
   eventSource: cron
@@ -32,8 +43,11 @@ expect:
     - hn-monitor.feed-scan front_page=2 show_hn=2 new=4
     - hn-monitor.matched-agentic matched=3
     - hn-monitor.posted
+    - hn-monitor.qa.hydrated
+    - hn-monitor.qa.slack-replied
   effectsContain:
     - http.read
+    - compose.run
     - model.complete
     - provider.write
   providerActions:

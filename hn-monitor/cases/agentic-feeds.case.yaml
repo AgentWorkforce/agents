@@ -34,7 +34,7 @@ expect:
     - hn-monitor.posted
   effectsContain:
     - memory.save
-    - model.complete
+    - compose.run
     - provider.write
   providerActions:
     - provider: slack
@@ -42,4 +42,4 @@ expect:
       channel: C123
       threaded: true
       textContains:
-        - Agent
+        - HN discussion

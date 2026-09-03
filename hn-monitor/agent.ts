@@ -5,7 +5,7 @@
  *     → fetch Front Page, Show HN, and the last 24h of New HN
  *     → score stories against an agent-infrastructure interest profile
  *     → drop ones already posted (durable memory)
- *     → add concise "why it matters" notes with ctx.llm
+ *     → curate concise "why it matters" notes in a durable Relayflow v1 run
  *     → post digest to Slack, Telegram, or both
  *
  *   Slack mention / Telegram message / relay inbox DM
@@ -111,6 +111,14 @@ interface PendingThreadBody {
    *  The `draftRef` field holds the relay path for Slack refs and the messageId
    *  for Telegram refs — see saveHeaderRefs() / rebuildHeaderRefs(). */
   headerRefs: Array<{ provider: 'slack' | 'telegram'; draftRef: string; channel?: string; chatId?: string; threadTs?: string }>;
+}
+
+const SCHEDULED_DIGEST_WORKFLOW = 'hn-monitor-scheduled-digest-v1';
+const SCHEDULED_DIGEST_VERSION = 'v1' as const;
+
+interface ScheduledScanDependencies {
+  delivery?: DeliveryClient;
+  fetchStories?: (lookbackHours: number) => Promise<Story[]>;
 }
 
 // ── message parsing ──────────────────────────────────────────────────────
@@ -229,41 +237,53 @@ export default defineAgent({
     // Cron path
     if (!isCronTickEvent(event as unknown as AgentEvent)) return;
 
-    const delivery = createDelivery(ctx);
-    if (delivery.targets.length === 0) {
-      ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
-      return;
-    }
-
-    // Pending thread body recovery — if a previous run posted the header but
-    // the threaded body failed, retry it before processing new stories.
-    if (await retryPendingThreadBody(ctx, delivery)) return;
-
-    const topics = list(input(ctx, 'TOPICS'));
-    const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
-    const maxStories = boundedPositiveInt(input(ctx, 'MAX_STORIES') ?? '8', 'MAX_STORIES', 20);
-
-    const stories = await fetchHackerNewsFeeds(lookbackHours);
-    const feedCounts = countFeeds(stories);
-    ctx.log(
-      'info',
-      `hn-monitor.feed-scan front_page=${feedCounts.front_page} show_hn=${feedCounts.show_hn} new=${feedCounts.new}`,
-      { stories: stories.length, lookbackHours }
-    );
-    const matches = selectRelevantStories(stories, topics, maxStories);
-    ctx.log('info', `hn-monitor.matched-agentic matched=${matches.length}`, { matched: matches.length, candidates: stories.length });
-
-    const seen = await loadSeen(ctx);
-    const fresh = matches.filter((s) => !seen.includes(s.id));
-    ctx.log('info', `hn-monitor.fresh fresh=${fresh.length}`, { fresh: fresh.length });
-    if (fresh.length === 0) {
-      ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
-      return;
-    }
-
-    await postFreshStories(ctx, delivery, seen, fresh);
+    await runScheduledScan(ctx);
   }
 });
+
+/**
+ * Product schedule boundary. The deployed defineAgent handler delegates every
+ * cron tick here; dependencies are injectable only so the exact product path
+ * can be exercised without live HN reads or provider writes.
+ */
+export async function runScheduledScan(
+  ctx: WorkforceCtx,
+  deps: ScheduledScanDependencies = {}
+): Promise<void> {
+  const delivery = deps.delivery ?? createDelivery(ctx);
+  if (delivery.targets.length === 0) {
+    ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
+    return;
+  }
+
+  // Pending thread body recovery — if a previous run posted the header but
+  // the threaded body failed, retry it before processing new stories.
+  if (await retryPendingThreadBody(ctx, delivery)) return;
+
+  const topics = list(input(ctx, 'TOPICS'));
+  const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);
+  const maxStories = boundedPositiveInt(input(ctx, 'MAX_STORIES') ?? '8', 'MAX_STORIES', 20);
+
+  const stories = await (deps.fetchStories ?? fetchHackerNewsFeeds)(lookbackHours);
+  const feedCounts = countFeeds(stories);
+  ctx.log(
+    'info',
+    `hn-monitor.feed-scan front_page=${feedCounts.front_page} show_hn=${feedCounts.show_hn} new=${feedCounts.new}`,
+    { stories: stories.length, lookbackHours }
+  );
+  const matches = selectRelevantStories(stories, topics, maxStories);
+  ctx.log('info', `hn-monitor.matched-agentic matched=${matches.length}`, { matched: matches.length, candidates: stories.length });
+
+  const seen = await loadSeen(ctx);
+  const fresh = matches.filter((story) => !seen.includes(story.id));
+  ctx.log('info', `hn-monitor.fresh fresh=${fresh.length}`, { fresh: fresh.length });
+  if (fresh.length === 0) {
+    ctx.log('info', 'hn-monitor.nothing-new', { matched: matches.length });
+    return;
+  }
+
+  await postFreshStories(ctx, delivery, seen, fresh);
+}
 
 // ── Q&A handler ──────────────────────────────────────────────────────────
 
@@ -904,31 +924,59 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
     hnUrl: story.hnUrl
   }));
   let notes: DigestNotes = { theme: fallbackTheme(stories), whyById: new Map() };
+  const batchKey = scheduledDigestBatchKey(stories);
   try {
-    const output = await withTimeout(
-      ctx.llm.complete(
-        [
-          'You are curating Hacker News for the Agent Relay team, which builds agent messaging, multi-agent orchestration, agent runtimes, cloud sandboxes, coding-agent workflows, and developer infrastructure.',
-          'Return ONLY compact JSON with this shape:',
-          '{"theme":"one specific sentence about the batch","stories":[{"id":123,"why":"one specific sentence, <= 160 characters"}]}',
-          'Keep every supplied story. Explain why each matters to builders of agentic developer tools; avoid generic hype and do not invent facts beyond the title/metadata.',
-          '',
-          JSON.stringify(storyData)
-        ].join('\n'),
-        { maxTokens: 900 }
-      ),
-      45_000,
-      'ctx.llm.complete'
+    const run = await withTimeout(
+      ctx.workflow.run(SCHEDULED_DIGEST_WORKFLOW, {
+        relayflowVersion: SCHEDULED_DIGEST_VERSION,
+        batchKey,
+        stories: storyData
+      }),
+      30_000,
+      `ctx.workflow.run(${SCHEDULED_DIGEST_WORKFLOW})`
     );
-    notes = parseDigestNotes(output, stories);
+    ctx.log('info', 'hn-monitor.relayflow-started', { batchKey, runId: run.runId, version: SCHEDULED_DIGEST_VERSION });
+    const completion = await withTimeout(
+      run.completion(),
+      195_000,
+      `ctx.workflow.completion(${run.runId})`
+    );
+    if (completion.status !== 'success') {
+      throw new Error(`Relayflow ${run.runId} completed with status ${completion.status}`);
+    }
+    if (completion.output !== null && completion.output !== undefined) {
+      notes = parseDigestNotes(workflowOutputText(completion.output), stories);
+    }
+    ctx.log('info', 'hn-monitor.relayflow-completed', {
+      batchKey,
+      runId: run.runId,
+      usedFallback: completion.output === null || completion.output === undefined
+    });
   } catch (error) {
-    ctx.log('warn', 'hn-monitor.llm-fallback', { error: String(error) });
+    // Keep the existing delivery semantics: orchestration/model unavailability
+    // degrades to a deterministic digest rather than suppressing fresh stories.
+    ctx.log('warn', 'hn-monitor.relayflow-fallback', { batchKey, error: String(error) });
   }
   return renderDigest(stories, notes);
 }
 
+export function scheduledDigestBatchKey(stories: Story[]): string {
+  const ids = [...new Set(stories.map((story) => story.id))].sort((a, b) => a - b);
+  return `hn-monitor:${SCHEDULED_DIGEST_VERSION}:${ids.join(',')}`;
+}
+
+function workflowOutputText(output: unknown): string {
+  if (typeof output === 'string') return output;
+  try {
+    return JSON.stringify(output);
+  } catch {
+    return String(output);
+  }
+}
+
 function parseDigestNotes(output: string, stories: Story[]): DigestNotes {
-  const json = output.match(/\{[\s\S]*\}/u)?.[0] ?? output;
+  const marked = output.match(/HN_DIGEST_NOTES_JSON:\s*(\{[^\n\r]*\})/gu)?.at(-1);
+  const json = marked?.slice(marked.indexOf('{')) ?? output.match(/\{[\s\S]*\}/u)?.[0] ?? output;
   try {
     const parsed = JSON.parse(json) as { theme?: unknown; stories?: Array<{ id?: unknown; why?: unknown }> };
     const whyById = new Map<number, string>();

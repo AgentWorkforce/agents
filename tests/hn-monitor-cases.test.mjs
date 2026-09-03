@@ -70,7 +70,7 @@ test('local invoke case policy rejects writes: sandbox from a case file', () => 
   );
 });
 
-test('scheduled scan case keeps the reference policy and Slack thread assertion', () => {
+test('scheduled scan case pins Relayflow composition and the Slack thread assertion', () => {
   const scan = cases.get('scheduled-scan.case.yaml').value;
   assert.deepEqual(scan.event, { schedule: 'scan' });
   assert.deepEqual(scan.policy, {
@@ -81,14 +81,15 @@ test('scheduled scan case keeps the reference policy and Slack thread assertion'
     compose: 'preview',
   });
   assert.ok(scan.expect.logsContain.includes('hn-monitor.feed-scan'));
-  assert.ok(scan.expect.effectsContain.includes('model.complete'));
+  assert.ok(scan.expect.effectsContain.includes('compose.run'));
+  assert.ok(!scan.expect.effectsContain.includes('model.complete'));
   assert.ok(scan.expect.effectsContain.includes('provider.write'));
   assert.deepEqual(scan.expect.providerActions[0], {
     provider: 'slack',
     resource: 'messages',
     channel: 'C123',
     threaded: true,
-    textContains: ['Agent'],
+    textContains: ['HN discussion'],
   });
 });
 
@@ -106,6 +107,7 @@ test('deterministic feed case preserves story-selection and memory coverage', ()
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.matched-agentic matched=3'));
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.posted'));
   assert.ok(deterministic.expect.effectsContain.includes('memory.save'));
+  assert.ok(deterministic.expect.effectsContain.includes('compose.run'));
 });
 
 test('legacy eval JSONL keeps the HN deterministic feed-count contract in sync', () => {
@@ -162,22 +164,28 @@ test('live-read case is non-vacuous: has inputs and asserts only stable live-rea
   assert.equal(liveRead.expect?.providerActions, undefined, 'live-read must not pin data-dependent preview writes');
 });
 
-test('live-model case uses fixture HN reads plus live model mode', () => {
+test('live-model case composes the scheduled digest and reserves the live model for follow-up Q&A', () => {
   const liveModel = cases.get('live-model.case.yaml').value;
   assert.equal(liveModel.policy?.reads, 'fixtures', 'live-model must use fixture reads');
   assert.equal(liveModel.policy?.model, 'live', 'live-model must use model: live');
   assert.ok(liveModel.inputs?.SLACK_CHANNEL, 'live-model must have SLACK_CHANNEL input (agent exits early otherwise)');
+  assert.equal(liveModel.turns?.[0]?.type, 'cron.tick');
+  assert.equal(liveModel.turns?.[1]?.type, 'slack.app_mention');
   assert.deepEqual(
-    liveModel.http?.map((fixture) => fixture.match),
+    liveModel.http?.slice(0, 3).map((fixture) => fixture.match),
     ['tags=front_page', 'tags=show_hn', 'tags=story'],
     'live-model must check in the three HN feed fixtures',
   );
+  assert.ok(liveModel.http?.some((fixture) => fixture.match === '/api/v1/items/1001'),
+    'live-model follow-up must hydrate the selected HN item from a fixture');
   assert.ok(liveModel.expect?.logsContain?.some((l) => l.includes('hn-monitor.feed-scan')),
     'live-model must assert feed-scan log with concrete counts');
   assert.ok(liveModel.expect?.effectsContain?.includes('http.read'),
     'live-model must assert http.read effect for fixture-backed HN fetches');
+  assert.ok(liveModel.expect?.effectsContain?.includes('compose.run'),
+    'live-model must assert the scheduled Relayflow v1 boundary');
   assert.ok(liveModel.expect?.effectsContain?.includes('model.complete'),
-    'live-model must assert model.complete effect (proves real model path was exercised)');
+    'live-model must assert model.complete for the conversational follow-up only');
   assert.ok(liveModel.expect?.effectsContain?.includes('provider.write'),
     'live-model must assert provider.write effect');
   assert.ok(Array.isArray(liveModel.expect?.providerActions) && liveModel.expect.providerActions.length >= 1,
@@ -192,8 +200,33 @@ test('slack-follow-up case keeps memory and grounding assertions without claimin
     'follow-up case must assert qa.slack-replied');
   assert.ok(followUp.expect?.effectsContain?.includes('memory.save'),
     'follow-up case must assert memory.save (turn 1 must persist post data for turn 2)');
+  assert.ok(followUp.expect?.effectsContain?.includes('compose.run'),
+    'follow-up turn 1 must cross the scheduled Relayflow boundary');
   assert.equal(followUp.turns?.[1]?.thread_ts, '200.1',
     'follow-up fixture should keep a concrete thread_ts for the inbound Slack thread');
+});
+
+test('scheduled product handler is backed by a resumable, repairable Relayflow v1 DAG', () => {
+  const agentSource = readFileSync(resolve('hn-monitor/agent.ts'), 'utf8');
+  const workflowSource = readFileSync(resolve('workflows/hn-monitor-scheduled-digest-v1.ts'), 'utf8');
+  const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf8'));
+
+  assert.match(agentSource, /if \(!isCronTickEvent[\s\S]*await runScheduledScan\(ctx\);/u);
+  assert.match(agentSource, /ctx\.workflow\.run\(SCHEDULED_DIGEST_WORKFLOW/u);
+  assert.match(agentSource, /relayflowVersion:\s*SCHEDULED_DIGEST_VERSION/u);
+  assert.equal(pkg.dependencies['@relayflows/core'], '^1.0.6');
+
+  assert.match(workflowSource, /from '@relayflows\/core'/u);
+  assert.match(workflowSource, /\.step\('prepare-input'/u);
+  assert.match(workflowSource, /\.step\('analyze-stories'/u);
+  assert.match(workflowSource, /\.step\('review-digest'/u);
+  assert.match(workflowSource, /\.step\('validate-digest'/u);
+  assert.match(workflowSource, /\.repairable\(/u);
+  assert.match(workflowSource, /process\.env\.RESUME_RUN_ID/u);
+  assert.match(workflowSource, /reactivateSkippedV1Steps/u);
+  assert.match(workflowSource, /\.agent\('curator'/u);
+  assert.match(workflowSource, /\.agent\('reviewer'/u);
+  assert.doesNotMatch(workflowSource, /relayflowVersion:\s*'v2'/u);
 });
 
 test('HN eval and preview scripts are thin platform-invoke wrappers', () => {

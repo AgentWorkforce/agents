@@ -59,7 +59,18 @@ function fakeCtx({ llm, workflow } = {}) {
           return 'digest body';
         },
       },
-      workflow,
+      workflow: workflow ?? {
+        async run() {
+          events.push('workflow.run');
+          return {
+            runId: 'wf-preview',
+            async completion() {
+              events.push('workflow.completion');
+              return { status: 'success', output: null };
+            },
+          };
+        },
+      },
     },
     events,
     saved,
@@ -147,7 +158,11 @@ test('defineAgent scan schedule invokes the durable Relayflow v1 digest before p
 
   await hnMonitor.runScheduledScan(ctx, {
     delivery: fakeDelivery(posts),
-    fetchStories: async () => [{ ...STORY, feeds: ['front_page'] }],
+    fetchStories: async () => [{
+      ...STORY,
+      title: 'AgentWorkforce durable agent runtime orchestration',
+      feeds: ['front_page'],
+    }],
   });
 
   assert.equal(workflowCalls.length, 1);
@@ -159,6 +174,72 @@ test('defineAgent scan schedule invokes the durable Relayflow v1 digest before p
   assert.deepEqual(savedSeenIds(saved[0]), [20]);
   assert.equal(posts.length, 2);
   assert.match(posts[1].text, /journaled, resumable workflow steps/);
+});
+
+test('runScheduledScan dedupes a repeated story before starting a second Relayflow', async () => {
+  let workflowRuns = 0;
+  let recalledSeenIds = [];
+  const { ctx } = fakeCtx({
+    workflow: {
+      async run() {
+        workflowRuns += 1;
+        return {
+          runId: `wf-dedupe-${workflowRuns}`,
+          async completion() { return { status: 'success', output: null }; },
+        };
+      },
+    },
+  });
+  const originalSave = ctx.memory.save;
+  ctx.memory.save = async (content, opts) => {
+    await originalSave(content, opts);
+    if (opts?.tags?.includes('hn-monitor:seen')) recalledSeenIds = JSON.parse(content).ids;
+  };
+  ctx.memory.recall = async (_query, opts) => {
+    if (!opts?.tags?.includes('hn-monitor:seen') || recalledSeenIds.length === 0) return [];
+    return [{
+      id: 'seen-state',
+      content: JSON.stringify({ ids: recalledSeenIds }),
+      tags: ['hn-monitor:seen'],
+      scope: 'workspace',
+      createdAt: '2026-09-03T08:00:00.000Z',
+    }];
+  };
+  const posts = [];
+  const deps = {
+    delivery: fakeDelivery(posts),
+    fetchStories: async () => [{
+      ...STORY,
+      title: 'AgentWorkforce durable agent runtime orchestration',
+      feeds: ['front_page'],
+    }],
+  };
+
+  await hnMonitor.runScheduledScan(ctx, deps);
+  await hnMonitor.runScheduledScan(ctx, deps);
+
+  assert.equal(workflowRuns, 1, 'the durable seen claim must suppress duplicate orchestration');
+  assert.equal(posts.length, 2, 'only one header/body digest should be published');
+});
+
+test('postFreshStories degrades deterministically when Relayflow completion fails', async () => {
+  const { ctx, logs } = fakeCtx({
+    workflow: {
+      async run() {
+        return {
+          runId: 'wf-failed',
+          async completion() { return { status: 'failure', output: 'review failed' }; },
+        };
+      },
+    },
+  });
+  const posts = [];
+
+  await postFreshStories(ctx, fakeDelivery(posts), [], [STORY]);
+
+  assert.equal(posts.length, 2);
+  assert.match(posts[1].text, /Worth tracking for agent ecosystem/);
+  assert.ok(logs.some((entry) => entry.message === 'hn-monitor.relayflow-fallback'));
 });
 
 // ── feed discovery + relevance tests ───────────────────────────────────────
@@ -280,7 +361,7 @@ test('postFreshStories claims fresh ids before summarizing, then threads the dig
 
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [10, 20]);
   assert.deepEqual(saved[0].opts, { tags: ['hn-monitor:seen'], scope: 'workspace' });
   assert.equal(posts.length, 2);
@@ -300,16 +381,18 @@ test('postFreshStories claims fresh ids before summarizing, then threads the dig
   assert.match(record.stories[0].why, /agent ecosystem/i);
 });
 
-test('postFreshStories falls back to plain digest when LLM throws', async () => {
-  const { ctx, events, saved } = fakeCtx({
-    llm: { async complete() { events.push('llm'); throw new Error('llm exploded'); } },
-  });
+test('postFreshStories falls back to plain digest when Relayflow throws', async () => {
+  const { ctx, events, saved } = fakeCtx();
+  ctx.workflow.run = async () => {
+    events.push('workflow.run');
+    throw new Error('Relayflow exploded');
+  };
   const posts = [];
   const delivery = fakeDelivery(posts);
 
   await postFreshStories(ctx, delivery, [10], [STORY]);
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'save']);
   assert.deepEqual(savedSeenIds(saved[0]), [10, 20]);
   assert.equal(posts.length, 2);
   assert.match(posts[0].text, /HN agentic radar/);
@@ -445,7 +528,7 @@ test('postFreshStories releases claim when header publish fails', async () => {
     /Header publish failed/,
   );
 
-  assert.deepEqual(events, ['save', 'llm', 'save']);
+  assert.deepEqual(events, ['save', 'workflow.run', 'workflow.completion', 'save']);
   assert.deepEqual(saved.map(savedSeenIds), [[10, 20], [10]]);
 });
 

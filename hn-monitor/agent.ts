@@ -138,6 +138,23 @@ interface DigestOutbox {
   seenBefore: number[];
   seenClaim: number[];
   providers: Partial<Record<DigestProvider, DigestOutboxProvider>>;
+  /** Upgrade bridge for the pre-outbox pending-body/pending-state records. */
+  legacyRecovery?: true;
+}
+
+interface LegacyPendingThreadBody {
+  cleared?: boolean;
+  targets: string;
+  header: string;
+  body: string;
+  createdAt: string;
+  stories: PostedStory[];
+  headerRefs: SavedHeaderRef[];
+}
+
+interface LegacyPendingPostState {
+  cleared?: boolean;
+  record: PostRecord;
 }
 
 const SCHEDULED_DIGEST_VERSION = 'v1' as const;
@@ -601,7 +618,7 @@ export async function retryPendingThreadBody(
   ctx: WorkforceCtx,
   delivery: DigestDeliveryClient | DeliveryClient
 ): Promise<boolean> {
-  const outbox = await loadDigestOutbox(ctx);
+  const outbox = await loadDigestOutbox(ctx) ?? await migrateLegacyDigestOutbox(ctx, delivery.targets);
   if (!outbox) return false;
   await resumeDigestOutbox(ctx, delivery, outbox);
   return true;
@@ -708,6 +725,7 @@ async function resumeDigestOutbox(
     ctx.log('error', 'hn-monitor.post-grounding-persistence-failed', { recovery: true, phase: outbox.phase });
     throw new ExactPostPersistenceError();
   }
+  if (outbox.legacyRecovery) await clearLegacyRecoveryMarkers(ctx);
   await clearDigestOutbox(ctx, outbox.batchKey);
   ctx.log('info', 'hn-monitor.posted', {
     targets: digestProviderEntries(outbox).map(([provider]) => provider).join(',')
@@ -1716,26 +1734,246 @@ async function loadDigestOutbox(ctx: WorkforceCtx): Promise<DigestOutbox | null>
   for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
     if (!item.content) continue;
     try {
-      const outbox = JSON.parse(item.content) as Partial<DigestOutbox>;
-      if (outbox.cleared) return null;
+      const value = JSON.parse(item.content) as unknown;
+      if (isClearedDigestOutbox(value)) return null;
+      if (isDigestOutbox(value)) return value;
+    } catch {
+      // try the next recalled version
+    }
+  }
+  return null;
+}
+
+async function migrateLegacyDigestOutbox(
+  ctx: WorkforceCtx,
+  configuredTargets: ReadonlyArray<string>
+): Promise<DigestOutbox | null> {
+  const [pendingBody, pendingState] = await Promise.all([
+    loadLegacyPendingThreadBody(ctx),
+    loadLegacyPendingPostState(ctx)
+  ]);
+  if (pendingBody) {
+    const targets = supportedDigestTargets(pendingBody.targets.split(','));
+    if (targets.length === 0) return null;
+    const batchKey = scheduledDigestBatchKey(pendingBody.stories);
+    const outbox = newDigestOutbox(
+      batchKey,
+      pendingBody.header,
+      pendingBody.body,
+      pendingBody.stories,
+      [],
+      targets
+    );
+    outbox.phase = 'bodies';
+    outbox.createdAt = pendingBody.createdAt;
+    outbox.legacyRecovery = true;
+    for (const [provider, state] of digestProviderEntries(outbox)) {
+      const ref = pendingBody.headerRefs.find((candidate) => candidate.provider === provider);
+      state.header.status = ref ? 'delivered' : 'omitted';
+      state.header.ref = ref;
+      if (!ref) state.body.status = 'omitted';
+    }
+    await saveDigestOutbox(ctx, outbox);
+    ctx.log('info', 'hn-monitor.legacy-recovery-migrated', { phase: 'bodies', batchKey });
+    return outbox;
+  }
+  if (pendingState) {
+    const configured = supportedDigestTargets(configuredTargets);
+    const recorded = supportedDigestTargets((pendingState.record.threadRefs ?? []).map((ref) => ref.provider));
+    const targets = recorded.length > 0 ? recorded : configured;
+    if (targets.length === 0) return null;
+    const batchKey = scheduledDigestBatchKey(pendingState.record.stories);
+    const lines = pendingState.record.digest.split('\n');
+    const outbox = newDigestOutbox(
+      batchKey,
+      lines[0] ?? pendingState.record.digest,
+      lines.slice(1).join('\n'),
+      pendingState.record.stories,
+      [],
+      targets
+    );
+    outbox.phase = 'state';
+    outbox.createdAt = pendingState.record.postedAt;
+    outbox.legacyRecovery = true;
+    for (const [provider, state] of digestProviderEntries(outbox)) {
+      const ref = pendingState.record.threadRefs?.find((candidate) => candidate.provider === provider);
+      state.header.status = ref ? 'delivered' : 'omitted';
+      state.header.ref = ref;
+      state.body.status = ref ? 'delivered' : 'omitted';
+    }
+    await saveDigestOutbox(ctx, outbox);
+    ctx.log('info', 'hn-monitor.legacy-recovery-migrated', { phase: 'state', batchKey });
+    return outbox;
+  }
+  return null;
+}
+
+async function loadLegacyPendingThreadBody(ctx: WorkforceCtx): Promise<LegacyPendingThreadBody | null> {
+  const items = await ctx.memory.recall('hn-monitor pending threaded digest body', {
+    tags: ['hn-monitor:pending-thread-body'],
+    scope: 'workspace',
+    limit: 20,
+    failOnError: true
+  });
+  for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
+    try {
+      const record = asRecord(JSON.parse(item.content));
+      if (record?.cleared === true) return null;
       if (
-        outbox.kind === 'hn-monitor digest outbox' &&
-        outbox.version === 1 &&
-        typeof outbox.batchKey === 'string' &&
-        typeof outbox.header === 'string' &&
-        typeof outbox.body === 'string' &&
-        Array.isArray(outbox.stories) &&
-        Array.isArray(outbox.seenClaim) &&
-        outbox.providers &&
-        typeof outbox.providers === 'object'
+        record &&
+        typeof record.targets === 'string' &&
+        typeof record.header === 'string' &&
+        typeof record.body === 'string' &&
+        typeof record.createdAt === 'string' &&
+        Array.isArray(record.stories) && record.stories.every(isPostedStory) &&
+        Array.isArray(record.headerRefs) && record.headerRefs.every(isSavedHeaderRef)
+      ) return record as unknown as LegacyPendingThreadBody;
+    } catch {
+      // try the next recalled version
+    }
+  }
+  return null;
+}
+
+async function loadLegacyPendingPostState(ctx: WorkforceCtx): Promise<LegacyPendingPostState | null> {
+  const items = await ctx.memory.recall('hn-monitor pending exact post state', {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace',
+    limit: 20,
+    failOnError: true
+  });
+  for (const item of [...items].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))) {
+    try {
+      const record = asRecord(JSON.parse(item.content));
+      if (record?.cleared === true) return null;
+      if (
+        record &&
+        isPostRecord(record.record) &&
+        record.record.stories.every(isPostedStory) &&
+        (record.record.threadRefs ?? []).every(isSavedHeaderRef)
       ) {
-        return outbox as DigestOutbox;
+        return { record: record.record };
       }
     } catch {
       // try the next recalled version
     }
   }
   return null;
+}
+
+function supportedDigestTargets(values: ReadonlyArray<string>): DigestProvider[] {
+  return [...new Set(values.filter((value): value is DigestProvider => value === 'slack' || value === 'telegram'))];
+}
+
+function isSavedHeaderRef(value: unknown): value is SavedHeaderRef {
+  const ref = asRecord(value);
+  return Boolean(
+    ref &&
+    (ref.provider === 'slack' || ref.provider === 'telegram') &&
+    typeof ref.draftRef === 'string' && ref.draftRef.length > 0
+  );
+}
+
+async function clearLegacyRecoveryMarkers(ctx: WorkforceCtx): Promise<void> {
+  await saveCriticalMemory(ctx, JSON.stringify({
+    kind: 'hn-monitor pending thread body',
+    cleared: true,
+    createdAt: new Date().toISOString()
+  }), {
+    tags: ['hn-monitor:pending-thread-body'],
+    scope: 'workspace'
+  });
+  await saveCriticalMemory(ctx, JSON.stringify({
+    kind: 'hn-monitor pending exact post state',
+    cleared: true,
+    createdAt: new Date().toISOString()
+  }), {
+    tags: ['hn-monitor:pending-post-state'],
+    scope: 'workspace'
+  });
+}
+
+function isClearedDigestOutbox(value: unknown): boolean {
+  const record = asRecord(value);
+  return record?.kind === 'hn-monitor digest outbox' &&
+    record.version === 1 &&
+    record.cleared === true &&
+    typeof record.batchKey === 'string' &&
+    /^hn-monitor:v1:\d+(?:,\d+)*$/u.test(record.batchKey);
+}
+
+function isDigestOutbox(value: unknown): value is DigestOutbox {
+  const record = asRecord(value);
+  if (
+    record?.kind !== 'hn-monitor digest outbox' ||
+    record.version !== 1 ||
+    record.cleared === true ||
+    typeof record.batchKey !== 'string' ||
+    !/^hn-monitor:v1:\d+(?:,\d+)*$/u.test(record.batchKey) ||
+    !['claim', 'headers', 'bodies', 'state'].includes(String(record.phase)) ||
+    typeof record.createdAt !== 'string' ||
+    typeof record.updatedAt !== 'string' ||
+    typeof record.header !== 'string' ||
+    typeof record.body !== 'string' ||
+    !Array.isArray(record.stories) ||
+    !record.stories.every((story) => isPostedStory(story)) ||
+    !isSafeIntegerArray(record.seenBefore) ||
+    !isSafeIntegerArray(record.seenClaim) ||
+    (record.legacyRecovery !== undefined && record.legacyRecovery !== true)
+  ) return false;
+
+  const storyIds = record.stories.map((story) => (story as PostedStory).id);
+  if (new Set(storyIds).size !== storyIds.length) return false;
+  const expectedBatchKey = `hn-monitor:v1:${storyIds.sort((a, b) => a - b).join(',')}`;
+  if (record.batchKey !== expectedBatchKey) return false;
+  const phase = String(record.phase) as DigestOutboxPhase;
+  const providers = asRecord(record.providers);
+  if (!providers) return false;
+  let count = 0;
+  for (const provider of ['slack', 'telegram'] as const) {
+    if (providers[provider] === undefined) continue;
+    const state = asRecord(providers[provider]);
+    const header = asRecord(state?.header);
+    const body = asRecord(state?.body);
+    if (
+      !isDigestOutboxEffect(header, digestOperationKey(record.batchKey, provider, 'header'), provider) ||
+      !isDigestOutboxEffect(body, digestOperationKey(record.batchKey, provider, 'body'), provider)
+    ) return false;
+    if ((phase === 'bodies' || phase === 'state') && header?.status === 'pending') return false;
+    if (phase === 'state' && body?.status === 'pending') return false;
+    count += 1;
+  }
+  return count > 0;
+}
+
+function isDigestOutboxEffect(
+  value: Record<string, unknown> | null,
+  operationKey: string,
+  provider: DigestProvider
+): boolean {
+  if (
+    !value ||
+    !['pending', 'delivered', 'omitted'].includes(String(value.status)) ||
+    value.operationKey !== operationKey
+  ) return false;
+  if (value.ref === undefined) return true;
+  const ref = asRecord(value.ref);
+  return ref?.provider === provider && typeof ref.draftRef === 'string' && ref.draftRef.length > 0;
+}
+
+function isPostedStory(value: unknown): value is PostedStory {
+  const story = asRecord(value);
+  return Boolean(
+    story &&
+    Number.isSafeInteger(story.id) && Number(story.id) > 0 &&
+    Number.isSafeInteger(story.rank) && Number(story.rank) > 0 &&
+    typeof story.title === 'string' && story.title.length > 0 &&
+    typeof story.url === 'string' && story.url.length > 0
+  );
+}
+
+function isSafeIntegerArray(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((item) => Number.isSafeInteger(item));
 }
 
 async function saveDigestOutbox(ctx: WorkforceCtx, outbox: DigestOutbox): Promise<void> {

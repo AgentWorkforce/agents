@@ -74,10 +74,13 @@ Before the seen claim or any provider write, the handler saves a durable digest
 outbox. It advances through `claim`, `headers`, `bodies`, and `state`, recording
 Slack and Telegram independently after every effect. Critical seen/outbox reads
 fail closed, and critical writes must return a memory receipt. Each provider
-header and body carries a stable key derived from the canonical HN batch, so a
-worker termination between a provider write and its checkpoint safely replays
-the same logical operation. A partial multi-provider failure retries only the
-missing provider phase; a removed provider is marked omitted.
+header and body carries a stable key derived from the canonical HN batch. Slack
+consumes it as provider idempotency; Telegram, which has no native idempotency
+key, uses it as both draft metadata and a deterministic Relayfile item path so a
+replay rewrites the same draft identity. A partial multi-provider failure
+retries only the missing provider phase; a removed provider is marked omitted.
+The first run after upgrade also translates the previous pending-body or
+pending-state marker into this outbox before clearing the legacy records.
 
 If a delivered Slack digest cannot persist its exact grounding record, the run
 fails explicitly and emits `hn-monitor.post-grounding-persistence-failed`.
@@ -110,7 +113,8 @@ Local invocation always previews Slack actions; it never sends them. The
 scheduled preview records the `compose.run` request without launching the
 remote workflow, so the rendered preview uses the same deterministic fallback
 as an unavailable orchestration run. The explicit `live-model.case.yaml`
-command keeps live-model coverage on the conversational Slack follow-up path;
+command exercises the live-model request and grounded fallback on the
+conversational Slack follow-up path;
 its final event source is `slack`, while its scheduled turn remains a Relayflow
 compose preview. `npm run evals:hn`
 and `npm run preview:hn` are thin wrappers

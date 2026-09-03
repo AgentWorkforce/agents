@@ -87,8 +87,8 @@ $ npm run test:hn
 ✔ v1 resume reactivation rejects non-failed runs and touches only named descendants
 ✔ generated workflow dry run resolves least-privilege artifact grants and denies an unrelated secret
 ✔ production Relayflow budget covers core v1 transient replays and caller overhead
-ℹ tests 40
-ℹ pass 40
+ℹ tests 44
+ℹ pass 44
 ℹ fail 0
 ```
 
@@ -359,14 +359,17 @@ pinned to cron.
 The remediation introduces one durable `claim → headers → bodies → state`
 outbox, independent per-provider status, stable batch/provider/phase operation
 keys on the real provider drafts, receipt-checked critical memory writes,
-`failOnError: true` critical recalls, and state-only recovery after delivery.
+`failOnError: true` critical recalls, strict outbox validation, state-only
+recovery after delivery, and an upgrade bridge for the old pending markers.
+Slack uses its writeback idempotency key; Telegram reuses a deterministic
+Relayfile item path because the Bot API has no native idempotency key.
 The worst supported Relayflow path is now budgeted at about 451 seconds with a
 480-second workflow timeout, 510-second completion wait, and 600-second persona
 harness timeout. The live-model final source is explicitly Slack.
 
 ```text
 $ npm run test:hn
-tests 40; pass 40; fail 0
+tests 44; pass 44; fail 0
 
 $ npm run typecheck
 > tsc --noEmit
@@ -399,7 +402,7 @@ $ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-review-i4
 {"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14435,"posts":2,"stateSaves":4,"emittedSourceDryRun":true}
 
 $ npm test
-tests 341; pass 339; fail 2
+tests 342; pass 340; fail 2
 both failures: ENOENT .../workforce/packages/harness-kit/package.json
 ```
 

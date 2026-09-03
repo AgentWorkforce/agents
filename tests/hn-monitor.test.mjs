@@ -246,6 +246,26 @@ test('runScheduledScan serializes concurrent claims before starting a second Rel
   assert.equal(posts.length, 2, 'only one header/body digest should be published');
 });
 
+test('runScheduledScan fails closed when the durable outbox recall is unavailable', async () => {
+  const { ctx } = fakeCtx();
+  ctx.memory.recall = async () => { throw new Error('memory unavailable'); };
+  let fetched = false;
+  let sends = 0;
+  await assert.rejects(
+    () => hnMonitor.runScheduledScan(ctx, {
+      delivery: {
+        targets: ['slack'],
+        async send() { sends += 1; return { ok: true, refs: [] }; },
+        async publish() { sends += 1; return { ok: true, refs: [] }; },
+      },
+      fetchStories: async () => { fetched = true; return []; },
+    }),
+    /memory unavailable/u,
+  );
+  assert.equal(fetched, false);
+  assert.equal(sends, 0);
+});
+
 test('postFreshStories degrades deterministically when Relayflow completion fails', async () => {
   const { ctx, logs } = fakeCtx({
     workflow: {
@@ -710,10 +730,96 @@ test('production digest delivery writes stable provider idempotency keys and thr
       'stable-slack-header', 'stable-slack-body', 'stable-telegram-header', 'stable-telegram-body',
     ]);
     assert.equal(preview.actions[1].body.parentRef, slackHead.draftRef);
+    assert.match(preview.actions[2].path, /\/telegram\/chats\/456\/messages\/hn-monitor-[a-f0-9]{40}\.json$/u);
     assert.equal(preview.actions[3].body.reply_to_message_id, Number(telegramHead.messageId));
   } finally {
     clearPreviewTransport();
   }
+});
+
+test('Telegram operation replay reuses one deterministic Relayfile draft identity', async () => {
+  const preview = new PreviewTransport({ idFactory: (_request, sequence) => String(sequence) });
+  setPreviewTransport(preview);
+  try {
+    const { ctx } = fakeCtx();
+    ctx.persona.inputs = { TELEGRAM_CHAT: '456' };
+    const delivery = createDigestDelivery(ctx);
+    await delivery.sendOperation('telegram', 'same header', { idempotencyKey: 'stable-telegram-replay' });
+    await delivery.sendOperation('telegram', 'same header', { idempotencyKey: 'stable-telegram-replay' });
+
+    assert.equal(preview.actions.length, 2);
+    assert.equal(preview.actions[0].path, preview.actions[1].path);
+    assert.equal(preview.actions[0].body.idempotencyKey, preview.actions[1].body.idempotencyKey);
+  } finally {
+    clearPreviewTransport();
+  }
+});
+
+test('malformed durable outbox memory is ignored instead of skipping provider phases', async () => {
+  const { ctx } = fakeCtx();
+  ctx.memory.recall = async () => [{
+    id: 'malformed-outbox',
+    content: JSON.stringify({
+      kind: 'hn-monitor digest outbox',
+      version: 1,
+      batchKey: 'hn-monitor:v1:20',
+      phase: 'state',
+      createdAt: '2026-09-03T09:00:00.000Z',
+      updatedAt: '2026-09-03T09:00:00.000Z',
+      header: 'header',
+      body: 'body',
+      stories: [{ ...STORY, rank: 1 }],
+      seenBefore: [],
+      seenClaim: [20],
+      providers: { slack: {} },
+    }),
+    tags: ['hn-monitor:digest-outbox'],
+    scope: 'workspace',
+    createdAt: '2026-09-03T09:00:00.000Z',
+  }];
+  let sends = 0;
+  const recovered = await retryPendingThreadBody(ctx, {
+    targets: ['slack'],
+    async send() { sends += 1; return { ok: true, refs: [] }; },
+    async publish() { sends += 1; return { ok: true, refs: [] }; },
+  });
+
+  assert.equal(recovered, false);
+  assert.equal(sends, 0);
+});
+
+test('legacy pending exact-state intent migrates without replaying provider effects', async () => {
+  const { ctx, saved, files, logs } = fakeCtx();
+  const record = {
+    postedAt: '2026-09-03T09:00:00.000Z',
+    digest: 'legacy header\nlegacy body',
+    stories: [{ ...STORY, rank: 1 }],
+    threadRefs: [{
+      provider: 'slack', channel: 'C123', threadTs: '1710000000.100', draftRef: 'legacy-ref',
+    }],
+  };
+  ctx.memory.recall = async (_query, opts) => opts?.tags?.includes('hn-monitor:pending-post-state')
+    ? [{
+        id: 'legacy-state',
+        content: JSON.stringify({ kind: 'hn-monitor pending exact post state', record }),
+        tags: ['hn-monitor:pending-post-state'],
+        scope: 'workspace',
+        createdAt: record.postedAt,
+      }]
+    : [];
+  let sends = 0;
+  const recovered = await retryPendingThreadBody(ctx, {
+    targets: ['slack'],
+    async sendOperation() { sends += 1; throw new Error('state-only migration must not send'); },
+  });
+
+  assert.equal(recovered, true);
+  assert.equal(sends, 0);
+  assert.ok(files.has('/slack/channels/C123/hn-monitor/recent-digests.json'));
+  assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-thread-body') && JSON.parse(entry.content).cleared));
+  assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-post-state') && JSON.parse(entry.content).cleared));
+  assert.ok(saved.some(isClearedOutbox));
+  assert.ok(logs.some((entry) => entry.message === 'hn-monitor.legacy-recovery-migrated'));
 });
 
 test('partial multi-target header persists a phase-aware per-provider outbox', async () => {

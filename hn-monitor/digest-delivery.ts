@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { WorkforceCtx } from '@agentworkforce/runtime';
 import {
   resolveDeliveryTargets,
@@ -78,7 +79,10 @@ async function sendTelegramOperation(
   const parent = options.replyTo?.provider === 'telegram' ? options.replyTo : undefined;
   const parentMessageId = parent?.messageId ? Number(parent.messageId) : undefined;
   const client = telegramClient({ writebackTimeoutMs: options.nonBlocking ? 0 : WRITEBACK_TIMEOUT_MS });
-  const result = await client.messages.write({ chatId }, {
+  // Telegram has no native idempotency key. Use the logical operation key as a
+  // stable Relayfile item identity as well as draft metadata, so a worker replay
+  // writes the same path/content revision instead of allocating a second draft.
+  const result = await client.messages.write({ chatId, messageId: telegramDraftId(options.idempotencyKey) }, {
     text,
     idempotencyKey: options.idempotencyKey,
     ...(Number.isSafeInteger(parentMessageId) ? { reply_to_message_id: parentMessageId } : {})
@@ -88,6 +92,10 @@ async function sendTelegramOperation(
     throw new Error(`HN digest Telegram operation ${options.idempotencyKey} returned no receipt`);
   }
   return { provider: 'telegram', chatId, messageId };
+}
+
+function telegramDraftId(idempotencyKey: string): string {
+  return `hn-monitor-${createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 40)}`;
 }
 
 function receiptId(receipt: Record<string, unknown> | undefined): string {

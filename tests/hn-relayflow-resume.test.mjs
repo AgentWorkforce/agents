@@ -62,8 +62,8 @@ test('production resume guard uses the exact workflow name journaled by pinned R
 
 test('production Relayflow budget covers core v1 transient replays and caller overhead', async () => {
   const source = scheduledDigestWorkflowSource();
-  // The generated program is bundled by esbuild, which emits 480_000 as 48e4.
-  assert.match(source, /const WORKFLOW_TIMEOUT_MS = 48e4;/u);
+  // Focused tests use esbuild (`48e4`); the repository suite uses tsc (`480_000`).
+  assert.match(source, /const WORKFLOW_TIMEOUT_MS = (?:48e4|480_000);/u);
   assert.match(source, /\.timeout\(WORKFLOW_TIMEOUT_MS\)/u);
   assert.equal(SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS, 510_000);
 });

@@ -237,3 +237,24 @@ running/completed/wrong-workflow rejection coverage.
 The iteration-1 Claude worker returned `BLOCKED` without reviewing because the
 broker scheduled it to a Linux node that did not contain the macOS repository.
 It is recorded as an infrastructure non-review and is not counted as signoff.
+
+## Independent review iteration 2
+
+The fresh Codex reviewer returned `VERDICT: FINDINGS` on `88ed107` with one
+high-severity compound-failure gap: failure to save the pre-body exact-state
+recovery intent was logged and ignored, so a following successful body effect
+plus exact-state failure could not be repaired. The executable test was added
+first and failed as expected:
+
+```text
+$ npm run test:hn
+not ok 14 - durable recovery-intent failure prevents body delivery before exact-state persistence can also fail
+error: Slack digest posted, but deterministic HN grounding state could not be persisted
+tests 37; pass 36; fail 1
+```
+
+The remediation makes that intent a hard pre-body durability gate and applies
+the same gate when retrying a previously queued body. The focused regression
+asserts the body is not sent and exact state is not attempted under the compound
+failure; a second regression asserts the recovery path also performs no
+provider effect until the intent succeeds.

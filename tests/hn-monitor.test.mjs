@@ -511,6 +511,30 @@ test('exact-state failure after Slack delivery rejects with an observable persis
   assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.post-grounding-persistence-failed'));
 });
 
+test('durable recovery-intent failure prevents body delivery before exact-state persistence can also fail', async () => {
+  const { ctx, saved, logs } = fakeCtx();
+  const originalSave = ctx.memory.save;
+  ctx.memory.save = async (content, opts) => {
+    if (opts?.tags?.includes('hn-monitor:pending-post-state')) {
+      throw new Error('durable recovery intent unavailable');
+    }
+    return originalSave(content, opts);
+  };
+  let exactWriteAttempts = 0;
+  ctx.files.write = async (path) => {
+    if (path.startsWith('/slack/')) exactWriteAttempts += 1;
+    throw new Error('relayfile unavailable');
+  };
+  const posts = [];
+
+  await postFreshStories(ctx, fakeDelivery(posts), [], [STORY]);
+
+  assert.equal(posts.length, 1, 'only the header may land until the state-recovery intent is durable');
+  assert.equal(exactWriteAttempts, 0, 'exact state is not attempted before the gated body effect');
+  assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-thread-body') && !isClearedPending(entry)));
+  assert.ok(logs.some((entry) => entry.level === 'error' && entry.message === 'hn-monitor.thread-incomplete'));
+});
+
 test('next scheduled tick repairs exact state after delivery without reposting', async () => {
   const { ctx, saved, files, logs } = fakeCtx();
   let exactWritesFail = true;
@@ -1342,6 +1366,43 @@ test('retryPendingThreadBody retries threaded body using saved headerRefs', asyn
   assert.ok(clearCall, 'pending state should be cleared after successful retry');
   const postCall = saved.find((s) => s.opts?.tags?.includes('hn-monitor:post'));
   assert.ok(postCall, 'post should be saved after successful retry');
+});
+
+test('retryPendingThreadBody re-establishes durable state intent before retrying the provider effect', async () => {
+  const { ctx, saved } = fakeCtx();
+  ctx.memory.recall = async (_query, opts) => opts?.tags?.includes('hn-monitor:pending-thread-body')
+    ? [{
+        id: 'pending-body',
+        content: JSON.stringify({
+          targets: 'slack',
+          header: ':newspaper: *Hacker News* — 1 new match(es)',
+          body: 'digest body',
+          createdAt: '2026-09-03T09:00:00.000Z',
+          stories: [STORY],
+          headerRefs: [{ provider: 'slack', channel: 'C123', draftRef: 'ref-original' }],
+        }),
+        tags: ['hn-monitor:pending-thread-body'],
+        scope: 'workspace',
+        createdAt: '2026-09-03T09:00:00.000Z',
+      }]
+    : [];
+  ctx.memory.save = async (content, opts) => {
+    if (opts?.tags?.includes('hn-monitor:pending-post-state')) {
+      throw new Error('durable recovery intent unavailable');
+    }
+    saved.push({ content, opts });
+  };
+  let sends = 0;
+  const delivery = {
+    targets: ['slack'],
+    async send() { sends += 1; return { ok: true, refs: [] }; },
+    async publish() { return { ok: true, refs: [] }; },
+  };
+
+  await assert.rejects(() => retryPendingThreadBody(ctx, delivery), /durable recovery intent unavailable/u);
+
+  assert.equal(sends, 0, 'a recovered body must not be sent before its exact-state recovery intent is durable');
+  assert.equal(saved.some(isClearedPending), false, 'the pending body remains available for a later tick');
 });
 
 test('retryPendingThreadBody clears orphaned pending body when targets change', async () => {

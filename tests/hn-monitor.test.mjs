@@ -788,6 +788,34 @@ test('malformed durable outbox memory is ignored instead of skipping provider ph
   assert.equal(sends, 0);
 });
 
+test('zero configured targets retire a pending outbox before the scheduled scan returns', async () => {
+  const { ctx, saved } = fakeCtx();
+  await assert.rejects(
+    () => postFreshStories(ctx, {
+      targets: ['slack'],
+      async sendOperation() { throw new Error('provider unavailable'); },
+    }, [], [STORY]),
+    /provider unavailable/u,
+  );
+  assert.ok(latestActiveOutbox(saved), 'the failed provider leaves a durable outbox');
+
+  ctx.memory.recall = async (_query, opts) => saved
+    .filter((entry) => entry.opts?.tags?.includes(opts?.tags?.[0]))
+    .map((entry, index) => ({ ...entry, id: `m-${index}`, tags: entry.opts.tags, scope: 'workspace', createdAt: `${index}` }))
+    .reverse();
+  let fetches = 0;
+  await hnMonitor.runScheduledScan(ctx, {
+    delivery: {
+      targets: [],
+      async sendOperation() { throw new Error('a removed provider must not be called'); },
+    },
+    fetchStories: async () => { fetches += 1; return []; },
+  });
+
+  assert.equal(fetches, 0, 'a no-target scan does not read HN after recovery');
+  assert.ok(saved.some(isClearedOutbox), 'the disabled provider is omitted and the stale outbox is cleared');
+});
+
 test('legacy pending exact-state intent migrates without replaying provider effects', async () => {
   const { ctx, saved, files, logs } = fakeCtx();
   const record = {

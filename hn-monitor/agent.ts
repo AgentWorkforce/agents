@@ -296,10 +296,6 @@ export async function runScheduledScan(
   deps: ScheduledScanDependencies = {}
 ): Promise<void> {
   const delivery = deps.delivery ?? createDigestDelivery(ctx);
-  if (delivery.targets.length === 0) {
-    ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
-    return;
-  }
 
   // One deployed worker can receive overlapping at-least-once cron
   // deliveries. Serialize the whole read/claim/effect path per workspace and
@@ -309,6 +305,13 @@ export async function runScheduledScan(
     // A durable outbox recovery owns this tick. Stable provider operation keys
     // make every replay safe across delivery ids and worker termination.
     if (await retryPendingThreadBody(ctx, delivery)) return;
+
+    // Recovery runs even after every provider is removed so an old partial
+    // digest cannot remain publishable if that provider is enabled again.
+    if (delivery.targets.length === 0) {
+      ctx.log('warn', 'hn-monitor.no-targets', { reason: 'neither SLACK_CHANNEL nor TELEGRAM_CHAT configured' });
+      return;
+    }
 
     const topics = list(input(ctx, 'TOPICS'));
     const lookbackHours = boundedPositiveInt(input(ctx, 'LOOKBACK_HOURS') ?? '24', 'LOOKBACK_HOURS', 72);

@@ -85,6 +85,10 @@ function workflowProgram({
 }: WorkflowProgramDependencies): void {
 const WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 const OUTPUT_MARKER = 'HN_DIGEST_NOTES_JSON:';
+// Worst supported path is 210s: prepare 10s + two 60s agent steps +
+// validator 10s + reviewer repair 60s + validator retry 10s. The remaining
+// 30s covers retry delay and runner overhead; the persona waits another 15s.
+const WORKFLOW_TIMEOUT_MS = 240_000;
 
 interface DigestStoryInput {
   id: number;
@@ -125,7 +129,7 @@ async function main(): Promise<void> {
     .description('Curate and independently validate one HN scheduled digest')
     .pattern('pipeline')
     .maxConcurrency(1)
-    .timeout(180_000)
+    .timeout(WORKFLOW_TIMEOUT_MS)
     .trajectories({ enabled: true, autoDecisions: true })
     .agent('curator', {
       cli: 'claude',
@@ -133,7 +137,6 @@ async function main(): Promise<void> {
       preset: 'worker',
       role: 'Curate supplied HN metadata into concise builder-relevant notes.',
       interactive: false,
-      retries: 1,
       timeoutMs: 60_000,
       maxTokens: 1_800,
       cwd: artifactDir,
@@ -153,7 +156,6 @@ async function main(): Promise<void> {
       preset: 'reviewer',
       role: 'Independently check factual grounding and repair the digest artifact.',
       interactive: false,
-      retries: 1,
       timeoutMs: 60_000,
       maxTokens: 1_800,
       cwd: artifactDir,
@@ -178,6 +180,7 @@ async function main(): Promise<void> {
       captureOutput: true,
       failOnError: true,
       timeoutMs: 10_000,
+      retries: 0,
     })
     .step('analyze-stories', {
       agent: 'curator',
@@ -193,7 +196,7 @@ async function main(): Promise<void> {
       ].join('\n'),
       verification: { type: 'file_exists', value: candidatePath },
       timeoutMs: 60_000,
-      retries: 1,
+      retries: 0,
     })
     .step('review-digest', {
       agent: 'reviewer',
@@ -208,7 +211,7 @@ async function main(): Promise<void> {
       ].join('\n'),
       verification: { type: 'file_exists', value: digestPath },
       timeoutMs: 60_000,
-      retries: 1,
+      retries: 0,
     })
     .step('validate-digest', {
       type: 'deterministic',
@@ -218,6 +221,7 @@ async function main(): Promise<void> {
       failOnError: true,
       verification: { type: 'output_contains', value: OUTPUT_MARKER },
       timeoutMs: 10_000,
+      retries: 1,
     })
     .repairable({
       maxRetries: 1,

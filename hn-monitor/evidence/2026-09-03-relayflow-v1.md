@@ -268,3 +268,52 @@ contract export did not yet exist. The source now derives the journal name in
 one explicit v1 helper, embeds that helper in the uploaded workflow, and the
 mock journal uses the real suffixed name. The separate actual-core resume test
 continues to prove completed steps are not replayed.
+
+## Post-merge follow-up validation
+
+PR #126 was merged externally at `cec97c5` while this required review/fix loop
+was still active. This worker did not merge or deploy. The review remediations
+remain isolated as a narrow follow-up diff on the required feature branch.
+
+Automated review also identified an under-budgeted retry path and a bundle
+smoke that captured but did not execute the emitted workflow source. The
+workflow now makes the supported retry path explicit: deterministic prepare
+and both agent steps get one attempt; the final validator gets one
+reviewer-assisted repair and retry. Their 210-second maximum is covered by the
+240-second workflow timeout and the persona's 255-second completion wait. The
+bundle smoke now writes the exact source captured from `agent.bundle.mjs` into
+a workspace-local scratch directory, runs its real Relayflow dry-run, checks
+the journaled workflow name, and removes the scratch directory.
+
+Latest literal results:
+
+```text
+$ npm run test:hn
+tests 39; pass 39; fail 0
+
+$ npm run typecheck
+> tsc --noEmit
+(exit 0)
+
+$ node scripts/test.mjs tests/hn-monitor-cases.test.mjs
+tests 14; pass 14; fail 0
+
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm run evals:hn
+all platform cases: 1 run(s) — 1 ok, 0 failed per case
+(exit 0)
+
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm run preview:hn -- --output .../live-read-i3.run.json
+policy: reads=live writes=preview model=stub shell=simulate compose=preview
+fidelity: state=simulated inputs=current http=current model=simulated
+3 current HN feed reads; 1 run — 1 ok, 0 failed
+
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-review-i4
+{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14435,"posts":2,"stateSaves":4,"emittedSourceDryRun":true}
+
+$ npm test
+tests 341; pass 339; fail 2
+both failures: ENOENT .../workforce/packages/harness-kit/package.json
+```
+
+The live run record and bundle were moved to explicit Trash paths after
+inspection; no production provider or state write was made.

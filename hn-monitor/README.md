@@ -27,7 +27,7 @@ generator immediately before the runtime uploads it. That Relayflow
 uses the v1 journal with stable `prepare-input`, `analyze-stories`,
 `review-digest`, and `validate-digest` step identities. Completed step outputs
 survive `RESUME_RUN_ID`. A small v1 compatibility helper reactivates only
-descendants core `1.0.6` journaled as `skipped`; that version resets the failed
+descendants on core `1.0.6` journaled as `skipped`; that version resets the failed
 step itself but otherwise leaves skipped descendants inert on resume. A
 deterministic final gate checks the exact batch key, story ids, and output
 bounds before the persona can consume the notes. Curator and reviewer agents

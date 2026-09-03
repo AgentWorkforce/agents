@@ -125,6 +125,7 @@ interface PendingPostState {
 }
 
 const SCHEDULED_DIGEST_VERSION = 'v1' as const;
+const SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS = 255_000;
 const scheduledScanLocks = new Map<string, Promise<void>>();
 
 interface ScheduledScanDependencies {
@@ -1015,7 +1016,7 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
     ctx.log('info', 'hn-monitor.relayflow-started', { batchKey, runId: run.runId, version: SCHEDULED_DIGEST_VERSION });
     const completion = await withTimeout(
       run.completion(),
-      195_000,
+      SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS,
       `ctx.workflow.completion(${run.runId})`
     );
     if (completion.status !== 'success') {

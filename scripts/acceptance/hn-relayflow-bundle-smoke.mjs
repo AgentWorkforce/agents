@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -82,10 +84,36 @@ assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:seen
 assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:post')).length, 1);
 assert.equal(saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:pending-post-state')).length, 2);
 
+const sourceDir = await mkdtemp(path.resolve('.hn-relayflow-bundle-source-'));
+let sourceDryRun;
+try {
+  const workflowPath = path.join(sourceDir, 'hn-monitor-scheduled-digest-v1.ts');
+  await writeFile(workflowPath, workflowCall.source);
+  sourceDryRun = spawnSync(
+    path.resolve('node_modules/.bin/tsx'),
+    [workflowPath],
+    {
+      cwd: sourceDir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        DRY_RUN: '1',
+        invocationArgs: JSON.stringify(workflowCall.args),
+      },
+    },
+  );
+  assert.equal(sourceDryRun.status, 0, `${sourceDryRun.stdout}\n${sourceDryRun.stderr}`);
+  assert.match(sourceDryRun.stdout, /HN_RELAYFLOW_DRY_RUN:/u);
+  assert.match(sourceDryRun.stdout, /"name":"hn-monitor-scheduled-digest-v1-workflow"/u);
+} finally {
+  await rm(sourceDir, { recursive: true, force: true });
+}
+
 console.log(JSON.stringify({
   workflow: workflowCall.name,
   version: workflowCall.args.relayflowVersion,
   sourceBytes: workflowCall.source.length,
   posts: posts.length,
   stateSaves: saved.length,
+  emittedSourceDryRun: sourceDryRun?.status === 0,
 }));

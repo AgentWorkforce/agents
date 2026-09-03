@@ -89,8 +89,8 @@ $ npm run test:hn
 ✔ tracked TypeScript generator emits a self-contained Relayflow workflow
 ✔ production Relayflow budget covers core v1 transient replays and caller overhead
 ✔ zero configured targets retire a pending outbox before the scheduled scan returns
-ℹ tests 46
-ℹ pass 46
+ℹ tests 49
+ℹ pass 49
 ℹ fail 0
 ```
 
@@ -159,18 +159,18 @@ $ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm run evals:hn
 Representative scheduled trace order:
 
 ```text
-08. [PREVIEW] files.write path=workflows/hn-monitor-scheduled-digest-v1.ts bytes=14470
-07. [PREVIEW] compose.run name=hn-monitor-scheduled-digest-v1 relayflowVersion=v1
-08. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] phase=claim
-09. [PREVIEW] memory.save tags=["hn-monitor:seen"]
-10. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] phase=headers
-11. [PREVIEW] provider.write slack.messages idempotencyKey=...:slack:header
-12-13. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] header checkpoint → bodies
-14. [PREVIEW] provider.write slack.messages idempotencyKey=...:slack:body parentRef=...
-15-16. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] body checkpoint → state
-17-18. [PREVIEW] files.write exact per-thread digest state + rolling index
-19. [PREVIEW] memory.save tags=["hn-monitor:post"]
-20. [PREVIEW] memory.save tags=["hn-monitor:digest-outbox"] cleared=true
+07. [PREVIEW] files.write workflow source bytes=14470
+08. [PREVIEW] compose.run name=hn-monitor-scheduled-digest-v1 relayflowVersion=v1
+09-10. [PREVIEW] files.write exact outbox claim → memory.save audit claim
+11. [PREVIEW] memory.save tags=["hn-monitor:seen"]
+12-13. [PREVIEW] files.write exact outbox headers → memory.save audit headers
+14. [PREVIEW] provider.write slack.messages idempotencyKey=...:slack:header
+15-18. [PREVIEW] exact + audit-memory header checkpoint → bodies
+19. [PREVIEW] provider.write slack.messages idempotencyKey=...:slack:body parentRef=...
+20-23. [PREVIEW] exact + audit-memory body checkpoint → state
+24-25. [PREVIEW] files.write exact per-thread digest state + rolling index
+26. [PREVIEW] memory.save tags=["hn-monitor:post"]
+27-28. [PREVIEW] files.write exact cleared outbox → memory.save cleared audit
 ```
 
 The multi-turn fixture also proves the later Slack Q&A path still performs the
@@ -199,7 +199,7 @@ The first cold start timed out before readiness at 30 seconds. The same command
 with a 60-second readiness allowance completed:
 
 ```text
-$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-final-65506ed.run.json
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output /Users/khaliqgant/Projects/AgentWorkforce/agents-hn-relayflow-wt/hn-monitor/live-read-final-b9c1d7a.run.json
 preview: 1 run(s) — 1 ok, 0 failed
 policy: reads=live writes=preview model=stub shell=simulate compose=preview
 ```
@@ -209,15 +209,18 @@ Captured RunRecord summary:
 ```json
 {
   "status": "succeeded",
+  "actionCount": 28,
   "liveReads": ["show_hn:current", "front_page:current", "new:current"],
   "workflowSource": {"status":"previewed","path":"workflows/hn-monitor-scheduled-digest-v1.ts","bytes":14470},
   "workflow": {"status":"previewed","name":"hn-monitor-scheduled-digest-v1","version":"v1","batchKey":"hn-monitor:v1:49534948,49536840,49539792,49542723,49546659,49546831,49547372,49547527"},
-  "providerWrites": ["slack.messages:previewed", "slack.messages:previewed"]
+  "providerWrites": ["slack.messages:previewed", "slack.messages:previewed"],
+  "exactOutboxWrites": 7,
+  "nonPreviewWrites": 0
 }
 ```
 
 The RunRecord was moved to the recoverable Trash path
-`/Users/khaliqgant/.Trash/hn-monitor-live-read-final-65506ed.run.json` after
+`/Users/khaliqgant/.Trash/hn-monitor-live-read-final-b9c1d7a.run.json` after
 extracting this evidence. No provider write had status `executed`, and no
 deployment was performed.
 
@@ -229,11 +232,11 @@ persona hn-monitor: 0 integration(s), 1 schedule(s)
 --dry-run: persona validated; exiting before any side effects
 ok: hn-monitor (dry-run)
 
-$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-final-65506ed --no-prompt
-bundle: staged to .hn-bundle-final-65506ed/runner.mjs (705.9KB)
---bundle-out: bundle ready at .hn-bundle-final-65506ed; skipping launch
+$ ./node_modules/.bin/agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --bundle-out ./.hn-bundle-final-b9c1d7a --no-prompt
+bundle: staged to .hn-bundle-final-b9c1d7a/runner.mjs (708.4KB)
+--bundle-out: bundle ready at .hn-bundle-final-b9c1d7a; skipping launch
 
-$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-65506ed
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-b9c1d7a
 {"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14470,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
 ```
 
@@ -244,14 +247,14 @@ workflow before `ctx.workflow.run`, consumes a validated result, publishes the
 same header/thread pair through the production digest-delivery seam with stable
 keys, and completes the seen/outbox/exact-state transition.
 The inspected bundle was then moved to the recoverable Trash path
-`/Users/khaliqgant/.Trash/hn-bundle-final-65506ed`.
+`/Users/khaliqgant/.Trash/hn-bundle-final-b9c1d7a`.
 
 ## Repository regression result
 
 ```text
 $ npm test
-ℹ tests 348
-ℹ pass 346
+ℹ tests 351
+ℹ pass 349
 ℹ fail 2
 ```
 
@@ -369,16 +372,8 @@ The worst supported Relayflow path is now budgeted at about 451 seconds with a
 480-second workflow timeout, 510-second completion wait, and 600-second persona
 harness timeout. The live-model final source is explicitly Slack.
 
-```text
-$ npm run test:hn
-tests 44; pass 44; fail 0
-
-$ npm run typecheck
-> tsc --noEmit
-(exit 0)
-```
-
-Iteration 3 literal results:
+Iteration 3 input-candidate results (`59b7151`, before the findings above were
+remediated):
 
 ```text
 $ npm run test:hn
@@ -406,6 +401,18 @@ $ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-review-i4
 $ npm test
 tests 342; pass 340; fail 2
 both failures: ENOENT .../workforce/packages/harness-kit/package.json
+```
+
+After the iteration-3 delivery, timeout, and source-closure remediations added
+five focused cases, the later candidate produced:
+
+```text
+$ npm run test:hn
+tests 44; pass 44; fail 0
+
+$ npm run typecheck
+> tsc --noEmit
+(exit 0)
 ```
 
 The live run record and bundle were moved to explicit Trash paths after
@@ -472,7 +479,7 @@ to the persona-local path, and returned to 45/45. Deterministic E2E, live HN
 read/preview-only delivery, deploy dry-run, and emitted-bundle/source smoke were
 rerun on merge-clean checkpoint `091be58`; PR #132 reports mergeable.
 
-## Automated PR finding and final review preflight
+## Automated PR findings and final review preflight
 
 Automated PR review found that `runScheduledScan` returned immediately when no
 delivery targets were configured. If an earlier run had left a pending outbox,
@@ -528,7 +535,54 @@ $ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH npm test
 tests 348; pass 346; fail 2
 ```
 
-The only failures remain the two sibling-checkout acceptance prerequisites
-listed above. Code checkpoint `65506ed207990de83a823a69b0e9da5021c3a3de`
-contains the zero-target repair. A documentation-only checkpoint follows so
-fresh Claude and Codex reviewers can inspect one exact code-and-evidence SHA.
+The next automated sweep found three more executable issues: semantic memory
+recall has no newest-first or completeness guarantee, so an omitted cleared
+marker could expose an older active outbox; writeback `receipt.created` metadata
+could be mistaken for a Slack timestamp or Telegram message id; and a removed,
+already-settled provider caused an unchanged outbox checkpoint on every
+state-only retry. Tests were added first and failed together:
+
+```text
+$ npm run test:hn
+✖ provider receipt creation metadata is not used as the delivered message identity
+✖ an exact cleared outbox prevents replay when bounded memory recall returns an older checkpoint
+✖ removed delivered providers do not append unchanged outbox checkpoints during state-only retry
+tests 49; pass 46; fail 3
+```
+
+The repair makes a workspace/agent-sharded exact Relayfile the current outbox
+pointer and keeps semantic memory only as receipt-checked audit history. Each
+exact checkpoint precedes its audit entry, and clearing the exact pointer
+precedes the cleared audit entry. Provider identity ignores `created`, and the
+configuration-change flag is set only when a pending status actually changes.
+The unchanged tests then passed:
+
+```text
+$ npm run test:hn
+tests 49; pass 49; fail 0
+
+$ npm run typecheck
+> tsc --noEmit
+(exit 0)
+
+$ node scripts/test.mjs tests/hn-monitor-cases.test.mjs
+tests 14; pass 14; fail 0
+
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run evals:hn
+(exit 0; every checked-in non-live HN case passed)
+
+$ PATH=/opt/homebrew/Cellar/node/26.5.0/bin:$PATH WF_LOCAL_PREVIEW_READY_TIMEOUT_MS=60000 WF_LOCAL_PREVIEW_OVERALL_TIMEOUT_MS=120000 npm run preview:hn -- --output .../live-read-final-b9c1d7a.run.json
+1 run ok; 3 current HN reads; 28 actions; 7 exact outbox writes; 0 non-preview writes
+
+$ node scripts/acceptance/hn-relayflow-bundle-smoke.mjs ./.hn-bundle-final-b9c1d7a
+{"workflow":"hn-monitor-scheduled-digest-v1","version":"v1","sourceBytes":14470,"posts":2,"stateSaves":9,"emittedSourceDryRun":true}
+
+$ npm test
+tests 351; pass 349; fail 2
+```
+
+The two repository-wide failures remain only the absent sibling-package
+prerequisites listed above. Code checkpoint
+`b9c1d7a4cdf9ddf86276297557fac00d52328323` contains these repairs. A final
+documentation checkpoint follows so fresh Claude and Codex reviewers can
+inspect one exact code-and-evidence SHA.

@@ -72,8 +72,12 @@ You can also chat with it:
 
 Before the seen claim or any provider write, the handler saves a durable digest
 outbox. It advances through `claim`, `headers`, `bodies`, and `state`, recording
-Slack and Telegram independently after every effect. Critical seen/outbox reads
-fail closed, and critical writes must return a memory receipt. Each provider
+Slack and Telegram independently after every effect. The current outbox value is
+an exact, workspace/agent-sharded Relayfile pointer; append-only memory entries
+remain its audit history but are never queried to choose the current checkpoint.
+The exact pointer is written before each audit entry, so a missing memory receipt
+can fail closed without losing the state needed to resume. Critical seen and
+legacy-marker reads fail closed, and critical memory writes require a receipt. Each provider
 header and body carries a stable key derived from the canonical HN batch. Slack
 consumes it as provider idempotency; Telegram, which has no native idempotency
 key, uses it as both draft metadata and a deterministic Relayfile item path so a

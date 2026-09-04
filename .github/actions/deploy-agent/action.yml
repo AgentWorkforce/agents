@@ -22,6 +22,15 @@ inputs:
       secrets, then per-run dispatch values. Optional.
     required: false
     default: ''
+  harness-source:
+    description: >-
+      Which stored credential the deploy should use for the persona's harness:
+      managed | byok | oauth | plan. Optional; leave empty to let the CLI
+      resolve it. Needed under --no-prompt, where the CLI will not guess: a
+      workspace with a connected OAuth (setup-token) credential still fails
+      with "claude credentials are not connected" unless this names it.
+    required: false
+    default: ''
   dry-run:
     description: When 'true', print what would be deployed and stop before any deploy.
     required: false
@@ -88,6 +97,10 @@ runs:
         AGENT_INPUTS: ${{ inputs.agent-inputs }}
         WORKFORCE_WORKSPACE_ID: ${{ inputs.workspace-id }}
         WORKFORCE_WORKSPACE_TOKEN: ${{ inputs.workspace-token }}
+        # Read by the CLI directly. Passed unconditionally but empty when unset,
+        # which the CLI treats as "resolve it yourself" — so this changes
+        # nothing for deploys that already work.
+        WORKFORCE_DEPLOY_HARNESS_SOURCE: ${{ inputs.harness-source }}
       # `if ...; then` rather than `[ ... ] && ...`: the default shell runs with
       # `-e`, so a bare false `&&` list would exit the step with status 1.
       run: |

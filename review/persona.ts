@@ -27,7 +27,16 @@ export default definePersona({
   },
 
   integrations: {
-    github: {}
+    // source: workspace — the GitHub connection this agent runs on belongs to
+    // the WORKSPACE, not to whoever deployed it.
+    //
+    // persona-kit defaults an omitted `source` to `{ kind: 'deployer_user' }`,
+    // which makes the deploy preflight look for a connection owned by the
+    // deploying user. A CI deploy authenticates with a workspace token and has
+    // no such user, so it reports `integrations.github: not connected` for a
+    // workspace where GitHub demonstrably IS connected — and with --no-prompt
+    // it aborts rather than offering to connect.
+    github: { source: { kind: 'workspace' } }
   },
 
   inputs: {

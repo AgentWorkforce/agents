@@ -4,7 +4,13 @@ import test from 'node:test';
 import {
   commentBody,
   commenterLogin,
+  HARNESS_RESOURCE_ENV,
   conflictResolveHarnessPrompt,
+  harnessExitCode,
+  harnessOutputTail,
+  isInfraKillExitCode,
+  logHarnessFailureDiagnostics,
+  runReviewHarnessWithRetry,
   deriveReviewDecision,
   evaluateMergeOnGreenState,
   isAuthorizedConflictCommander,
@@ -520,4 +526,114 @@ test('reviewHarnessPrompt requires accounting for each bot/reviewer comment with
   assert.match(prompt, /## Addressed comments/);
   assert.match(prompt, /file:line where you/);
   assert.match(prompt, /do not say a comment\s+was addressed without pointing to the fix/);
+});
+
+// A review run failed here with a bare "harness exited with code 137". 137 is
+// 128+SIGKILL: the sandbox OOM-killed the harness while running the repo's full
+// install/build/test, which is what the review prompt asks for. Nothing in the
+// PR caused it, so it retries once and is reported as infrastructure.
+test('runReviewHarnessWithRetry: retries once on an infra kill and succeeds', async () => {
+  const codes = [137, 0];
+  let calls = 0;
+  const retried = [];
+  const outcome = await runReviewHarnessWithRetry(
+    async () => ({ exitCode: codes[calls++], output: 'review body' }),
+    { onRetry: (code) => retried.push(code) },
+  );
+  assert.equal(calls, 2);
+  assert.equal(outcome.attempts, 2);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.infraKill, false);
+  assert.deepEqual(retried, [137]);
+});
+
+test('runReviewHarnessWithRetry: reports an infra kill when the retry is killed too', async () => {
+  let calls = 0;
+  const outcome = await runReviewHarnessWithRetry(async () => {
+    calls += 1;
+    return { exitCode: 143 };
+  });
+  assert.equal(calls, 2);
+  assert.equal(outcome.infraKill, true);
+  assert.equal(outcome.exitCode, 143);
+});
+
+test('runReviewHarnessWithRetry: does NOT retry a genuine harness failure', async () => {
+  let calls = 0;
+  const outcome = await runReviewHarnessWithRetry(async () => {
+    calls += 1;
+    return { exitCode: 1 };
+  });
+  assert.equal(calls, 1, 'a real failure must not re-run work that may have pushed commits');
+  assert.equal(outcome.infraKill, false);
+});
+
+test('runReviewHarnessWithRetry: reports the FINAL failed attempt for diagnostics', async () => {
+  const failures = [];
+  await runReviewHarnessWithRetry(
+    async () => ({ exitCode: 137, output: 'FATAL ERROR: JavaScript heap out of memory' }),
+    { onFailure: (run, code) => failures.push({ code, output: run.output }) },
+  );
+  assert.equal(failures.length, 1, 'one report for the final attempt, not one per attempt');
+  assert.equal(failures[0].code, 137);
+  assert.match(failures[0].output, /heap out of memory/);
+
+  const clean = [];
+  await runReviewHarnessWithRetry(async () => ({ exitCode: 0 }), { onFailure: (r, c) => clean.push(c) });
+  assert.deepEqual(clean, [], 'a clean run reports no failure');
+});
+
+test('the harness heap cap stays BELOW the sandbox memory ceiling', () => {
+  // The cap only converts a SIGKILL into a readable heap error while it sits
+  // under the sandbox limit. Raise it above and the kernel wins the race again,
+  // which is the regression this guards.
+  const SANDBOX_MEMORY_MIB = 8 * 1024;
+  const heap = /--max-old-space-size=(\d+)/.exec(HARNESS_RESOURCE_ENV.NODE_OPTIONS);
+  assert.ok(heap, 'NODE_OPTIONS must pin a V8 heap cap');
+  const heapMib = Number(heap[1]);
+  assert.ok(heapMib < SANDBOX_MEMORY_MIB, `heap cap ${heapMib}MiB must stay under the ${SANDBOX_MEMORY_MIB}MiB box`);
+  assert.ok(heapMib <= SANDBOX_MEMORY_MIB - 2048, 'leave at least 2 GiB for the harness, mount sidecar and OS');
+  for (const key of ['VITEST_MAX_THREADS', 'TURBO_CONCURRENCY', 'JEST_MAX_WORKERS']) {
+    assert.equal(HARNESS_RESOURCE_ENV[key], '1', `${key} must pin serial execution`);
+  }
+});
+
+test('reviewHarnessPrompt tells the harness to run build/test serially', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'wepost-no', repo: 'wepost-saga', number: 5020 });
+  assert.match(prompt, /memory-constrained, so run those steps SERIALLY/);
+  assert.match(prompt, /do not raise worker\/concurrency counts/);
+  assert.match(prompt, /Run the repo's canonical build and test command end to end/);
+});
+
+test('harnessOutputTail keeps the END of the output and drops empties', () => {
+  // An OOM stack is the LAST thing written, so head-truncation would discard
+  // exactly the evidence this exists to capture.
+  assert.equal(harnessOutputTail('abcdef', 3), 'def');
+  assert.equal(harnessOutputTail('short'), 'short');
+  assert.equal(harnessOutputTail('   '), undefined);
+  assert.equal(harnessOutputTail(undefined), undefined);
+});
+
+test('logHarnessFailureDiagnostics records stderr, output and duration on a kill', () => {
+  const logged = [];
+  const ctx = { log: (level, message, fields) => logged.push({ level, message, fields }) };
+  logHarnessFailureDiagnostics(ctx, { owner: 'wepost-no', repo: 'wepost-saga', number: 5020 }, {
+    output: 'FATAL ERROR: JavaScript heap out of memory',
+    stderr: 'Aborted (core dumped)',
+    durationMs: 366_000,
+  }, 137);
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].fields.exitCode, 137);
+  assert.equal(logged[0].fields.infraKill, true);
+  assert.match(logged[0].fields.outputTail, /heap out of memory/);
+  assert.equal(harnessExitCode({ exitCode: 137 }), 137);
+  assert.equal(isInfraKillExitCode(1), false);
+});
+
+test('logHarnessFailureDiagnostics survives a harness result with nothing in it', () => {
+  const logged = [];
+  const ctx = { log: (level, message, fields) => logged.push({ level, message, fields }) };
+  logHarnessFailureDiagnostics(ctx, { owner: 'o', repo: 'r', number: 1 }, {}, 1);
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].fields.outputTail, undefined);
 });

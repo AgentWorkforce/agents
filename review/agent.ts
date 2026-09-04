@@ -374,31 +374,128 @@ export interface HarnessAttemptOutcome<T> {
  */
 export async function runReviewHarnessWithRetry<T>(
   runHarness: () => Promise<T>,
-  onRetry?: (exitCode: number) => void,
+  hooks: {
+    onRetry?: (exitCode: number) => void;
+    /**
+     * Invoked once with the FINAL attempt when the harness ends non-zero.
+     * Owned by this function rather than the caller so the diagnostics capture
+     * cannot be silently dropped from the failure path — the run that
+     * prompted this had no captured cause at all.
+     */
+    onFailure?: (run: T, exitCode: number) => void;
+  } = {},
 ): Promise<HarnessAttemptOutcome<T>> {
   let run = await runHarness();
   let exitCode = harnessExitCode(run);
   let attempts = 1;
 
   if (isInfraKillExitCode(exitCode)) {
-    onRetry?.(exitCode as number);
+    hooks.onRetry?.(exitCode as number);
     run = await runHarness();
     exitCode = harnessExitCode(run);
     attempts = 2;
   }
 
+  if (exitCode !== null && exitCode !== 0) {
+    hooks.onFailure?.(run, exitCode);
+  }
+
   return { run, exitCode, attempts, infraKill: isInfraKillExitCode(exitCode) };
+}
+
+/**
+ * Memory budget for everything the harness spawns, sized against the sandbox.
+ *
+ * The Daytona snapshot bakes `{ cpu: 4, memory: 8, disk: 10 }` and 8 GiB is
+ * Daytona's hard per-sandbox maximum — a bake above it is rejected outright
+ * (see cloud/scripts/create-snapshot.ts), so this cannot be solved by asking
+ * for a bigger box.
+ *
+ * The review prompt tells the harness to install dependencies and run the
+ * repo's full build/test/typecheck. On a large monorepo that is the real
+ * memory consumer, not the checkout: `tsc` alone takes multiple GiB, and a
+ * test runner defaulting to one worker per core multiplies it by four.
+ *
+ * The arithmetic: 8 GiB total, ~1.5 GiB reserved for the harness process, the
+ * mount sidecar and the OS, leaving ~6.5 GiB. Held to ONE worker, a single
+ * 4 GiB V8 heap fits with headroom.
+ *
+ * The cap must sit BELOW the cgroup limit, which is the whole point. When V8
+ * hits its own ceiling it throws "JavaScript heap out of memory" with a stack
+ * — diagnosable, attributable, and visible in the harness output. When the
+ * cgroup hits its ceiling first the kernel sends SIGKILL, which is how this
+ * surfaced as a bare exit 137 with no captured cause at all.
+ */
+export const HARNESS_RESOURCE_ENV: Record<string, string> = {
+  NODE_OPTIONS: '--max-old-space-size=4096',
+  // Serial execution across the runners a JS repo is likely to use. Each is
+  // ignored by repos that don't use that tool, so this is additive, not a
+  // requirement that any of them be present.
+  VITEST_MAX_THREADS: '1',
+  VITEST_MIN_THREADS: '1',
+  TURBO_CONCURRENCY: '1',
+  JEST_MAX_WORKERS: '1',
+};
+
+/** Keep the tail: a heap-exhaustion stack lands at the END of the output. */
+export function harnessOutputTail(value: unknown, limit = 4000): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length <= limit ? trimmed : trimmed.slice(-limit);
+}
+
+/**
+ * Record what the harness actually produced before it died.
+ *
+ * A customer's run failed with a bare "exited with code 137" and we could not
+ * say why: the agent logged only the exit code, so the sandbox row had 0 bytes
+ * of stderr and no harness output at all. HarnessRunResult already carries
+ * `output`, `stderr` and `durationMs` — nothing new has to be plumbed, the
+ * failure path simply never read them.
+ *
+ * Tails rather than heads, because the interesting part of an OOM (the
+ * "JavaScript heap out of memory" line and its stack) is the last thing
+ * written. Emitted before the PR comment so the evidence is recorded even if
+ * the GitHub write then fails.
+ */
+export function logHarnessFailureDiagnostics(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  run: unknown,
+  exitCode: number,
+): void {
+  const result = run as { output?: unknown; stderr?: unknown; durationMs?: unknown; usage?: unknown };
+  ctx.log?.('error', 'pr-reviewer harness diagnostics', {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    exitCode,
+    infraKill: isInfraKillExitCode(exitCode),
+    durationMs: typeof result.durationMs === 'number' ? result.durationMs : undefined,
+    stderrTail: harnessOutputTail(result.stderr),
+    outputTail: harnessOutputTail(result.output),
+    usage: result.usage ?? undefined,
+  });
 }
 
 async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   const { run, exitCode, infraKill } = await runReviewHarnessWithRetry(
-    () => ctx.harness.run({ cwd: ctx.sandbox.cwd, prompt: reviewHarnessPrompt(pr) }),
-    (killedWith) => ctx.log?.('warn', 'pr-reviewer harness killed; retrying once', {
-      owner: pr.owner,
-      repo: pr.repo,
-      number: pr.number,
-      exitCode: killedWith,
+    () => ctx.harness.run({
+      cwd: ctx.sandbox.cwd,
+      prompt: reviewHarnessPrompt(pr),
+      env: HARNESS_RESOURCE_ENV,
     }),
+    {
+      onRetry: (killedWith) => ctx.log?.('warn', 'pr-reviewer harness killed; retrying once', {
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+        exitCode: killedWith,
+      }),
+      onFailure: (failed, failedExitCode) =>
+        logHarnessFailureDiagnostics(ctx, pr, failed, failedExitCode),
+    },
   );
 
   if (infraKill) {
@@ -609,6 +706,9 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `Verify every edit before you finish, and verify it the way CI does — not just the unit test next to the file.`,
     `Run the repo's canonical build and test command end to end (read package.json / turbo.json / the CI workflow to`,
     `find what CI actually runs, focusing only on build/test/typecheck steps; install dependencies if needed) so you catch breakage DOWNSTREAM of the file you`,
+    `The sandbox is memory-constrained, so run those steps SERIALLY: do not raise worker/concurrency counts, and`,
+    `prefer a tool's single-worker flag (e.g. --maxWorkers=1, --concurrency=1) when it has one. A build or test run`,
+    `that is killed outright verifies nothing, so a slower serial run is strictly better than a parallel one that dies.`,
     `edited. In a monorepo, editing one source file can break a generated/committed artifact (a catalog, lockfile,`,
     `snapshot, or generated types) or a different package that imports it: when a finding makes you touch a source`,
     `that feeds a generated file, regenerate that file with the repo's own generator and rebuild the packages that`,

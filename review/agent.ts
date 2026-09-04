@@ -330,14 +330,81 @@ export function labelNames(labels: unknown): string[] {
     .filter(Boolean);
 }
 
-async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
-  const run = await ctx.harness.run({
-    cwd: ctx.sandbox.cwd,
-    prompt: reviewHarnessPrompt(pr)
-  });
+/**
+ * Exit codes that mean the OS killed the harness, not that the review failed.
+ *
+ * 137 = 128 + SIGKILL, 143 = 128 + SIGTERM. In practice 137 is the sandbox
+ * running out of memory on a large checkout: the kernel OOM killer takes the
+ * biggest process (the harness) while the sandbox itself survives. Nothing
+ * about the PR caused it and nothing in the PR can fix it, so this is treated
+ * as transient infrastructure rather than a review verdict.
+ *
+ * The durable fix is sandbox sizing (AgentWorkforce/cloud#1988 — Daytona boxes
+ * are created at the provider default with no way to request more memory).
+ * Until that lands, one retry rescues the runs that were merely unlucky.
+ */
+const INFRA_KILL_EXIT_CODES = new Set([137, 143]);
 
-  const exitCode = (run as { exitCode?: unknown }).exitCode;
-  if (typeof exitCode === 'number' && exitCode !== 0) {
+export function harnessExitCode(run: unknown): number | null {
+  const value = (run as { exitCode?: unknown }).exitCode;
+  return typeof value === 'number' ? value : null;
+}
+
+export function isInfraKillExitCode(exitCode: number | null): boolean {
+  return exitCode !== null && INFRA_KILL_EXIT_CODES.has(exitCode);
+}
+
+export interface HarnessAttemptOutcome<T> {
+  run: T;
+  exitCode: number | null;
+  attempts: number;
+  infraKill: boolean;
+}
+
+/**
+ * Run the harness, retrying ONCE and only when the OS killed it.
+ *
+ * Side-effect free by construction (the caller supplies the runner and the
+ * logger) so the retry policy is testable without a sandbox, GitHub, or Slack.
+ *
+ * A non-zero exit from the harness itself is a real failure and is never
+ * retried: the first pass may already have pushed mechanical fix commits, so
+ * re-running is not free. Only 137/143 — where no review work was completed
+ * because the process was killed outright — earns a second attempt.
+ */
+export async function runReviewHarnessWithRetry<T>(
+  runHarness: () => Promise<T>,
+  onRetry?: (exitCode: number) => void,
+): Promise<HarnessAttemptOutcome<T>> {
+  let run = await runHarness();
+  let exitCode = harnessExitCode(run);
+  let attempts = 1;
+
+  if (isInfraKillExitCode(exitCode)) {
+    onRetry?.(exitCode as number);
+    run = await runHarness();
+    exitCode = harnessExitCode(run);
+    attempts = 2;
+  }
+
+  return { run, exitCode, attempts, infraKill: isInfraKillExitCode(exitCode) };
+}
+
+async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
+  const { run, exitCode, infraKill } = await runReviewHarnessWithRetry(
+    () => ctx.harness.run({ cwd: ctx.sandbox.cwd, prompt: reviewHarnessPrompt(pr) }),
+    (killedWith) => ctx.log?.('warn', 'pr-reviewer harness killed; retrying once', {
+      owner: pr.owner,
+      repo: pr.repo,
+      number: pr.number,
+      exitCode: killedWith,
+    }),
+  );
+
+  if (infraKill) {
+    await abandonReviewRunToInfraKill(ctx, pr, exitCode as number);
+  }
+  if (exitCode !== null && exitCode !== 0) {
     await failReviewRun(ctx, pr, `The review harness exited with code ${exitCode}.`);
   }
 
@@ -1008,6 +1075,37 @@ function describeNotReadyState(state: PullRequestReadyState): string {
   const stateText = record.state ?? record.status ?? 'missing';
   const conclusionText = record.conclusion ?? 'missing';
   return `check=${String(name)} state=${String(stateText)} conclusion=${String(conclusionText)}`;
+}
+
+/**
+ * Give up on a run the OS killed twice.
+ *
+ * Deliberately NOT failReviewRun: that tells the PR author "this needs
+ * operator attention", which reads as though something in their PR needs
+ * fixing and leaves them asking whether the problem is on their side. An OOM
+ * is ours. Say so plainly on the PR, skip the Slack failure ping (an infra
+ * kill is not an actionable review result), and still throw so the run is
+ * recorded as failed and reaches our own alerting.
+ */
+async function abandonReviewRunToInfraKill(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  exitCode: number
+): Promise<never> {
+  const message = [
+    `pr-reviewer could not review #${pr.number} — the review sandbox ran out of resources (exit ${exitCode}).`,
+    '',
+    'This is an infrastructure limit on our side, not a problem with this PR, and there is nothing to fix here. The review runs again on the next push.',
+  ].join('\n');
+  ctx.log?.('error', 'pr-reviewer harness killed by infrastructure', {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    exitCode,
+    retried: true,
+  });
+  await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, message);
+  throw new Error(message);
 }
 
 async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<never> {

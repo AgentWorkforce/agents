@@ -11,6 +11,8 @@ import {
   deriveReviewDecision,
   evaluateMergeOnGreenState,
   handleSlackMergeRequest,
+  harnessExitCode,
+  isInfraKillExitCode,
   isAuthorizedConflictCommander,
   labelNames,
   matchesConflictDirective,
@@ -20,6 +22,7 @@ import {
   readPr,
   resolveAuthorLogin,
   reviewHarnessPrompt,
+  runReviewHarnessWithRetry,
   reviewAuthorAllowlistDecision,
   rollupFromCheckSummary,
 } from '../.test-build/review/agent.js';
@@ -854,3 +857,68 @@ function readyAnnouncementPr() {
     headSha: '9b1ecb4022bf574885b50376db65a827ddedce3b',
   };
 }
+
+// Exit 137 (128+SIGKILL) is the sandbox OOM-killing the harness on a large
+// checkout; 143 is SIGTERM. Neither is a review verdict, and both wasted the
+// whole run, so one retry is worth it. A real non-zero harness exit must NOT
+// retry: the first pass may already have pushed mechanical fix commits.
+test('runReviewHarnessWithRetry: retries once on an infra kill and succeeds', async () => {
+  const codes = [137, 0];
+  let calls = 0;
+  const retried = [];
+  const outcome = await runReviewHarnessWithRetry(
+    async () => ({ exitCode: codes[calls++], output: 'review body' }),
+    (code) => retried.push(code),
+  );
+  assert.equal(calls, 2);
+  assert.equal(outcome.attempts, 2);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.infraKill, false);
+  assert.deepEqual(retried, [137]);
+  assert.equal(outcome.run.output, 'review body');
+});
+
+test('runReviewHarnessWithRetry: reports an infra kill when the retry is killed too', async () => {
+  let calls = 0;
+  const outcome = await runReviewHarnessWithRetry(async () => {
+    calls += 1;
+    return { exitCode: 143 };
+  });
+  assert.equal(calls, 2);
+  assert.equal(outcome.attempts, 2);
+  assert.equal(outcome.infraKill, true);
+  assert.equal(outcome.exitCode, 143);
+});
+
+test('runReviewHarnessWithRetry: does NOT retry a genuine harness failure', async () => {
+  let calls = 0;
+  const outcome = await runReviewHarnessWithRetry(async () => {
+    calls += 1;
+    return { exitCode: 1 };
+  });
+  assert.equal(calls, 1, 'a real failure must not re-run work that may have pushed commits');
+  assert.equal(outcome.attempts, 1);
+  assert.equal(outcome.infraKill, false);
+});
+
+test('runReviewHarnessWithRetry: does not retry a clean run', async () => {
+  let calls = 0;
+  const outcome = await runReviewHarnessWithRetry(async () => {
+    calls += 1;
+    return { exitCode: 0 };
+  });
+  assert.equal(calls, 1);
+  assert.equal(outcome.attempts, 1);
+  assert.equal(outcome.infraKill, false);
+});
+
+test('harnessExitCode / isInfraKillExitCode classify exit codes', () => {
+  assert.equal(harnessExitCode({ exitCode: 137 }), 137);
+  assert.equal(harnessExitCode({}), null, 'a missing exit code is unknown, not zero');
+  assert.equal(harnessExitCode({ exitCode: 'nope' }), null);
+  assert.equal(isInfraKillExitCode(137), true);
+  assert.equal(isInfraKillExitCode(143), true);
+  assert.equal(isInfraKillExitCode(1), false);
+  assert.equal(isInfraKillExitCode(0), false);
+  assert.equal(isInfraKillExitCode(null), false);
+});

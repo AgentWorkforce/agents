@@ -330,14 +330,178 @@ export function labelNames(labels: unknown): string[] {
     .filter(Boolean);
 }
 
-async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
-  const run = await ctx.harness.run({
-    cwd: ctx.sandbox.cwd,
-    prompt: reviewHarnessPrompt(pr)
-  });
+/**
+ * Exit codes that mean the OS killed the harness, not that the review failed.
+ *
+ * 137 = 128 + SIGKILL, 143 = 128 + SIGTERM. In practice 137 is the sandbox
+ * running out of memory on a large checkout: the kernel OOM killer takes the
+ * biggest process (the harness) while the sandbox itself survives. Nothing
+ * about the PR caused it and nothing in the PR can fix it, so this is treated
+ * as transient infrastructure rather than a review verdict.
+ *
+ * The durable fix is sandbox sizing (AgentWorkforce/cloud#1988 — Daytona boxes
+ * are created at the provider default with no way to request more memory).
+ * Until that lands, one retry rescues the runs that were merely unlucky.
+ */
+const INFRA_KILL_EXIT_CODES = new Set([137, 143]);
 
-  const exitCode = (run as { exitCode?: unknown }).exitCode;
-  if (typeof exitCode === 'number' && exitCode !== 0) {
+export function harnessExitCode(run: unknown): number | null {
+  const value = (run as { exitCode?: unknown }).exitCode;
+  return typeof value === 'number' ? value : null;
+}
+
+export function isInfraKillExitCode(exitCode: number | null): boolean {
+  return exitCode !== null && INFRA_KILL_EXIT_CODES.has(exitCode);
+}
+
+export interface HarnessAttemptOutcome<T> {
+  run: T;
+  exitCode: number | null;
+  attempts: number;
+  infraKill: boolean;
+}
+
+/**
+ * Run the harness, retrying ONCE and only when the OS killed it.
+ *
+ * Side-effect free by construction (the caller supplies the runner and the
+ * logger) so the retry policy is testable without a sandbox, GitHub, or Slack.
+ *
+ * A non-zero exit from the harness itself is a real failure and is never
+ * retried: the first pass may already have pushed mechanical fix commits, so
+ * re-running is not free. Only 137/143 — where no review work was completed
+ * because the process was killed outright — earns a second attempt.
+ */
+export async function runReviewHarnessWithRetry<T>(
+  runHarness: () => Promise<T>,
+  hooks: {
+    onRetry?: (exitCode: number) => void;
+    /**
+     * Invoked once with the FINAL attempt when the harness ends non-zero.
+     * Owned by this function rather than the caller so the diagnostics capture
+     * cannot be silently dropped from the failure path — the run that
+     * prompted this had no captured cause at all.
+     */
+    onFailure?: (run: T, exitCode: number) => void;
+  } = {},
+): Promise<HarnessAttemptOutcome<T>> {
+  let run = await runHarness();
+  let exitCode = harnessExitCode(run);
+  let attempts = 1;
+
+  if (isInfraKillExitCode(exitCode)) {
+    hooks.onRetry?.(exitCode as number);
+    run = await runHarness();
+    exitCode = harnessExitCode(run);
+    attempts = 2;
+  }
+
+  if (exitCode !== null && exitCode !== 0) {
+    hooks.onFailure?.(run, exitCode);
+  }
+
+  return { run, exitCode, attempts, infraKill: isInfraKillExitCode(exitCode) };
+}
+
+/**
+ * Memory budget for everything the harness spawns, sized against the sandbox.
+ *
+ * The Daytona snapshot bakes `{ cpu: 4, memory: 8, disk: 10 }` and 8 GiB is
+ * Daytona's hard per-sandbox maximum — a bake above it is rejected outright
+ * (see cloud/scripts/create-snapshot.ts), so this cannot be solved by asking
+ * for a bigger box.
+ *
+ * The review prompt tells the harness to install dependencies and run the
+ * repo's full build/test/typecheck. On a large monorepo that is the real
+ * memory consumer, not the checkout: `tsc` alone takes multiple GiB, and a
+ * test runner defaulting to one worker per core multiplies it by four.
+ *
+ * The arithmetic: 8 GiB total, ~1.5 GiB reserved for the harness process, the
+ * mount sidecar and the OS, leaving ~6.5 GiB. Held to ONE worker, a single
+ * 4 GiB V8 heap fits with headroom.
+ *
+ * The cap must sit BELOW the cgroup limit, which is the whole point. When V8
+ * hits its own ceiling it throws "JavaScript heap out of memory" with a stack
+ * — diagnosable, attributable, and visible in the harness output. When the
+ * cgroup hits its ceiling first the kernel sends SIGKILL, which is how this
+ * surfaced as a bare exit 137 with no captured cause at all.
+ */
+export const HARNESS_RESOURCE_ENV: Record<string, string> = {
+  NODE_OPTIONS: '--max-old-space-size=4096',
+  // Serial execution across the runners a JS repo is likely to use. Each is
+  // ignored by repos that don't use that tool, so this is additive, not a
+  // requirement that any of them be present.
+  VITEST_MAX_THREADS: '1',
+  VITEST_MIN_THREADS: '1',
+  TURBO_CONCURRENCY: '1',
+  JEST_MAX_WORKERS: '1',
+};
+
+/** Keep the tail: a heap-exhaustion stack lands at the END of the output. */
+export function harnessOutputTail(value: unknown, limit = 4000): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length <= limit ? trimmed : trimmed.slice(-limit);
+}
+
+/**
+ * Record what the harness actually produced before it died.
+ *
+ * A customer's run failed with a bare "exited with code 137" and we could not
+ * say why: the agent logged only the exit code, so the sandbox row had 0 bytes
+ * of stderr and no harness output at all. HarnessRunResult already carries
+ * `output`, `stderr` and `durationMs` — nothing new has to be plumbed, the
+ * failure path simply never read them.
+ *
+ * Tails rather than heads, because the interesting part of an OOM (the
+ * "JavaScript heap out of memory" line and its stack) is the last thing
+ * written. Emitted before the PR comment so the evidence is recorded even if
+ * the GitHub write then fails.
+ */
+export function logHarnessFailureDiagnostics(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  run: unknown,
+  exitCode: number,
+): void {
+  const result = run as { output?: unknown; stderr?: unknown; durationMs?: unknown; usage?: unknown };
+  ctx.log?.('error', 'pr-reviewer harness diagnostics', {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    exitCode,
+    infraKill: isInfraKillExitCode(exitCode),
+    durationMs: typeof result.durationMs === 'number' ? result.durationMs : undefined,
+    stderrTail: harnessOutputTail(result.stderr),
+    outputTail: harnessOutputTail(result.output),
+    usage: result.usage ?? undefined,
+  });
+}
+
+async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
+  const { run, exitCode, infraKill } = await runReviewHarnessWithRetry(
+    () => ctx.harness.run({
+      cwd: ctx.sandbox.cwd,
+      prompt: reviewHarnessPrompt(pr),
+      env: HARNESS_RESOURCE_ENV,
+    }),
+    {
+      onRetry: (killedWith) => ctx.log?.('warn', 'pr-reviewer harness killed; retrying once', {
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+        exitCode: killedWith,
+      }),
+      onFailure: (failed, failedExitCode) =>
+        logHarnessFailureDiagnostics(ctx, pr, failed, failedExitCode),
+    },
+  );
+
+  if (infraKill) {
+    await abandonReviewRunToInfraKill(ctx, pr, exitCode as number);
+  }
+  if (exitCode !== null && exitCode !== 0) {
     await failReviewRun(ctx, pr, `The review harness exited with code ${exitCode}.`);
   }
 
@@ -542,6 +706,9 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `Verify every edit before you finish, and verify it the way CI does — not just the unit test next to the file.`,
     `Run the repo's canonical build and test command end to end (read package.json / turbo.json / the CI workflow to`,
     `find what CI actually runs, focusing only on build/test/typecheck steps; install dependencies if needed) so you catch breakage DOWNSTREAM of the file you`,
+    `The sandbox is memory-constrained, so run those steps SERIALLY: do not raise worker/concurrency counts, and`,
+    `prefer a tool's single-worker flag (e.g. --maxWorkers=1, --concurrency=1) when it has one. A build or test run`,
+    `that is killed outright verifies nothing, so a slower serial run is strictly better than a parallel one that dies.`,
     `edited. In a monorepo, editing one source file can break a generated/committed artifact (a catalog, lockfile,`,
     `snapshot, or generated types) or a different package that imports it: when a finding makes you touch a source`,
     `that feeds a generated file, regenerate that file with the repo's own generator and rebuild the packages that`,
@@ -1008,6 +1175,37 @@ function describeNotReadyState(state: PullRequestReadyState): string {
   const stateText = record.state ?? record.status ?? 'missing';
   const conclusionText = record.conclusion ?? 'missing';
   return `check=${String(name)} state=${String(stateText)} conclusion=${String(conclusionText)}`;
+}
+
+/**
+ * Give up on a run the OS killed twice.
+ *
+ * Deliberately NOT failReviewRun: that tells the PR author "this needs
+ * operator attention", which reads as though something in their PR needs
+ * fixing and leaves them asking whether the problem is on their side. An OOM
+ * is ours. Say so plainly on the PR, skip the Slack failure ping (an infra
+ * kill is not an actionable review result), and still throw so the run is
+ * recorded as failed and reaches our own alerting.
+ */
+async function abandonReviewRunToInfraKill(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  exitCode: number
+): Promise<never> {
+  const message = [
+    `pr-reviewer could not review #${pr.number} — the review sandbox ran out of resources (exit ${exitCode}).`,
+    '',
+    'This is an infrastructure limit on our side, not a problem with this PR, and there is nothing to fix here. The review runs again on the next push.',
+  ].join('\n');
+  ctx.log?.('error', 'pr-reviewer harness killed by infrastructure', {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    exitCode,
+    retried: true,
+  });
+  await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, message);
+  throw new Error(message);
 }
 
 async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<never> {

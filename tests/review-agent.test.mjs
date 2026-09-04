@@ -7,6 +7,7 @@ import {
   announceReadyOnce,
   commentBody,
   commenterLogin,
+  attributeCiFailure,
   conflictResolveHarnessPrompt,
   deriveReviewDecision,
   evaluateMergeOnGreenState,
@@ -454,12 +455,15 @@ test('reviewHarnessPrompt keeps fixes within the PR scope and verifies CI-deep',
   assert.match(prompt, /Stay within this PR's purpose/);
   assert.match(prompt, /use \.workforce\/context\.json for available PR\s+metadata/);
   assert.match(prompt, /record it as an advisory note under a "## Advisory Notes" heading in your review and leave the code unchanged/);
-  // Verification must be CI-deep (full build/test), not just the touched file,
-  // and must regenerate generated/committed artifacts the edit feeds.
-  assert.match(prompt, /verify it the way CI does/);
-  assert.match(prompt, /canonical build and test command end to end/);
-  assert.match(prompt, /regenerate that file with the repo's own generator/);
-  assert.match(prompt, /the working tree must pass the full command with your edits in place/);
+  // Verification moved to the repo's own CI, so the guarantee is no longer
+  // "the build passed here" but "the agent did not edit what it cannot see".
+  // Generated artifacts and cross-package importers are the blast radius that
+  // used to be caught by the full build, so they must now be named explicitly
+  // as suggest-don't-edit territory.
+  assert.match(prompt, /Verification is delegated to the repo's own/);
+  assert.doesNotMatch(prompt, /canonical build and test command end to end/);
+  assert.match(prompt, /generated\/committed artifact/);
+  assert.match(prompt, /raise them as suggestions rather than editing blind/);
   // Anti-hollow guard: don't make a check pass by gutting the test.
   assert.match(prompt, /Never make a check pass by weakening the test/);
   assert.match(prompt, /worse than no test/);
@@ -926,17 +930,22 @@ test('harnessExitCode / isInfraKillExitCode classify exit codes', () => {
   assert.equal(isInfraKillExitCode(null), false);
 });
 
-// The sandbox is capped at Daytona's 8 GiB per-sandbox maximum and the review
-// prompt runs the repo's full install/build/test. Serial execution under a V8
-// heap cap BELOW the cgroup limit is what turns an unattributable SIGKILL into
-// a "JavaScript heap out of memory" we can actually read.
-test('reviewHarnessPrompt tells the harness to run build/test serially', () => {
+// Verification is delegated to the repo's own CI. Nothing is installed, built
+// or tested in the sandbox — that work is what exhausted an 8 GiB box on a
+// large repo, and the repo's CI is sized for the repo in a way ours cannot be.
+test('reviewHarnessPrompt delegates verification to CI and narrows what may be edited', () => {
   const prompt = reviewHarnessPrompt({ owner: 'wepost-no', repo: 'wepost-saga', number: 5020 });
-  assert.match(prompt, /memory-constrained, so run those steps SERIALLY/);
-  assert.match(prompt, /do not raise worker\/concurrency counts/);
-  // The serial instruction is worthless if it does not survive alongside the
-  // CI-deep verification requirement it constrains.
-  assert.match(prompt, /Run the repo's canonical build and test command end to end/);
+  // No install/build/test in the sandbox: that was the OOM, and the repo's own
+  // CI is sized for the repo in a way our box can never be.
+  assert.match(prompt, /Do NOT install dependencies, build the repo, or run its test suite/);
+  assert.doesNotMatch(prompt, /Run the repo's canonical build and test command end to end/);
+
+  // Delegating verification must NARROW what the agent edits, not widen it —
+  // otherwise this is just unverified pushing, which broke three PRs in a day
+  // the last time it happened.
+  assert.match(prompt, /justify it\s+by READING the code/);
+  assert.match(prompt, /would require a build or test run.*do NOT make it/s);
+  assert.match(prompt, /a\s+guess pushed to someone's PR is worse than a comment/);
 });
 
 test('harnessOutputTail keeps the END of the output and drops empties', () => {
@@ -1021,4 +1030,56 @@ test('runReviewHarnessWithRetry: reports the FINAL failed attempt for diagnostic
     { onFailure: (run, code) => clean.push(code) },
   );
   assert.deepEqual(clean, [], 'a clean run reports no failure');
+});
+
+// Verification now happens in the repo's CI, so the agent learns about its own
+// breakage from a red check. That is only actionable if it can tell its own
+// regression from a failure that was already there.
+test('attributeCiFailure: no edits from us means it cannot be ours', () => {
+  assert.equal(attributeCiFailure({
+    priorCiFailing: false, priorHeadSha: 'a', currentHeadSha: 'b', leftEdits: false,
+  }), 'pre-existing');
+});
+
+test('attributeCiFailure: already red before we touched it is pre-existing', () => {
+  assert.equal(attributeCiFailure({
+    priorCiFailing: true, priorHeadSha: 'a', currentHeadSha: 'b', leftEdits: true,
+  }), 'pre-existing');
+});
+
+test('attributeCiFailure: green before, head moved after our edits, is ours', () => {
+  assert.equal(attributeCiFailure({
+    priorCiFailing: false, priorHeadSha: 'a', currentHeadSha: 'b', leftEdits: true,
+  }), 'ours');
+});
+
+test('attributeCiFailure: unknown when we never observed CI, or the head never moved', () => {
+  // Never observed: claiming either way would be a guess.
+  assert.equal(attributeCiFailure({
+    priorCiFailing: null, priorHeadSha: null, currentHeadSha: 'b', leftEdits: true,
+  }), 'unknown');
+  // Head unchanged: our edits were never pushed, so this red is not from them.
+  assert.equal(attributeCiFailure({
+    priorCiFailing: false, priorHeadSha: 'a', currentHeadSha: 'a', leftEdits: true,
+  }), 'unknown');
+});
+
+test('reviewHarnessPrompt steers differently on our regression vs a pre-existing one', () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5020 };
+
+  const ours = reviewHarnessPrompt(pr, { failing: true, attribution: 'ours' });
+  assert.match(ours, /treat it as YOUR regression/);
+
+  // A pre-existing red must NOT become the agent's job — silently fixing
+  // unrelated CI is the scope creep the rest of this prompt forbids.
+  const pre = reviewHarnessPrompt(pr, { failing: true, attribution: 'pre-existing' });
+  assert.match(pre, /it is NOT your regression/);
+  assert.doesNotMatch(pre, /treat it as YOUR regression/);
+
+  const unknown = reviewHarnessPrompt(pr, { failing: true, attribution: 'unknown' });
+  assert.match(unknown, /cannot tell whether its own edits caused it/);
+
+  // Green CI adds no attribution noise at all.
+  assert.doesNotMatch(reviewHarnessPrompt(pr, { failing: false, attribution: 'unknown' }), /CI is RED/);
+  assert.doesNotMatch(reviewHarnessPrompt(pr), /CI is RED/);
 });

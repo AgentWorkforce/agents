@@ -12,10 +12,9 @@
  * harness runs. The agent may leave only mechanical fixes there; cloud commits
  * and pushes those edits after the harness exits — no git/gh in the harness.
  *
- * Slack policy: the channel only hears about a PR when it's a human's turn —
- * checks green, every bot/reviewer comment resolved, nothing left for the agent
- * to fix (the agent's READY sentinel). In-progress passes stay silent. The only
- * other pings are operator/terminal signals: a failed harness run and a merge.
+ * Ready signal: the review comment says the PR is a human's turn only when it
+ * genuinely is — checks green, every bot/reviewer comment resolved, nothing left
+ * for the agent to fix (the agent's READY sentinel).
  */
 import {
   defineAgent,
@@ -26,7 +25,7 @@ import {
   type IntegrationClientOptions,
   type WorkforceCtx
 } from '@agentworkforce/runtime';
-import { githubClient, slackClient } from '@relayfile/relay-helpers';
+import { githubClient } from '@relayfile/relay-helpers';
 
 export interface Pr {
   owner: string;
@@ -60,7 +59,6 @@ interface PrMeta {
 const DEFAULT_SKIP_LABEL = 'no-agent-relay-review';
 const MERGE_ON_GREEN_LABEL = 'merge-on-green';
 const AGENT_WORKFORCE_ORG = 'agentworkforce';
-const SLACK_THREAD_TAG = 'pr-reviewer:slack-thread';
 
 // The opt-in directive a commenter posts to ask for merge-conflict resolution.
 // Accepts "@relay fix conflicts" / "@relay-bot resolve conflict" (case- and
@@ -87,23 +85,12 @@ export default defineAgent({
       // Opt-in merge-conflict resolution: a PR-conversation comment carrying the
       // CONFLICT_DIRECTIVE phrase asks the agent to resolve conflict markers.
       { on: 'issue_comment.created' }
-    ],
-    slack: [
-      {
-        on: 'message.created',
-        paths: ['/slack/channels/${SLACK_CHANNEL}/**']
-      }
     ]
   },
   handler: async (ctx, event) => {
   // `event` is narrowed to the declared provider triggers. The provider
   // payload is reached via expand (no synchronous `event.payload` in v4).
   const data = (await event.expand('full')).data;
-
-  if (event.type.startsWith('slack.')) {
-    await handleSlackMergeRequest(ctx, data);
-    return;
-  }
 
   const pr = readPr(data);
 
@@ -342,25 +329,21 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   }
 
   // The harness only writes a review when we explicitly post it. Strip the
-  // READY sentinel (it's the slack/ready signal, not a review-body line) and
-  // post whatever's left as a PR comment via the github VFS.
+  // READY sentinel (it's the ready signal, not a review-body line) and post
+  // whatever's left as a PR comment via the github VFS.
   const raw = (run.output ?? '').trimEnd();
   const harnessReady = lastLine(raw) === 'READY';
-  const body = harnessReady ? stripLastLine(raw).trimEnd() : raw;
-  if (!body) {
+  const review = harnessReady ? stripLastLine(raw).trimEnd() : raw;
+  if (!review) {
     await failReviewRun(ctx, pr, 'The review harness produced no review output.');
   }
-  if (body) {
+  if (review) {
+    // Only call it a human's turn when it actually is: checks green, all
+    // bot/reviewer comments resolved, nothing left for the agent to fix (the
+    // READY sentinel). Every in-progress pass posts the review on its own.
+    const ready = harnessReady && await verifyReadyForHumanReview(ctx, pr);
+    const body = ready ? `${review}\n\n:white_check_mark: This PR is ready for your review.` : review;
     await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
-  }
-  const ready = harnessReady ? await verifyReadyForHumanReview(ctx, pr) : false;
-
-  // Only ping Slack when the PR is actually a human's turn: checks green, all
-  // bot/reviewer comments resolved, nothing left for the agent to fix (the
-  // READY sentinel). Every in-progress pass — opened, new commits, failing CI,
-  // unresolved bot threads — stays silent so the channel isn't a play-by-play.
-  if (ready) {
-    await announceReadyOnce(ctx, pr);
   }
 }
 
@@ -388,119 +371,6 @@ async function resolveConflicts(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   if (body) {
     await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
   }
-}
-
-// Announce "ready for your review" at most once per head commit. Re-reviews
-// fire on many webhooks (a later check completing, a new bot comment) and the
-// PR is no more "ready" than the last time we said so — re-announcing is the
-// duplicate-reminder noise. A genuinely new head SHA (fresh commits that pass)
-// is worth a new note, and postSlackPrUpdate threads it under the PR's first
-// message so the channel stays a single conversation per PR.
-const READY_ANNOUNCED_TAG = 'pr-reviewer:ready-announced';
-
-export async function announceReadyOnce(ctx: WorkforceCtx, pr: Pr, client?: SlackThreadClient): Promise<void> {
-  const channel = input(ctx, 'SLACK_CHANNEL');
-  if (!channel) return;
-  const reservation = pr.headSha ? await reserveReadyAnnouncement(ctx, pr) : undefined;
-  if (pr.headSha && !reservation) return;
-  const who = `<https://github.com/${pr.author}|@${pr.author}>`; // the PR opener
-  try {
-    await postSlackPrUpdate(
-      ctx,
-      pr,
-      `:white_check_mark: ${who} — PR #${pr.number} in *${pr.owner}/${pr.repo}* is ready for your review: ${pr.url}`,
-      client
-    );
-  } catch (error) {
-    if (pr.headSha && reservation && 'id' in reservation && typeof reservation.id === 'string') {
-      await forgetReadyAnnouncementReservation(ctx, pr, reservation.id, 'failed');
-    }
-    throw error;
-  }
-  if (pr.headSha) await rememberReadyAnnounced(ctx, pr);
-}
-
-function readyAnnouncedTags(pr: Pr): string[] {
-  return [
-    READY_ANNOUNCED_TAG,
-    `pr:${pr.owner}/${pr.repo}#${pr.number}`,
-    ...(pr.headSha ? [`head:${pr.headSha}`] : []),
-  ];
-}
-
-async function alreadyAnnouncedReady(ctx: WorkforceCtx, pr: Pr): Promise<boolean> {
-  return (await readyAnnouncementItems(ctx, pr, 'announced')).length > 0;
-}
-
-async function reserveReadyAnnouncement(ctx: WorkforceCtx, pr: Pr): Promise<{ id: string } | {} | undefined> {
-  if (await alreadyAnnouncedReady(ctx, pr)) return undefined;
-  const saved = await rememberReadyAnnouncementReservation(ctx, pr);
-  if (!saved?.id) return {};
-  const [winner] = await readyAnnouncementItems(ctx, pr, 'reservation');
-  if (!winner || winner.id === saved.id) return saved;
-  await forgetReadyAnnouncementReservation(ctx, pr, saved.id, 'cancelled');
-  return undefined;
-}
-
-async function readyAnnouncementItems(ctx: WorkforceCtx, pr: Pr, kind: 'announced' | 'reservation') {
-  const items = await ctx.memory.recall(`pr-reviewer ready announced for ${pr.owner}/${pr.repo}#${pr.number}`, {
-    scope: 'workspace',
-    tags: readyAnnouncedTags(pr),
-    limit: 100,
-  });
-  const parsed = items.flatMap((item) => {
-    try {
-      const content = JSON.parse(item.content) as { headSha?: string; kind?: string; reservationId?: string };
-      return content.headSha === pr.headSha ? [{ item, content }] : [];
-    } catch {
-      return [];
-    }
-  });
-  const inactiveReservationIds = new Set(
-    parsed
-      .filter(({ content }) => content.kind === 'failed' || content.kind === 'cancelled')
-      .map(({ content }) => content.reservationId)
-      .filter((id): id is string => typeof id === 'string' && id.length > 0)
-  );
-  return parsed
-    .filter(({ item, content }) => {
-      try {
-        return content.kind === kind && !inactiveReservationIds.has(item.id);
-      } catch {
-        return false;
-      }
-    })
-    .map(({ item }) => item)
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-}
-
-async function rememberReadyAnnounced(ctx: WorkforceCtx, pr: Pr): Promise<{ id: string } | void> {
-  return await saveReadyAnnouncementMarker(ctx, pr, 'announced');
-}
-
-async function rememberReadyAnnouncementReservation(ctx: WorkforceCtx, pr: Pr): Promise<{ id: string } | void> {
-  return await saveReadyAnnouncementMarker(ctx, pr, 'reservation');
-}
-
-async function forgetReadyAnnouncementReservation(
-  ctx: WorkforceCtx,
-  pr: Pr,
-  reservationId: string,
-  kind: 'failed' | 'cancelled'
-): Promise<{ id: string } | void> {
-  return await saveReadyAnnouncementMarker(ctx, pr, kind, reservationId);
-}
-
-async function saveReadyAnnouncementMarker(
-  ctx: WorkforceCtx,
-  pr: Pr,
-  kind: 'announced' | 'reservation' | 'failed' | 'cancelled',
-  reservationId?: string
-): Promise<{ id: string } | void> {
-  return await ctx.memory.save(JSON.stringify({ headSha: pr.headSha, kind, ...(reservationId ? { reservationId } : {}) }), {
-    scope: 'workspace',
-    tags: readyAnnouncedTags(pr),
-  });
 }
 
 export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: number }): string {
@@ -1023,14 +893,6 @@ async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise
     reason,
   });
   await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, message);
-  const channel = input(ctx, 'SLACK_CHANNEL');
-  if (channel) {
-    await postSlackPrUpdate(
-      ctx,
-      pr,
-      `:warning: pr-reviewer failed for PR #${pr.number} in *${pr.owner}/${pr.repo}*: ${reason}`
-    );
-  }
   throw new Error(message);
 }
 
@@ -1047,212 +909,6 @@ async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   if (!result.merged) {
     throw new Error(`GitHub did not confirm PR #${pr.number} in ${pr.owner}/${pr.repo} was merged.`);
   }
-  const channel = input(ctx, 'SLACK_CHANNEL');
-  if (channel) {
-    await postSlackPrUpdate(ctx, pr, `:tada: Merged PR #${pr.number} in ${pr.owner}/${pr.repo}.`);
-  }
-}
-
-interface SlackMessage {
-  channel: string;
-  ts: string;
-  threadTs?: string;
-  text: string;
-  isBot: boolean;
-  subtype?: string;
-}
-
-interface SlackThreadMemory {
-  channel: string;
-  threadTs: string;
-}
-
-interface SlackThreadClient {
-  post(channel: string, text: string): Promise<{ channel: string; ts: string }>;
-  reply(channel: string, threadTs: string, text: string): Promise<{ channel: string; ts: string }>;
-}
-
-export async function handleSlackMergeRequest(
-  ctx: WorkforceCtx,
-  payload: unknown,
-  client: SlackThreadClient = slackClient({ writebackTimeoutMs: 15_000 }),
-  decide: (ctx: WorkforceCtx, pr: Pr) => Promise<MergeOnGreenDecision> = mergeOnGreenDecision,
-  merge: (ctx: WorkforceCtx, pr: Pr) => Promise<void> = mergePr
-): Promise<void> {
-  const msg = readSlackMessage(payload);
-  if (!msg || msg.isBot || msg.subtype) return;
-  const configuredChannel = input(ctx, 'SLACK_CHANNEL');
-  if (configuredChannel && msg.channel !== configuredChannel) return;
-  const request = parseSlackMergeRequest(msg.text);
-  if (!request) return;
-
-  if (!request.pr) {
-    await replyToSlackMessage(client, msg, 'I can check merge-on-green status, but I need a GitHub pull request URL.');
-    return;
-  }
-
-  try {
-    const decision = await decide(ctx, request.pr);
-    if (decision.outcome === 'ready' && decision.pr) {
-      await merge(ctx, decision.pr);
-      await replyToSlackMessage(
-        client,
-        msg,
-        `Merged ${decision.pr.owner}/${decision.pr.repo}#${decision.pr.number} because checks are green and bot reviews are satisfied.`
-      );
-      return;
-    }
-
-    const reasons = decision.reasons.length > 0 ? decision.reasons : ['merge-on-green gates are not satisfied yet'];
-    await replyToSlackMessage(
-      client,
-      msg,
-      `I cannot merge ${request.pr.owner}/${request.pr.repo}#${request.pr.number} yet: ${reasons.join('; ')}.`
-    );
-  } catch (error) {
-    await replyToSlackMessage(
-      client,
-      msg,
-      `An error occurred while processing the merge request for ${request.pr.owner}/${request.pr.repo}#${request.pr.number}: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-}
-
-function readSlackMessage(payload: unknown): SlackMessage | undefined {
-  const p = payload as {
-    channel?: string;
-    ts?: string;
-    thread_ts?: string;
-    threadTs?: string;
-    text?: string;
-    is_bot?: boolean;
-    isBot?: boolean;
-    bot_id?: string;
-    subtype?: string;
-    message?: {
-      channel?: string;
-      ts?: string;
-      thread_ts?: string;
-      text?: string;
-      is_bot?: boolean;
-      bot_id?: string;
-      subtype?: string;
-    };
-  } | null;
-  const source = p?.message ?? p ?? {};
-  const channel = typeof source?.channel === 'string' ? source.channel : '';
-  const ts = typeof source?.ts === 'string' ? source.ts : '';
-  const text = typeof source?.text === 'string' ? source.text : '';
-  if (!channel || !ts || !text) return undefined;
-  return {
-    channel,
-    ts,
-    threadTs: typeof source.thread_ts === 'string'
-      ? source.thread_ts
-      : typeof p?.threadTs === 'string'
-        ? p.threadTs
-        : undefined,
-    text,
-    isBot: source.is_bot === true || p?.isBot === true || typeof source.bot_id === 'string',
-    subtype: typeof source.subtype === 'string' ? source.subtype : undefined,
-  };
-}
-
-export function parseSlackMergeRequest(text: string): { pr?: Pr } | null {
-  const normalized = text.toLowerCase();
-  if (!mentionsPrReviewer(normalized)) return null;
-  if (!/(merge|ship|land)/.test(normalized)) return null;
-  const pr = parseGithubPullRequestUrl(text);
-  return { ...(pr ? { pr } : {}) };
-}
-
-function mentionsPrReviewer(normalizedText: string): boolean {
-  return /<@[A-Z0-9]+>/i.test(normalizedText) ||
-    normalizedText.includes('pr-reviewer') ||
-    normalizedText.includes('review agent');
-}
-
-function parseGithubPullRequestUrl(text: string): Pr | undefined {
-  const match = text.match(/https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/([1-9]\d*)/i);
-  if (!match) return undefined;
-  return {
-    owner: match[1],
-    repo: match[2],
-    number: Number.parseInt(match[3], 10),
-    url: `https://github.com/${match[1]}/${match[2]}/pull/${match[3]}`,
-    author: 'unknown',
-  };
-}
-
-async function replyToSlackMessage(
-  client: SlackThreadClient,
-  msg: SlackMessage,
-  text: string
-): Promise<void> {
-  await client.reply(msg.channel, msg.threadTs ?? msg.ts, text);
-}
-
-export async function postSlackPrUpdate(
-  ctx: WorkforceCtx,
-  pr: Pr,
-  text: string,
-  client: SlackThreadClient = slackClient({ writebackTimeoutMs: 15_000 })
-): Promise<void> {
-  const channel = input(ctx, 'SLACK_CHANNEL');
-  if (!channel) return;
-
-  const remembered = await recallSlackThread(ctx, pr, channel);
-  if (remembered) {
-    await client.reply(channel, remembered.threadTs, text);
-    return;
-  }
-
-  const posted = await client.post(channel, text);
-  if (posted.ts) {
-    await rememberSlackThread(ctx, pr, { channel, threadTs: posted.ts });
-  } else {
-    ctx.log?.('warn', 'pr-reviewer.slack-thread.no-receipt', {
-      owner: pr.owner,
-      repo: pr.repo,
-      number: pr.number,
-      channel,
-    });
-  }
-}
-
-async function recallSlackThread(ctx: WorkforceCtx, pr: Pr, channel: string): Promise<SlackThreadMemory | undefined> {
-  const [item] = await ctx.memory.recall(slackThreadQuery(pr, channel), {
-    scope: 'workspace',
-    tags: slackThreadTags(pr, channel),
-    limit: 1,
-  });
-  try {
-    const parsed = item ? JSON.parse(item.content) as Partial<SlackThreadMemory> : undefined;
-    return parsed?.channel === channel && parsed.threadTs
-      ? { channel, threadTs: parsed.threadTs }
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function rememberSlackThread(ctx: WorkforceCtx, pr: Pr, thread: SlackThreadMemory): Promise<void> {
-  await ctx.memory.save(JSON.stringify(thread), {
-    scope: 'workspace',
-    tags: slackThreadTags(pr, thread.channel),
-  });
-}
-
-function slackThreadQuery(pr: Pr, channel: string): string {
-  return `Slack thread for PR ${pr.owner}/${pr.repo}#${pr.number} in ${channel}`;
-}
-
-function slackThreadTags(pr: Pr, channel: string): string[] {
-  return [
-    SLACK_THREAD_TAG,
-    `pr:${pr.owner}/${pr.repo}#${pr.number}`,
-    `slack:${channel}`,
-  ];
 }
 
 // ── parsing the github webhook payload ──────────────────────────────────────

@@ -6,14 +6,14 @@
  *     → compare to the version we saw last time (durable memory)
  *     → post any bumps to the team Slack channel
  */
-import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime';
+import { defineAgent, isCronTickEvent, type WorkforceCtx } from '@agentworkforce/runtime';
 import { slackClient } from '@relayfile/relay-helpers';
 
 export default defineAgent({
   // Weekday mornings.
   schedules: [{ name: 'check', cron: '0 8 * * 1-5', tz: 'America/New_York' }],
   handler: async (ctx, event) => {
-  if (event.source !== 'cron') return;
+  if (!isCronTickEvent(event)) return;
 
   const channel = input(ctx, 'SLACK_CHANNEL');
   if (!channel) throw new Error('SLACK_CHANNEL is required');

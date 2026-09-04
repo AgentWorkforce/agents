@@ -4,37 +4,63 @@
   "tags": [
     "discovery"
   ],
-  "description": "Scans Hacker News a few times a day for topics you care about and posts a summary to Slack. Retains the last ~30 days of digests — DM the agent to ask questions about what it has recently posted.",
+  "description": "Scans Front Page, Show HN, and New HN for high-signal agent infrastructure, orchestration, coding-agent, and developer-tooling stories; posts a rich threaded digest to Slack or Telegram and answers follow-up questions with live HN details and top comments.",
   "cloud": true,
   "integrations": {
     "slack": {
+      "optional": true,
+      "enabledByInput": "SLACK_CHANNEL",
       "scope": {
         "paths": "/slack/channels/**"
+      }
+    },
+    "telegram": {
+      "optional": true,
+      "enabledByInput": "TELEGRAM_CHAT",
+      "scope": {
+        "chats": "/telegram/chats/**",
+        "layout": "/telegram/LAYOUT.md"
       }
     }
   },
   "inputs": {
     "TOPICS": {
-      "description": "Comma-separated keywords to watch for (matched against story titles).",
+      "description": "Comma-separated interests added to the built-in agentic relevance profile. Broad terms only count when the title also has agent/software context.",
       "env": "TOPICS",
-      "default": "agents,ai,typescript,developer tools"
+      "default": "AI agents,coding agents,multi-agent,agent orchestration,agent workflows,agent runtime,agent memory,MCP,Claude Code,Codex,Cursor,software factory,developer tooling"
+    },
+    "LOOKBACK_HOURS": {
+      "description": "How far back New HN and Show HN scans should look. The default overlaps the twice-daily cadence so overnight stories are not missed.",
+      "env": "LOOKBACK_HOURS",
+      "default": "24"
+    },
+    "MAX_STORIES": {
+      "description": "Maximum number of fresh, relevance-ranked stories in one digest.",
+      "env": "MAX_STORIES",
+      "default": "8"
     },
     "SLACK_CHANNEL": {
-      "description": "Slack channel id to post the digest to.",
+      "description": "Slack channel id to post the digest to. Leave empty to skip Slack delivery.",
       "env": "SLACK_CHANNEL",
+      "optional": true,
       "picker": {
         "provider": "slack",
         "resource": "channels"
       }
+    },
+    "TELEGRAM_CHAT": {
+      "description": "Telegram chat id to post the digest to (and answer Q&A in). Leave empty to skip Telegram delivery.",
+      "env": "TELEGRAM_CHAT",
+      "optional": true
     }
   },
   "useSubscription": true,
   "harness": "claude",
   "model": "claude-haiku-4-5-20251001",
-  "systemPrompt": "Summarize Hacker News stories into a short, skimmable Slack digest.",
+  "systemPrompt": "You are the Hacker News radar for the Agent Relay team. The team builds agent messaging and coordination, multi-agent orchestration, cloud agent runtimes, sandboxes, coding-agent workflows, memory/context infrastructure, and open-source developer tools. Be selective and concrete: explain why a story matters to builders in that space, avoid generic AI hype, and never invent details beyond the supplied HN metadata or live comments. For chat, distinguish article claims from HN community reactions and link back to the article and HN discussion.",
   "harnessSettings": {
     "reasoning": "low",
-    "timeoutSeconds": 1800
+    "timeoutSeconds": 300
   },
   "relay": {
     "inbox": [
@@ -47,6 +73,24 @@
       "workspace"
     ],
     "ttlDays": 30
+  },
+  "capabilities": {
+    "httpRead": {
+      "allow": [
+        {
+          "method": "GET",
+          "urlGlob": "https://hn.algolia.com/api/v1/search?*"
+        },
+        {
+          "method": "GET",
+          "urlGlob": "https://hn.algolia.com/api/v1/search_by_date?*"
+        },
+        {
+          "method": "GET",
+          "urlGlob": "https://hn.algolia.com/api/v1/items/*"
+        }
+      ]
+    }
   },
   "onEvent": "./agent.ts"
 }

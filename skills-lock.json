@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "creating-cloud-persona": {
+      "source": "agentworkforce/skills",
+      "sourceType": "github",
+      "skillPath": "skills/creating-cloud-persona/SKILL.md",
+      "computedHash": "2019cd25139aef21dcbcbbf98a252447aa6004efb1a49a8b149c9ec43c742977"
+    }
+  }
+}

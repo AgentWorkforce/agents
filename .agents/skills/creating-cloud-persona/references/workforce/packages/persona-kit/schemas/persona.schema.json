@@ -141,6 +141,9 @@
         "skills",
         "harnessSettings"
       ],
+      "additionalProperties": {
+        "description": "Consumer-defined persona fields are forwarded to downstream runtimes unchanged."
+      },
       "description": "A persona describes *what an agent is* — its identity, runtime (harness, model, system prompt), skills, MCP servers, inputs, and which providers it\n*connects* to ( {@link  integrations } ). It does **not** describe when the agent fires: event triggers, cron schedules, and relayfile watch rules live on the agent ( {@link  AgentSpec } , authored via `defineAgent` in `agent.ts`).",
       "allOf": [
         {
@@ -181,6 +184,9 @@
         "source",
         "description"
       ],
+      "additionalProperties": {
+        "description": "Consumer-defined skill metadata is forwarded unchanged."
+      },
       "description": "A skill is a named, reusable capability attached to a persona. `source` points to canonical guidance the persona should apply (e.g. a prpm.dev package URL, an internal runbook, a docs page)."
     },
     "PersonaInputSpec": {
@@ -207,6 +213,9 @@
           "description": "Declares that this input's value is an id chosen from a live list backed by an integration connection (e.g. a Slack user id, a Linear team id). When set, the deploy CLI offers the operator a picker right after the provider's OAuth connect — fetching the options through the cloud and writing the chosen id into this input — instead of making them paste a raw id. Purely an onboarding affordance: the runtime still resolves the value the usual way (explicit value → env → default), so a `picker` can coexist with `env`/`default`/`optional`."
         }
       },
+      "additionalProperties": {
+        "description": "Consumer-defined input metadata is forwarded unchanged."
+      },
       "description": "Prompt-visible runtime input declared by a persona. Inputs are for non-secret run configuration such as output paths, target package names, or mode switches. Launchers resolve each input from explicit values, the process environment, or `default`, then substitute `$NAME` / `${NAME}` in the system prompt before spawning the harness."
     },
     "PersonaInputPicker": {
@@ -225,6 +234,9 @@
         "provider",
         "resource"
       ],
+      "additionalProperties": {
+        "description": "Consumer-defined picker metadata is forwarded unchanged."
+      },
       "description": "How the deploy CLI sources a picker's options for a  {@link  PersonaInputSpec } . `provider` must be one the persona declares under `integrations` (so it is connected before the picker runs). `resource` names what to list from that provider — known values today are `users`, `channels` (Slack), and `teams` (Linear); the value is passed through to the cloud, so new resources don't require a persona-kit release."
     },
     "Harness": {
@@ -275,7 +287,10 @@
       "required": [
         "reasoning",
         "timeoutSeconds"
-      ]
+      ],
+      "additionalProperties": {
+        "description": "Consumer-defined harness settings are forwarded unchanged."
+      }
     },
     "CodexSandboxMode": {
       "type": "string",
@@ -319,7 +334,8 @@
           "required": [
             "type",
             "url"
-          ]
+          ],
+          "additionalProperties": {}
         },
         {
           "type": "object",
@@ -347,7 +363,8 @@
           "required": [
             "type",
             "command"
-          ]
+          ],
+          "additionalProperties": {}
         }
       ],
       "description": "MCP server config, structured to match Claude Code's `--mcp-config` JSON verbatim so the whole object can be passed through untouched. Values inside `headers` / `env` / `args` / `url` / `command` may be literal strings or `$VAR` / `${VAR}` references. Resolution happens in the runner/CLI at spawn time — this package only defines the shape, not the interpolation policy."
@@ -373,6 +390,9 @@
           "$ref": "#/definitions/PermissionMode",
           "description": "Permission mode for the session."
         }
+      },
+      "additionalProperties": {
+        "description": "Consumer-defined permission metadata is forwarded unchanged."
       },
       "description": "Persona-level permission policy for the harness session. Translates to the harness's native allow/deny/mode flags at spawn time. Tool-pattern syntax is passed through verbatim — `\"mcp__posthog\"` to allow every posthog MCP tool, `\"mcp__posthog__projects-get\"` for a specific one, `\"Bash(git *)\"` for a shell pattern. See the target harness's docs for the exact grammar."
     },
@@ -405,6 +425,9 @@
           }
         }
       },
+      "additionalProperties": {
+        "description": "Consumer-defined mount metadata is forwarded unchanged."
+      },
       "description": "Relayfile mount policy for interactive sessions. Patterns use gitignore syntax. `ignoredPatterns` are omitted from the mount entirely; `readonlyPatterns` are copied into the mount but edits do not sync back. Launchers may merge these with project-level `.agentignore` / `.agentreadonly` dotfiles."
     },
     "SidecarMdMode": {
@@ -429,9 +452,18 @@
         "config": {
           "type": "object",
           "additionalProperties": {}
+        },
+        "optional": {
+          "type": "boolean"
+        },
+        "enabledByInput": {
+          "type": "string"
         }
       },
-      "description": "Per-provider **connection** configuration for a RelayFile provider. The map key is the provider slug (`github`, `linear`, `slack`, `notion`, `jira`). `scope` is provider-specific filter metadata (e.g. `{ repo: \"org/repo\" }` for github, `{ database: \"<id>\" }` for notion).\n\nThis declares only *that the persona connects to the provider* and how the connection resolves — **not** which events fire it. Event triggers live on the agent ( {@link  AgentSpec.triggers } ); the deploy CLI requires every provider in `agent.triggers` to also appear here so the connection is set up.\n\n`source` discriminates the cloud-side resolver between `user_integrations` and `workspace_integrations`; defaults to `{ kind: 'deployer_user' }` when omitted so existing personas keep their pre-discriminator behavior.\n\n`config` is a forward-compatible adapter passthrough. Persona-kit validates only that it is an object; provider adapters own the nested schema (for example GitHub materialization policy)."
+      "additionalProperties": {
+        "description": "Consumer-defined connection fields are forwarded to the cloud unchanged."
+      },
+      "description": "Per-provider **connection** configuration for a RelayFile provider. The map key is the provider slug (`github`, `linear`, `slack`, `notion`, `jira`). `scope` is provider-specific filter metadata (e.g. `{ repo: \"org/repo\" }` for github, `{ database: \"<id>\" }` for notion).\n\nThis declares only *that the persona connects to the provider* and how the connection resolves — **not** which events fire it. Event triggers live on the agent ( {@link  AgentSpec.triggers } ); the deploy CLI requires every provider in `agent.triggers` to also appear here so the connection is set up.\n\n`source` discriminates the cloud-side resolver between `user_integrations` and `workspace_integrations`; defaults to `{ kind: 'deployer_user' }` when omitted so existing personas keep their pre-discriminator behavior.\n\n`config` is a forward-compatible adapter passthrough. Persona-kit validates only that it is an object; provider adapters own the nested schema (for example GitHub materialization policy).\n\nOptional integrations are deploy-time choices controlled by persona inputs: set `optional: true` and `enabledByInput: \"SLACK_CHANNEL\"` to include this provider only when that input resolves to a non-empty value. Inactive optional providers are skipped before deploy connects integrations or registers provider triggers."
     },
     "IntegrationSource": {
       "anyOf": [
@@ -445,7 +477,8 @@
           },
           "required": [
             "kind"
-          ]
+          ],
+          "additionalProperties": {}
         },
         {
           "type": "object",
@@ -457,7 +490,8 @@
           },
           "required": [
             "kind"
-          ]
+          ],
+          "additionalProperties": {}
         },
         {
           "type": "object",
@@ -476,7 +510,8 @@
           "required": [
             "kind",
             "name"
-          ]
+          ],
+          "additionalProperties": {}
         }
       ],
       "description": "Discriminator on how the cloud-side integration resolver should look up the connection backing a persona's declared integration:\n\n- `deployer_user` — resolve via `user_integrations` keyed by the deploying   user (the default; matches today's behavior).\n- `workspace` — resolve via the workspace's default `workspace_integrations`   row for this provider.\n- `workspace_service_account` — resolve via a named workspace service   account (e.g. `release-bot`), letting one workspace expose multiple   provider identities.\n\nThe persona-kit only validates the shape; the cloud resolver enforces which sources are actually permitted at deploy time."
@@ -499,6 +534,10 @@
         "pullRequest": {
           "$ref": "#/definitions/CapabilityValue",
           "description": "Legacy alias of `review`."
+        },
+        "httpRead": {
+          "$ref": "#/definitions/PersonaHttpReadCapability",
+          "description": "Declarative local live-read allowlist for GET/HEAD URLs."
         }
       },
       "additionalProperties": {
@@ -529,6 +568,41 @@
           "additionalProperties": {}
         }
       ]
+    },
+    "PersonaHttpReadCapability": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "allow": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PersonaHttpReadRule"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PersonaHttpReadRule": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
+            "GET",
+            "HEAD"
+          ]
+        },
+        "urlGlob": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "urlGlob"
+      ],
+      "additionalProperties": false
     },
     "PersonaMemory": {
       "anyOf": [
@@ -584,6 +658,9 @@
           "description": "Opt into ai-memory recall (the \"how\" + \"why\" retrieval). **Off by default.** When enabled, the persona loads the ai-hist MCP so it can recall its own compacted trajectories (the why) and cross-tool prompt/session history (the how). Object form lets you override the history DB path."
         }
       },
+      "additionalProperties": {
+        "description": "Consumer-defined memory metadata is forwarded unchanged."
+      },
       "description": "Long-form memory configuration. Defaults are applied by the runtime, not the parser — the spec keeps only what the author actually wrote. `enabled` defaults to true when the object form is present."
     },
     "PersonaMemoryScope": {
@@ -606,6 +683,9 @@
           "description": "Run mechanical+markdown compaction on completion. Defaults to true."
         }
       },
+      "additionalProperties": {
+        "description": "Consumer-defined trajectory metadata is forwarded unchanged."
+      },
       "description": "Decision-trajectory recording config (the \"why\"). `enabled` defaults to true in object form, so `{ autoCompact: false }` means \"record, don't compact\". The store root is never per-persona — it's resolved once from `TRAJECTORY_ROOT` (or the cloud default) so the recorder's write-root always matches the ai-hist MCP's read-root."
     },
     "PersonaAiMemoryConfig": {
@@ -618,6 +698,9 @@
           "type": "string",
           "description": "Override the ai-hist history DB path; else `AI_HIST_DB` env / discovery."
         }
+      },
+      "additionalProperties": {
+        "description": "Consumer-defined AI-memory metadata is forwarded unchanged."
       },
       "description": "ai-memory recall config (the \"how\" + \"why\" retrieval via the ai-hist MCP). `enabled` defaults to true in object form."
     },
@@ -661,7 +744,10 @@
           "description": "Default relay workspace (`RELAY_DEFAULT_WORKSPACE`); else env."
         }
       },
-      "description": "Relay (agent-relay / relaycast) participation config. Like {@link PersonaMemoryConfig}, the persona declares **intent** only — the API key and base URL are secrets that come from workforce env (`RELAY_API_KEY`, `RELAY_BASE_URL`). When enabled, launchers inject the relaycast MCP server (see `buildRelaycastMcpServer`) so the persona is a first-class chat participant: it can post to channels, DM, and answer replies — the human-in-the-loop surface a solo persona otherwise lacks."
+      "additionalProperties": {
+        "description": "Consumer-defined relay metadata is forwarded unchanged."
+      },
+      "description": "Relay (agent-relay / relaycast) participation config. Like  {@link  * PersonaMemoryConfig } , the persona declares **intent** only — the API key and base URL are secrets that come from workforce env (`RELAY_API_KEY`, `RELAY_BASE_URL`). When enabled, launchers inject the relaycast MCP server (see `buildRelaycastMcpServer`) so the persona is a first-class chat participant: it can post to channels, DM, and answer replies — the human-in-the-loop surface a solo persona otherwise lacks."
     }
   },
   "$id": "https://agentworkforce.dev/schemas/persona.schema.json"

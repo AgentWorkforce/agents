@@ -11,8 +11,8 @@ A conservative PR reviewer that posts a multi-agent review when a PR opens.
 It may auto-apply only lint, formatting, typo, import-order, and other
 mechanical non-semantic fixes. Logic changes, safety-sensitive code, lifecycle
 or termination paths, and test changes are suggestion/comment-only so a human
-author owns them. It sends a message on Slack when a PR is ready for your
-review or can merge the PR if you approve.
+author owns them. Its review comment says when a PR is ready for your review,
+and it can merge the PR if you approve.
 
 ## Resolving merge conflicts (opt-in)
 

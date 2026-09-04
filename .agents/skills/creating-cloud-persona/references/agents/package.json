@@ -8,21 +8,36 @@
   "scripts": {
     "test": "rm -rf .test-build && tsc --noEmit false --outDir .test-build && node --test tests/*.test.mjs; status=$?; rm -rf .test-build; exit $status",
     "test:review": "node scripts/test.mjs tests/review-agent.test.mjs",
+    "test:hn": "node scripts/test.mjs tests/hn-monitor.test.mjs",
+    "preview:hn": "node scripts/run-hn-platform-preview.mjs",
+    "acceptance:composable-runtime-closure": "node scripts/acceptance/composable-runtime-closure.mjs",
     "typecheck": "tsc --noEmit",
-    "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done"
+    "compile": "for d in */persona.ts; do agentworkforce persona compile \"$d\"; done",
+    "evals": "npm run compile && node scripts/evals/run-evals.mjs",
+    "evals:hn": "node scripts/run-hn-platform-cases.mjs",
+    "evals:live": "npm run compile && node scripts/evals/run-evals.mjs --live --judge"
   },
   "dependencies": {
-    "@agentworkforce/persona-kit": "^3.0.47",
-    "@agentworkforce/runtime": "^3.0.49",
-    "@relayfile/relay-helpers": "0.3.33"
+    "@agentworkforce/compose": "4.1.23",
+    "@agentworkforce/delivery": "4.1.23",
+    "@agentworkforce/persona-kit": "4.1.23",
+    "@agentworkforce/runtime": "4.1.23",
+    "@relayfile/adapter-daytona": "^0.1.1",
+    "@relayfile/relay-helpers": "0.4.6"
   },
   "devDependencies": {
     "@types/node": "^22",
-    "agentworkforce": "^3.0.47",
+    "agentworkforce": "4.1.23",
     "esbuild": "^0.25.12",
+    "tsx": "^4.22.4",
     "typescript": "^5.6.0"
   },
   "overrides": {
+    "@agentworkforce/deploy": "4.1.23",
+    "@agentworkforce/local-surface": "4.1.23",
+    "@agentworkforce/persona-kit": "4.1.23",
+    "@agentworkforce/runtime": "4.1.23",
+    "@relayfile/adapter-linear": "0.3.11",
     "@opentelemetry/otlp-transformer": {
       "protobufjs": "^8.5.0"
     }

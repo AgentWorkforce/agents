@@ -27,7 +27,7 @@ export default definePersona({
   },
 
   // Pure version-diff + post — no model needed.
-  harnessSettings: { reasoning: 'low', timeoutSeconds: 120 },
+  harnessSettings: { reasoning: 'low', timeoutSeconds: 600 },
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 90 },
 
   onEvent: './agent.ts'

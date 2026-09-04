@@ -33,13 +33,8 @@ import {
  * named imports without a static "no matching export" error.
  */
 const RUNTIME_STUB = `
-const hasOwn = Object.prototype.hasOwnProperty;
 function defineAgent(input) {
-  const out = {};
-  if (input && hasOwn.call(input, 'launchedBy')) out.launchedBy = input.launchedBy;
-  if (input && input.triggers) out.triggers = input.triggers;
-  if (input && input.schedules) out.schedules = input.schedules;
-  if (input && input.watch) out.watch = input.watch;
+  const out = input && typeof input === 'object' ? { ...input } : {};
   // Preserve the handler so extraction can confirm a real defineAgent shape
   // (it is never invoked during extraction).
   if (input && typeof input.handler === 'function') out.handler = input.handler;
@@ -124,18 +119,13 @@ export async function extractAgentSpec(onEventPath: string): Promise<ExtractedAg
       );
     }
 
-    const source = def as {
-      launchedBy?: unknown;
-      triggers?: unknown;
-      schedules?: unknown;
-      watch?: unknown;
-    };
-    const raw = {
-      ...(source.launchedBy !== undefined ? { launchedBy: source.launchedBy } : {}),
-      ...(source.triggers !== undefined ? { triggers: source.triggers } : {}),
-      ...(source.schedules !== undefined ? { schedules: source.schedules } : {}),
-      ...(source.watch !== undefined ? { watch: source.watch } : {})
-    };
+    // A split agent module owns every authored top-level field except its
+    // executable handler and runtime brand. Pass the full declarative record
+    // through parseAgentSpec so future cloud-owned fields do not require an
+    // extract-agent allowlist update.
+    const raw = { ...(def as Record<string, unknown>) };
+    delete raw.handler;
+    delete raw.__workforceAgent;
 
     return { agent: parseAgentSpec(raw, `agent "${onEventPath}"`), raw: def };
   } finally {

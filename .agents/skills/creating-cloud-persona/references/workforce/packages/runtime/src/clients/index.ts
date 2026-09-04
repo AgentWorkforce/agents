@@ -1,3 +1,11 @@
+import {
+  writeJsonFile as coreWriteJsonFile,
+  normalizeWritebackStatus,
+  WritebackError,
+  type IntegrationClientOptions,
+  type WritebackResult
+} from '@relayfile/adapter-core/vfs-client';
+
 // Shared VFS-backed transport surface. All provider interactions go through
 // these helpers — no per-provider client code lives in the runtime.
 //
@@ -15,10 +23,13 @@ export {
   readJsonFile,
   readTextFile,
   resolveMountRoot,
-  writeJsonFile,
   RelayfileWritebackError,
+  WritebackError,
+  normalizeWritebackStatus,
   type RelayfileWritebackErrorOptions,
   type IntegrationClientOptions,
+  type NormalizedWritebackState,
+  type NormalizedWritebackStatus,
   type WritebackReceipt,
   type WritebackResult
 } from '@relayfile/adapter-core/vfs-client';
@@ -28,3 +39,21 @@ export {
   type WorkforceIntegrationErrorOptions,
   SandboxNotAvailableError
 } from '../errors.js';
+
+export async function writeJsonFile(
+  client: IntegrationClientOptions,
+  provider: string,
+  operation: string,
+  relayPath: string,
+  body: unknown
+): Promise<WritebackResult> {
+  const result = await coreWriteJsonFile(client, provider, operation, relayPath, body);
+  const normalized = normalizeWritebackStatus(result);
+  if (normalized.state !== 'succeeded') {
+    if (client.writebackTimeoutMs === 0 && normalized.state === 'no_receipt') {
+      return result;
+    }
+    throw new WritebackError(normalized);
+  }
+  return result;
+}

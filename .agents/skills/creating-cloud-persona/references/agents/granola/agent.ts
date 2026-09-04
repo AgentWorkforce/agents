@@ -20,7 +20,7 @@ export default defineAgent({
   handler: async (ctx, event) => {
   // Notes arrive via the Nango sync as storage events (defineAgent narrows
   // `event` to the declared granola trigger, so there's no clock case here).
-  const notePath = readNotePath(event.payload);
+  const notePath = readNotePath((await event.expand('full')).data);
   if (!notePath || !notePath.includes('/granola/notes/')) return; // ignore folders/other writes
 
   const transcript = await readNote(ctx, notePath);

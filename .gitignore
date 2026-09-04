@@ -1,3 +1,4 @@
+.agents/*
 .DS_Store
 node_modules/
 */.workforce/build/

@@ -4,9 +4,12 @@ name: Deploy agent
 # Full setup instructions: docs/SELF-DEPLOY.md
 #
 # Required config (Settings -> Environments -> New environment named "workforce"):
-#   WORKFORCE_WORKSPACE_ID     your workspace id (Environment variable — not
-#                              sensitive; a UUID that identifies the workspace)
-#   WORKFORCE_WORKSPACE_TOKEN  that workspace's token (Environment secret —
+#   WORKFORCE_WORKSPACE_ID     your workspace id — a UUID that identifies the
+#                              workspace, not a credential. Set it as an
+#                              Environment VARIABLE (preferred, stays readable
+#                              in logs) or an Environment SECRET; either is
+#                              read, so an existing secret keeps working.
+#   WORKFORCE_WORKSPACE_TOKEN  that workspace's token (Environment SECRET —
 #                              sensitive; grants write access to the workspace)
 #
 # --- Why `workflow_dispatch` ONLY -------------------------------------------
@@ -73,7 +76,14 @@ jobs:
         with:
           agent: ${{ inputs.agent }}
           dry-run: ${{ inputs.dry-run }}
-          workspace-id: ${{ vars.WORKFORCE_WORKSPACE_ID }}
+          # Accept the id as EITHER an Environment variable or an Environment
+          # secret. It is a UUID, not a credential, so a variable is the right
+          # home and keeps it readable in run logs — but it lived in secrets
+          # before, every existing setup and every fork put it there, and a
+          # workflow that silently reads empty from the other place costs an
+          # operator a failed deploy and a confused hour. `||` takes the first
+          # non-empty, so both work and neither needs migrating.
+          workspace-id: ${{ vars.WORKFORCE_WORKSPACE_ID || secrets.WORKFORCE_WORKSPACE_ID }}
           workspace-token: ${{ secrets.WORKFORCE_WORKSPACE_TOKEN }}
           # Stacked lowest-precedence first; the deploy script lets later lines
           # win. So: AGENT_INPUTS variable = your standing defaults, AGENT_INPUTS

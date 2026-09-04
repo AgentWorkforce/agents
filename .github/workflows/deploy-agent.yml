@@ -51,9 +51,9 @@ on:
       harness-source:
         description: >-
           Which stored credential to use for the agent's harness: managed, byok,
-          oauth, or plan. Leave empty to use the WORKFORCE_DEPLOY_HARNESS_SOURCE
-          Environment variable, or to let the CLI resolve it. Use "oauth" when
-          the harness was connected with a setup token.
+          oauth, or plan. Leave empty to use this workspace's default of "oauth"
+          (its Claude credential was connected with a setup token). Only set
+          this if that ever changes.
         required: false
         type: string
       dry-run:
@@ -91,9 +91,16 @@ jobs:
           # workflow that silently reads empty from the other place costs an
           # operator a failed deploy and a confused hour. `||` takes the first
           # non-empty, so both work and neither needs migrating.
-          # Dispatch box wins, then the Environment variable, then empty (the
-          # CLI resolves it). Same precedence as the other stacked inputs.
-          harness-source: ${{ inputs.harness-source || vars.WORKFORCE_DEPLOY_HARNESS_SOURCE }}
+          # Defaults to `oauth` because this workspace's Claude credential was
+          # connected with a setup token (provider_credentials.auth_type =
+          # oauth_token). The CLI will not guess a source under --no-prompt, so
+          # without a default every deploy fails with "claude credentials are
+          # not connected" on a credential that is present and healthy.
+          #
+          # Still overridable: dispatch box wins, then the
+          # WORKFORCE_DEPLOY_HARNESS_SOURCE Environment variable, then this
+          # default. Change it if this workspace ever moves to managed or byok.
+          harness-source: ${{ inputs.harness-source || vars.WORKFORCE_DEPLOY_HARNESS_SOURCE || 'oauth' }}
           workspace-id: ${{ vars.WORKFORCE_WORKSPACE_ID || secrets.WORKFORCE_WORKSPACE_ID }}
           workspace-token: ${{ secrets.WORKFORCE_WORKSPACE_TOKEN }}
           # Stacked lowest-precedence first; the deploy script lets later lines

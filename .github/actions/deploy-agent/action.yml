@@ -10,7 +10,7 @@ inputs:
     description: Agent name as listed in scripts/deploy/agents.json
     required: true
   workspace-id:
-    description: WORKFORCE_WORKSPACE_ID, from the caller job's environment variables (a UUID; not sensitive)
+    description: WORKFORCE_WORKSPACE_ID, from the caller job's environment variables or secrets (a UUID; not sensitive)
     required: true
   workspace-token:
     description: WORKFORCE_WORKSPACE_TOKEN, from the caller job's environment secrets (sensitive)
@@ -61,9 +61,14 @@ runs:
         [ -n "${WORKFORCE_WORKSPACE_ID//[[:space:]]/}" ] || missing+=(WORKFORCE_WORKSPACE_ID)
         [ -n "${WORKFORCE_WORKSPACE_TOKEN//[[:space:]]/}" ] || missing+=(WORKFORCE_WORKSPACE_TOKEN)
         if [ ${#missing[@]} -ne 0 ]; then
-          echo "::error::${missing[*]} empty. Confirm they exist under Settings ->" \
-               "Environments -> workforce -> Environment secrets, AND that the calling job" \
-               "declares 'environment: workforce' — a job without it silently reads empty" \
+          # Name the right place per value: the id is read from EITHER
+          # Environment variables or Environment secrets, the token only from
+          # secrets. Sending someone to "Environment secrets" for an id they
+          # set as a variable (or vice versa) is how this wastes an hour.
+          echo "::error::${missing[*]} empty. Under Settings -> Environments -> workforce," \
+               "set WORKFORCE_WORKSPACE_ID as an Environment variable (or secret — both are read)" \
+               "and WORKFORCE_WORKSPACE_TOKEN as an Environment secret. Also confirm the calling" \
+               "job declares 'environment: workforce' — a job without it silently reads empty" \
                "strings. See docs/SELF-DEPLOY.md."
           exit 1
         fi

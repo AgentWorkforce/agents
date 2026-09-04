@@ -105,7 +105,9 @@ Then add:
 
 - `WORKFORCE_WORKSPACE_ID` under **Environment variables** (the workspace UUID
   is not sensitive; leaving it in variables keeps it visible in the run summary
-  for debugging).
+  for debugging). If you already have it under **Environment secrets** that
+  keeps working — the workflow reads whichever is set, preferring the variable.
+  Nothing needs migrating.
 - `WORKFORCE_WORKSPACE_TOKEN` under **Environment secrets** (the token is
   sensitive and must never appear in logs).
 

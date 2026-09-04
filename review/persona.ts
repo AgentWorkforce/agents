@@ -29,6 +29,14 @@ export default definePersona({
   integrations: {
     github: {},
     slack: {
+      // Slack is a notification transport, not a requirement: every Slack call
+      // in agent.ts is guarded on SLACK_CHANNEL, and the reviewer's GitHub work
+      // (review, mechanical fixes, merge-on-approve) is unaffected without it.
+      // `optional` + `enabledByInput` let the one-click deploy page finish
+      // without a Slack connection, and make cloud prune the Slack trigger
+      // below when SLACK_CHANNEL is left empty.
+      optional: true,
+      enabledByInput: 'SLACK_CHANNEL',
       // Slack writebacks use bare channel ids while trigger paths can include
       // display labels; keep the whole channels subtree mounted so ready/merge
       // pings and merge-request replies both reach the writeback worker.
@@ -38,7 +46,7 @@ export default definePersona({
 
   inputs: {
     SLACK_CHANNEL: {
-      description: 'Slack channel to post review updates to (the message references the PR author).',
+      description: 'Slack channel to post review updates to (the message references the PR author). Leave empty to skip Slack entirely.',
       env: 'SLACK_CHANNEL',
       optional: true,
       picker: { provider: 'slack', resource: 'channels' }

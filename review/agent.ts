@@ -154,7 +154,22 @@ export default defineAgent({
       ctx.log?.('info', 'pr-reviewer skipped', { owner: pr.owner, repo: pr.repo, number: pr.number, reason: skip.reason });
       return;
     }
-    await reviewAndFix(ctx, pr);
+    const ciFailing = event.type === 'github.check_run.completed' && ciFailed(data);
+    const attribution = ciFailing ? await attributeCurrentCiFailure(ctx, pr) : 'unknown';
+    if (ciFailing) {
+      ctx.log?.('info', 'pr-reviewer ci failure attributed', {
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+        headSha: pr.headSha,
+        attribution,
+      });
+    }
+    await reviewAndFix(ctx, pr, {
+      failing: ciFailing,
+      attribution,
+      ...(ciFailing ? { check: readFailingCheck(data) } : {}),
+    });
   } else if (event.type === 'github.check_run.completed') {
     // GitHub sometimes emits check_run.completed with pull_requests: [] for
     // fork PRs and org-level checks; surface so a "silent no-op" isn't
@@ -479,11 +494,24 @@ export function logHarnessFailureDiagnostics(
   });
 }
 
-async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
+async function reviewAndFix(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  ci: { failing: boolean; attribution: CiFailureAttribution; check?: FailingCheck } =
+    { failing: false, attribution: 'unknown' },
+): Promise<void> {
+  // Recorded BEFORE the harness runs: this is the state our edits are measured
+  // against next time CI reports. `leftEdits` is an upper bound — the agent
+  // cannot see cloud's push outcome, so a pass that changed nothing still
+  // records true. That biases attribution toward blaming ourselves first, which
+  // is the safe direction: investigating our own edit costs a read, while
+  // missing our own regression costs the author a broken PR.
+  await rememberCiObservation(ctx, pr, ciObservationFor(pr, ci));
+
   const { run, exitCode, infraKill } = await runReviewHarnessWithRetry(
     () => ctx.harness.run({
       cwd: ctx.sandbox.cwd,
-      prompt: reviewHarnessPrompt(pr),
+      prompt: reviewHarnessPrompt(pr, ci),
       env: HARNESS_RESOURCE_ENV,
     }),
     {
@@ -667,8 +695,245 @@ async function saveReadyAnnouncementMarker(
   });
 }
 
-export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: number }): string {
+const CI_OBSERVATION_TAG = 'pr-reviewer:ci-observation';
+
+export type CiFailureAttribution = 'pre-existing' | 'ours' | 'unknown';
+
+/**
+ * Decide whether a red check is ours or was already red before we touched the PR.
+ *
+ * Verification is delegated to the repo's CI, so the agent finds out about its
+ * own breakage the same way a human does — a failing check afterwards. That is
+ * only actionable if it can tell "I broke this" from "this was already red",
+ * otherwise it either chases someone else's pre-existing failure forever or
+ * ignores damage it caused.
+ *
+ * The signal is the CI state observed at the head sha BEFORE the pass that left
+ * edits, compared against the head the red check belongs to.
+ *
+ * Deliberately conservative, and it does NOT claim certainty. A human pushing
+ * to the same PR also moves the head, so 'ours' means "our edits are in the
+ * range that could have caused this", not proof. It is used to steer the
+ * harness's attention, never to take a destructive action.
+ */
+export function attributeCiFailure(input: {
+  /** CI state observed before our edits; null when we never observed it. */
+  priorCiFailing: boolean | null;
+  /** Head sha we observed that state at. */
+  priorHeadSha: string | null;
+  /** Head sha the failing check belongs to. */
+  currentHeadSha: string | null;
+  /** Whether the pass that made that observation left edits to be pushed. */
+  leftEdits: boolean;
+  /** Whether we already owned an unfixed regression here. */
+  priorOwnedRegression?: boolean;
+}): CiFailureAttribution {
+  // A regression we already own stays ours until CI is green again. Checked
+  // FIRST: a repair pass records ciFailing:true, so every later check would
+  // otherwise read as pre-existing and hand our own breakage back to the author.
+  if (input.priorOwnedRegression) return 'ours';
+  // We changed nothing, so we cannot have broken it.
+  if (!input.leftEdits) return 'pre-existing';
+  // It was already red before we touched it.
+  if (input.priorCiFailing === true) return 'pre-existing';
+  // Green (or absent) before, and the head has moved since — our edits landed.
+  if (
+    input.priorCiFailing === false &&
+    input.priorHeadSha &&
+    input.currentHeadSha &&
+    input.priorHeadSha !== input.currentHeadSha
+  ) {
+    return 'ours';
+  }
+  return 'unknown';
+}
+
+interface CiObservation {
+  headSha: string | null;
+  ciFailing: boolean;
+  leftEdits: boolean;
+  /**
+   * Whether we already own an unfixed regression on this PR.
+   *
+   * Without this, ownership survives exactly one pass: the pass that repairs an
+   * `ours` failure records `ciFailing: true`, so if the repair does not work the
+   * NEXT failure reads as "already red before us" and the agent is told it is
+   * not responsible — abandoning a regression it caused on the author's branch.
+   * Ownership therefore sticks until CI actually goes green.
+   */
+  ownedRegression?: boolean;
+}
+
+function ciObservationTags(pr: Pr): string[] {
+  return [CI_OBSERVATION_TAG, `repo:${pr.owner}/${pr.repo}`, `pr:${pr.number}`];
+}
+
+/** Record the CI state we saw going in, so a later red check is attributable. */
+export async function rememberCiObservation(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  observation: CiObservation,
+): Promise<void> {
+  await ctx.memory.save(JSON.stringify(observation), {
+    scope: 'workspace',
+    tags: ciObservationTags(pr),
+  });
+}
+
+/** Most recent observation for this PR, or null when we have never seen it. */
+/**
+ * The observation this pass leaves behind for the next one to be judged against.
+ *
+ * Split out so the recorded shape is testable: with it inlined, deleting the
+ * ownership carry-forward left every test green, which is the same blind spot
+ * that let a failure reach an operator with no captured cause.
+ *
+ * `leftEdits` is an upper bound — the agent cannot see cloud's push outcome, so
+ * a pass that changed nothing still records true. That biases attribution
+ * toward blaming ourselves first, which is the safe direction.
+ */
+export function ciObservationFor(
+  pr: Pr,
+  ci: { failing: boolean; attribution: CiFailureAttribution },
+): { headSha: string | null; ciFailing: boolean; leftEdits: boolean; ownedRegression: boolean } {
+  return {
+    headSha: pr.headSha ?? null,
+    ciFailing: ci.failing,
+    leftEdits: true,
+    // Sticky while red, cleared the moment CI is green again. `attribution` is
+    // already sticky (attributeCiFailure checks prior ownership first), so
+    // carrying it forward here is what preserves it across a failed repair.
+    ownedRegression: ci.failing && ci.attribution === 'ours',
+  };
+}
+
+export async function recallCiObservation(
+  ctx: WorkforceCtx,
+  pr: Pr,
+): Promise<CiObservation | null> {
+  const items = await ctx.memory.recall(
+    `pr-reviewer ci observation for ${pr.owner}/${pr.repo}#${pr.number}`,
+    { scope: 'workspace', tags: ciObservationTags(pr), limit: 50 },
+  );
+  const parsed = items
+    .flatMap((item) => {
+      try {
+        const content = JSON.parse(item.content) as Partial<CiObservation>;
+        return typeof content.ciFailing === 'boolean'
+          ? [{ item, content: content as CiObservation }]
+          : [];
+      } catch {
+        return [];
+      }
+    })
+    .sort((a, b) => b.item.createdAt.localeCompare(a.item.createdAt) || b.item.id.localeCompare(a.item.id));
+  return parsed[0]?.content ?? null;
+}
+
+/** Attribution for the red check now on `pr`, from what we recorded earlier. */
+export async function attributeCurrentCiFailure(
+  ctx: WorkforceCtx,
+  pr: Pr,
+): Promise<CiFailureAttribution> {
+  const prior = await recallCiObservation(ctx, pr);
+  return attributeCiFailure({
+    priorCiFailing: prior ? prior.ciFailing : null,
+    priorHeadSha: prior?.headSha ?? null,
+    currentHeadSha: pr.headSha ?? null,
+    leftEdits: prior?.leftEdits ?? false,
+    priorOwnedRegression: prior?.ownedRegression === true,
+  });
+}
+
+export interface FailingCheck {
+  name?: string;
+  conclusion?: string;
+  summary?: string;
+  text?: string;
+  detailsUrl?: string;
+}
+
+/**
+ * Pull the failing check's own diagnostic out of the webhook payload.
+ *
+ * Without this the CI-reaction loop cannot work: the prompt asks the harness to
+ * read the failing check's output, but the harness has no `gh`, cannot run the
+ * build, and is handed only the PR — so it would be told to diagnose a failure
+ * it cannot see. The payload already carries the summary GitHub renders on the
+ * PR, which is the same thing a human reads first.
+ */
+export function readFailingCheck(payload: unknown): FailingCheck | undefined {
+  const run = (payload as { check_run?: {
+    name?: unknown; conclusion?: unknown; details_url?: unknown;
+    output?: { summary?: unknown; text?: unknown };
+  } } | null)?.check_run;
+  if (!run) return undefined;
+  const str = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.trim() ? v.trim() : undefined;
+  const check: FailingCheck = {
+    ...(str(run.name) ? { name: str(run.name) } : {}),
+    ...(str(run.conclusion) ? { conclusion: str(run.conclusion) } : {}),
+    ...(str(run.output?.summary) ? { summary: str(run.output?.summary) } : {}),
+    ...(str(run.output?.text) ? { text: str(run.output?.text) } : {}),
+    ...(str(run.details_url) ? { detailsUrl: str(run.details_url) } : {}),
+  };
+  return Object.keys(check).length > 0 ? check : undefined;
+}
+
+/** Render the failing check for the prompt, bounded so a huge log cannot crowd out the instructions. */
+export function failingCheckGuidance(check: FailingCheck | undefined, limit = 3000): string[] {
+  if (!check) return [];
+  const body = [check.summary, check.text].filter(Boolean).join('\n\n');
+  const trimmed = body.length > limit ? `${body.slice(0, limit)}\n…(truncated)` : body;
   return [
+    `The failing check is ${check.name ?? 'unnamed'}${check.conclusion ? ` (${check.conclusion})` : ''}.`,
+    ...(trimmed ? [`Its reported output follows between the markers.`, `<<<FAILING_CHECK_OUTPUT`, trimmed, `FAILING_CHECK_OUTPUT`] : []),
+    ...(check.detailsUrl ? [`Full log: ${check.detailsUrl} (you cannot open it — work from the output above).`] : []),
+    ...(trimmed ? [] : [`GitHub reported no output for it, so say that rather than inventing a cause.`]),
+  ];
+}
+
+/**
+ * Front-load what we know about a red check.
+ *
+ * Verification now happens in the repo's CI, so a failing check is how the
+ * agent learns about its own breakage. Telling it whose failure this likely is
+ * changes what it should do: its own regression is the first thing to fix,
+ * while a pre-existing failure it did not cause is not something to chase — and
+ * silently "fixing" unrelated red CI is exactly the scope creep the rest of
+ * this prompt forbids.
+ */
+function ciAttributionGuidance(
+  ci?: { failing: boolean; attribution: CiFailureAttribution },
+): string[] {
+  if (!ci?.failing) return [];
+  if (ci.attribution === 'ours') {
+    return [
+      `CI is RED and it went red after your previous pass edited this PR, so treat it as YOUR regression and the`,
+      `first thing to address. Read the failing check's output, find what your edit broke, and fix it forward — or,`,
+      `if you cannot fix it by reading, revert your own earlier edit and say so in your review.`,
+    ];
+  }
+  if (ci.attribution === 'pre-existing') {
+    return [
+      `CI is RED, but it was already failing before this agent edited the PR, so it is NOT your regression. Do not`,
+      `treat clearing it as your job: fix it only if the fix is mechanical AND in scope for this PR, otherwise report`,
+      `it in your review and leave it. Chasing someone else's failing check is how an unrelated change gets folded in.`,
+    ];
+  }
+  return [
+    `CI is RED and this agent cannot tell whether its own edits caused it. Read the failing output before assuming`,
+    `either way, and say which you concluded in your review.`,
+  ];
+}
+
+export function reviewHarnessPrompt(
+  pr: { owner: string; repo: string; number: number },
+  ci?: { failing: boolean; attribution: CiFailureAttribution; check?: FailingCheck },
+): string {
+  return [
+    ...ciAttributionGuidance(ci),
+    ...(ci?.failing ? failingCheckGuidance(ci.check) : []),
     `Review pull request #${pr.number} in ${pr.owner}/${pr.repo}. The PR code is checked out in the current directory.`,
     `Focus on the actual PR changes: read .workforce/pr.diff first, then .workforce/changed-files.txt and .workforce/context.json.`,
     `Use the checked-out repo to trace the impact of this diff across callers, types, tests, config, and related files.`,
@@ -703,19 +968,21 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `already handled by a later commit, or invalid because <reason>). This is how the comment authors and the human`,
     `see that each thread was handled and exactly where, so be specific with the path and line; do not say a comment`,
     `was addressed without pointing to the fix.`,
-    `Verify every edit before you finish, and verify it the way CI does — not just the unit test next to the file.`,
-    `Run the repo's canonical build and test command end to end (read package.json / turbo.json / the CI workflow to`,
-    `find what CI actually runs, focusing only on build/test/typecheck steps; install dependencies if needed) so you catch breakage DOWNSTREAM of the file you`,
-    `The sandbox is memory-constrained, so run those steps SERIALLY: do not raise worker/concurrency counts, and`,
-    `prefer a tool's single-worker flag (e.g. --maxWorkers=1, --concurrency=1) when it has one. A build or test run`,
-    `that is killed outright verifies nothing, so a slower serial run is strictly better than a parallel one that dies.`,
-    `edited. In a monorepo, editing one source file can break a generated/committed artifact (a catalog, lockfile,`,
-    `snapshot, or generated types) or a different package that imports it: when a finding makes you touch a source`,
-    `that feeds a generated file, regenerate that file with the repo's own generator and rebuild the packages that`,
-    `consume it. A green "tests for the file I touched" while the full build/test is red is exactly the failure that`,
-    `ships — the working tree must pass the full command with your edits in place. When you change code that`,
-    `GENERATES commands, scripts, or queries, also execute a sample of the generated output against a throwaway`,
-    `fixture — tests that only assert on the generated string prove nothing about its behavior.`,
+    `Do NOT install dependencies, build the repo, or run its test suite. Verification is delegated to the repo's own`,
+    `CI, which runs on infrastructure sized for this repo — your sandbox is not, and a build that exhausts it`,
+    `verifies nothing while costing the entire review.`,
+    `This makes what you may EDIT narrower, not wider. Leave an edit in the working tree only when you can justify it`,
+    `by READING the code: a typo, a formatting or import-order fix, a lint rule, a rename you have traced to every`,
+    `caller in the checkout. Reading is still your job and the whole checkout is available for it — tracing a diff`,
+    `across callers, types, tests and config is exactly how you justify an edit without running anything.`,
+    `If knowing whether a change is safe would require a build or test run, do NOT make it: describe it in your`,
+    `review as a suggestion instead. CI is the verifier, but an edit you cannot justify by reading is a guess, and a`,
+    `guess pushed to someone's PR is worse than a comment.`,
+    `Be especially careful with changes whose blast radius you cannot see by reading: a generated/committed artifact`,
+    `(a catalog, lockfile, snapshot, or generated types) or a package that imports what you touched. Those are the`,
+    `edits that look mechanical and break a build elsewhere — raise them as suggestions rather than editing blind.`,
+    `When CI comes back red you will be re-invoked with that failure and can fix it forward, so a missed edit costs`,
+    `a round trip; a wrong edit costs someone's PR.`,
     `Never add or modify tests to make your own change pass. If a change needs a new or updated test, that is a`,
     `human decision; describe the needed test in your review and leave the working tree unchanged.`,
     `Never make a check pass by weakening the test: do not delete it, skip it, loosen an assertion, narrow its`,
@@ -724,11 +991,11 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `fix the CODE; only change a test's EXPECTATION when the test encoded the OLD, now-intentionally-changed contract`,
     `and the new expected value is demonstrably correct — and say which in your "## Addressed comments" notes. If you`,
     `cannot make a test genuinely pass, leave the code unfixed and raise it as advisory rather than gutting the test.`,
-    `If you cannot verify an edit (tests cannot run in this sandbox and you cannot make them run), do not leave it`,
-    `in the working tree: discard it with "git restore <file>" — the one exception to the no-git rule, because`,
-    `rewriting a file back from memory is error-prone — delete files you created, and present the proposed change as`,
-    `advisory text in your review instead. Anything left in the working tree is committed and pushed to the PR after`,
-    `you exit — an unverified push is worse than no push.`,
+    `If you cannot justify an edit by reading — you are guessing at its effect, or its blast radius is wider than`,
+    `you can trace — do not leave it in the working tree: discard it with "git restore <file>" — the one exception to the no-git rule,`,
+    `because rewriting a file back from memory is error-prone — delete files you created, and`,
+    `present the proposed change as advisory text in your review instead. Anything left in the working tree is`,
+    `committed and pushed to the PR after you exit — an unjustified push is worse than no push.`,
     `Only end your output with READY on its own last line when the PR genuinely needs a human now — meaning you have`,
     `resolved or addressed every bot and reviewer comment, every required CI check has completed (none are pending`,
     `or in-progress) and all are passing, the PR has no merge conflicts (GitHub reports it as mergeable), and the`,
@@ -1482,7 +1749,7 @@ export function readPr(payload: unknown): Pr | undefined {
       // how a plain issue_comment is told apart from a PR comment.
       pull_request?: unknown;
     };
-    check_run?: { pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string }> };
+    check_run?: { head_sha?: string; pull_requests?: Array<{ number?: number; html_url?: string; head_sha?: string; head?: { sha?: string } }> };
     repository?: { name?: string; owner?: { login?: string } };
     sender?: { login?: string };
   } | null;
@@ -1495,7 +1762,18 @@ export function readPr(payload: unknown): Pr | undefined {
   const repo = p?.repository?.name;
   // Validate `number` is a real integer — it's interpolated into a shell command.
   if (typeof number !== 'number' || !Number.isInteger(number) || !owner || !repo) return undefined;
-  const headSha = p?.pull_request?.head?.sha ?? p?.check_run?.pull_requests?.[0]?.head_sha;
+  // check_run payloads carry the sha in two places and NEITHER is the flat
+  // `pull_requests[0].head_sha` this used to read: GitHub's PullRequestMinimal
+  // nests it as `head.sha`, and `check_run.head_sha` is the commit the check
+  // actually ran against. Reading only the flat field left headSha undefined
+  // for every real check_run event, which silently disabled CI-failure
+  // attribution — it could never observe the head moving. Keep the flat field
+  // for any payload shape that does use it.
+  const checkRunPr = p?.check_run?.pull_requests?.[0];
+  const headSha = p?.pull_request?.head?.sha
+    ?? checkRunPr?.head?.sha
+    ?? checkRunPr?.head_sha
+    ?? p?.check_run?.head_sha;
   // On issue_comment, `issue.user.login` is the PR opener and `sender.login` is
   // the commenter — prefer the opener so the author allowlist gates on the right
   // person; fall back to sender only for PR-shaped payloads without an opener.

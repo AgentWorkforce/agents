@@ -7,7 +7,11 @@ import {
   announceReadyOnce,
   commentBody,
   commenterLogin,
+  attributeCiFailure,
+  ciObservationFor,
   conflictResolveHarnessPrompt,
+  failingCheckGuidance,
+  readFailingCheck,
   deriveReviewDecision,
   evaluateMergeOnGreenState,
   HARNESS_RESOURCE_ENV,
@@ -454,12 +458,15 @@ test('reviewHarnessPrompt keeps fixes within the PR scope and verifies CI-deep',
   assert.match(prompt, /Stay within this PR's purpose/);
   assert.match(prompt, /use \.workforce\/context\.json for available PR\s+metadata/);
   assert.match(prompt, /record it as an advisory note under a "## Advisory Notes" heading in your review and leave the code unchanged/);
-  // Verification must be CI-deep (full build/test), not just the touched file,
-  // and must regenerate generated/committed artifacts the edit feeds.
-  assert.match(prompt, /verify it the way CI does/);
-  assert.match(prompt, /canonical build and test command end to end/);
-  assert.match(prompt, /regenerate that file with the repo's own generator/);
-  assert.match(prompt, /the working tree must pass the full command with your edits in place/);
+  // Verification moved to the repo's own CI, so the guarantee is no longer
+  // "the build passed here" but "the agent did not edit what it cannot see".
+  // Generated artifacts and cross-package importers are the blast radius that
+  // used to be caught by the full build, so they must now be named explicitly
+  // as suggest-don't-edit territory.
+  assert.match(prompt, /Verification is delegated to the repo's own/);
+  assert.doesNotMatch(prompt, /canonical build and test command end to end/);
+  assert.match(prompt, /generated\/committed artifact/);
+  assert.match(prompt, /raise them as suggestions rather than editing blind/);
   // Anti-hollow guard: don't make a check pass by gutting the test.
   assert.match(prompt, /Never make a check pass by weakening the test/);
   assert.match(prompt, /worse than no test/);
@@ -926,17 +933,22 @@ test('harnessExitCode / isInfraKillExitCode classify exit codes', () => {
   assert.equal(isInfraKillExitCode(null), false);
 });
 
-// The sandbox is capped at Daytona's 8 GiB per-sandbox maximum and the review
-// prompt runs the repo's full install/build/test. Serial execution under a V8
-// heap cap BELOW the cgroup limit is what turns an unattributable SIGKILL into
-// a "JavaScript heap out of memory" we can actually read.
-test('reviewHarnessPrompt tells the harness to run build/test serially', () => {
+// Verification is delegated to the repo's own CI. Nothing is installed, built
+// or tested in the sandbox — that work is what exhausted an 8 GiB box on a
+// large repo, and the repo's CI is sized for the repo in a way ours cannot be.
+test('reviewHarnessPrompt delegates verification to CI and narrows what may be edited', () => {
   const prompt = reviewHarnessPrompt({ owner: 'wepost-no', repo: 'wepost-saga', number: 5020 });
-  assert.match(prompt, /memory-constrained, so run those steps SERIALLY/);
-  assert.match(prompt, /do not raise worker\/concurrency counts/);
-  // The serial instruction is worthless if it does not survive alongside the
-  // CI-deep verification requirement it constrains.
-  assert.match(prompt, /Run the repo's canonical build and test command end to end/);
+  // No install/build/test in the sandbox: that was the OOM, and the repo's own
+  // CI is sized for the repo in a way our box can never be.
+  assert.match(prompt, /Do NOT install dependencies, build the repo, or run its test suite/);
+  assert.doesNotMatch(prompt, /Run the repo's canonical build and test command end to end/);
+
+  // Delegating verification must NARROW what the agent edits, not widen it —
+  // otherwise this is just unverified pushing, which broke three PRs in a day
+  // the last time it happened.
+  assert.match(prompt, /justify it\s+by READING the code/);
+  assert.match(prompt, /would require a build or test run.*do NOT make it/s);
+  assert.match(prompt, /a\s+guess pushed to someone's PR is worse than a comment/);
 });
 
 test('harnessOutputTail keeps the END of the output and drops empties', () => {
@@ -1021,4 +1033,167 @@ test('runReviewHarnessWithRetry: reports the FINAL failed attempt for diagnostic
     { onFailure: (run, code) => clean.push(code) },
   );
   assert.deepEqual(clean, [], 'a clean run reports no failure');
+});
+
+// Verification now happens in the repo's CI, so the agent learns about its own
+// breakage from a red check. That is only actionable if it can tell its own
+// regression from a failure that was already there.
+test('attributeCiFailure: no edits from us means it cannot be ours', () => {
+  assert.equal(attributeCiFailure({
+    priorCiFailing: false, priorHeadSha: 'a', currentHeadSha: 'b', leftEdits: false,
+  }), 'pre-existing');
+});
+
+test('attributeCiFailure: already red before we touched it is pre-existing', () => {
+  assert.equal(attributeCiFailure({
+    priorCiFailing: true, priorHeadSha: 'a', currentHeadSha: 'b', leftEdits: true,
+  }), 'pre-existing');
+});
+
+test('attributeCiFailure: green before, head moved after our edits, is ours', () => {
+  assert.equal(attributeCiFailure({
+    priorCiFailing: false, priorHeadSha: 'a', currentHeadSha: 'b', leftEdits: true,
+  }), 'ours');
+});
+
+test('attributeCiFailure: unknown when we never observed CI, or the head never moved', () => {
+  // Never observed: claiming either way would be a guess.
+  assert.equal(attributeCiFailure({
+    priorCiFailing: null, priorHeadSha: null, currentHeadSha: 'b', leftEdits: true,
+  }), 'unknown');
+  // Head unchanged: our edits were never pushed, so this red is not from them.
+  assert.equal(attributeCiFailure({
+    priorCiFailing: false, priorHeadSha: 'a', currentHeadSha: 'a', leftEdits: true,
+  }), 'unknown');
+});
+
+test('reviewHarnessPrompt steers differently on our regression vs a pre-existing one', () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5020 };
+
+  const ours = reviewHarnessPrompt(pr, { failing: true, attribution: 'ours' });
+  assert.match(ours, /treat it as YOUR regression/);
+
+  // A pre-existing red must NOT become the agent's job — silently fixing
+  // unrelated CI is the scope creep the rest of this prompt forbids.
+  const pre = reviewHarnessPrompt(pr, { failing: true, attribution: 'pre-existing' });
+  assert.match(pre, /it is NOT your regression/);
+  assert.doesNotMatch(pre, /treat it as YOUR regression/);
+
+  const unknown = reviewHarnessPrompt(pr, { failing: true, attribution: 'unknown' });
+  assert.match(unknown, /cannot tell whether its own edits caused it/);
+
+  // Green CI adds no attribution noise at all.
+  assert.doesNotMatch(reviewHarnessPrompt(pr, { failing: false, attribution: 'unknown' }), /CI is RED/);
+  assert.doesNotMatch(reviewHarnessPrompt(pr), /CI is RED/);
+});
+
+// readPr previously read only check_run.pull_requests[0].head_sha. Real GitHub
+// check_run payloads nest it as head.sha (PullRequestMinimal) and also carry
+// check_run.head_sha, so headSha came back undefined for every production
+// check_run event — and attribution can never say "ours" without a head to
+// compare, which silently disabled the whole CI-ownership path.
+test('readPr reads the head sha GitHub actually sends on check_run', () => {
+  const base = { repository: { name: 'wepost-saga', owner: { login: 'wepost-no' } } };
+
+  const nested = readPr({
+    ...base,
+    check_run: { head_sha: 'sha-from-check', pull_requests: [{ number: 5020, head: { sha: 'sha-from-pr' } }] },
+  });
+  assert.equal(nested?.headSha, 'sha-from-pr', 'the PR entry is more specific than the check');
+
+  // check_run.head_sha alone still resolves.
+  const runOnly = readPr({ ...base, check_run: { head_sha: 'sha-from-check', pull_requests: [{ number: 5020 }] } });
+  assert.equal(runOnly?.headSha, 'sha-from-check');
+
+  // The legacy flat shape keeps working.
+  const flat = readPr({ ...base, check_run: { pull_requests: [{ number: 5020, head_sha: 'sha-flat' }] } });
+  assert.equal(flat?.headSha, 'sha-flat');
+});
+
+// The prompt asks the harness to read the failing check's output, but the
+// harness has no gh, no build and no tests — so the output has to be handed to
+// it or the instruction is unfollowable.
+test('readFailingCheck extracts the diagnostic from the payload', () => {
+  const check = readFailingCheck({
+    check_run: {
+      name: 'typecheck', conclusion: 'failure', details_url: 'https://ci.example/1',
+      output: { summary: 'tsc failed', text: 'src/a.ts(3,1): error TS2322' },
+    },
+  });
+  assert.equal(check?.name, 'typecheck');
+  assert.equal(check?.conclusion, 'failure');
+  assert.match(check?.text, /TS2322/);
+  assert.equal(readFailingCheck({}), undefined);
+  assert.equal(readFailingCheck({ check_run: { name: '   ' } }), undefined, 'blank fields are not a diagnostic');
+});
+
+test('failingCheckGuidance surfaces the output and bounds it', () => {
+  const lines = failingCheckGuidance({ name: 'build', conclusion: 'failure', summary: 'boom', detailsUrl: 'https://ci/x' }).join('\n');
+  assert.match(lines, /The failing check is build \(failure\)/);
+  assert.match(lines, /boom/);
+  assert.match(lines, /you cannot open it/);
+
+  // A huge log must not crowd the instructions out of the prompt.
+  const big = failingCheckGuidance({ name: 'test', summary: 'x'.repeat(9000) }, 100).join('\n');
+  assert.match(big, /truncated/);
+  assert.ok(big.length < 1000);
+
+  // No output at all must be stated, not invented around.
+  assert.match(failingCheckGuidance({ name: 'lint' }).join('\n'), /reported no output/);
+  assert.deepEqual(failingCheckGuidance(undefined), []);
+});
+
+// One unsuccessful fix-forward must not hand our own regression back to the
+// author: the repair pass records ciFailing:true, so without sticky ownership
+// the next failure reads as pre-existing.
+test('attributeCiFailure: ownership survives a failed repair pass', () => {
+  assert.equal(attributeCiFailure({
+    priorCiFailing: true, priorHeadSha: 'b', currentHeadSha: 'c',
+    leftEdits: true, priorOwnedRegression: true,
+  }), 'ours');
+
+  // Sticky even when nothing new was pushed.
+  assert.equal(attributeCiFailure({
+    priorCiFailing: true, priorHeadSha: 'b', currentHeadSha: 'b',
+    leftEdits: false, priorOwnedRegression: true,
+  }), 'ours');
+
+  // Without ownership the same inputs are correctly pre-existing.
+  assert.equal(attributeCiFailure({
+    priorCiFailing: true, priorHeadSha: 'b', currentHeadSha: 'c',
+    leftEdits: true, priorOwnedRegression: false,
+  }), 'pre-existing');
+});
+
+test('reviewHarnessPrompt includes the failing check output when CI is red', () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5020 };
+  const withCheck = reviewHarnessPrompt(pr, {
+    failing: true, attribution: 'ours',
+    check: { name: 'typecheck', summary: 'src/a.ts(3,1): error TS2322' },
+  });
+  assert.match(withCheck, /TS2322/);
+  assert.match(withCheck, /FAILING_CHECK_OUTPUT/);
+
+  // Green CI carries no check block at all.
+  assert.doesNotMatch(reviewHarnessPrompt(pr), /FAILING_CHECK_OUTPUT/);
+});
+
+test('ciObservationFor records ownership only while CI is red and ours', () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5020, headSha: 'abc' };
+
+  // Our regression: remembered, so a failed repair does not lose provenance.
+  assert.equal(ciObservationFor(pr, { failing: true, attribution: 'ours' }).ownedRegression, true);
+
+  // Someone else's red is never adopted.
+  assert.equal(ciObservationFor(pr, { failing: true, attribution: 'pre-existing' }).ownedRegression, false);
+  assert.equal(ciObservationFor(pr, { failing: true, attribution: 'unknown' }).ownedRegression, false);
+
+  // Green clears ownership — this is the only thing that does.
+  assert.equal(ciObservationFor(pr, { failing: false, attribution: 'ours' }).ownedRegression, false);
+
+  const obs = ciObservationFor(pr, { failing: true, attribution: 'ours' });
+  assert.equal(obs.headSha, 'abc');
+  assert.equal(obs.ciFailing, true);
+  assert.equal(obs.leftEdits, true, 'upper bound: the agent cannot see the push outcome');
+  assert.equal(ciObservationFor({ ...pr, headSha: undefined }, { failing: false, attribution: 'unknown' }).headSha, null);
 });

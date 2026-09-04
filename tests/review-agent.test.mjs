@@ -8,7 +8,10 @@ import {
   commentBody,
   commenterLogin,
   attributeCiFailure,
+  ciObservationFor,
   conflictResolveHarnessPrompt,
+  failingCheckGuidance,
+  readFailingCheck,
   deriveReviewDecision,
   evaluateMergeOnGreenState,
   HARNESS_RESOURCE_ENV,
@@ -1082,4 +1085,115 @@ test('reviewHarnessPrompt steers differently on our regression vs a pre-existing
   // Green CI adds no attribution noise at all.
   assert.doesNotMatch(reviewHarnessPrompt(pr, { failing: false, attribution: 'unknown' }), /CI is RED/);
   assert.doesNotMatch(reviewHarnessPrompt(pr), /CI is RED/);
+});
+
+// readPr previously read only check_run.pull_requests[0].head_sha. Real GitHub
+// check_run payloads nest it as head.sha (PullRequestMinimal) and also carry
+// check_run.head_sha, so headSha came back undefined for every production
+// check_run event — and attribution can never say "ours" without a head to
+// compare, which silently disabled the whole CI-ownership path.
+test('readPr reads the head sha GitHub actually sends on check_run', () => {
+  const base = { repository: { name: 'wepost-saga', owner: { login: 'wepost-no' } } };
+
+  const nested = readPr({
+    ...base,
+    check_run: { head_sha: 'sha-from-check', pull_requests: [{ number: 5020, head: { sha: 'sha-from-pr' } }] },
+  });
+  assert.equal(nested?.headSha, 'sha-from-pr', 'the PR entry is more specific than the check');
+
+  // check_run.head_sha alone still resolves.
+  const runOnly = readPr({ ...base, check_run: { head_sha: 'sha-from-check', pull_requests: [{ number: 5020 }] } });
+  assert.equal(runOnly?.headSha, 'sha-from-check');
+
+  // The legacy flat shape keeps working.
+  const flat = readPr({ ...base, check_run: { pull_requests: [{ number: 5020, head_sha: 'sha-flat' }] } });
+  assert.equal(flat?.headSha, 'sha-flat');
+});
+
+// The prompt asks the harness to read the failing check's output, but the
+// harness has no gh, no build and no tests — so the output has to be handed to
+// it or the instruction is unfollowable.
+test('readFailingCheck extracts the diagnostic from the payload', () => {
+  const check = readFailingCheck({
+    check_run: {
+      name: 'typecheck', conclusion: 'failure', details_url: 'https://ci.example/1',
+      output: { summary: 'tsc failed', text: 'src/a.ts(3,1): error TS2322' },
+    },
+  });
+  assert.equal(check?.name, 'typecheck');
+  assert.equal(check?.conclusion, 'failure');
+  assert.match(check?.text, /TS2322/);
+  assert.equal(readFailingCheck({}), undefined);
+  assert.equal(readFailingCheck({ check_run: { name: '   ' } }), undefined, 'blank fields are not a diagnostic');
+});
+
+test('failingCheckGuidance surfaces the output and bounds it', () => {
+  const lines = failingCheckGuidance({ name: 'build', conclusion: 'failure', summary: 'boom', detailsUrl: 'https://ci/x' }).join('\n');
+  assert.match(lines, /The failing check is build \(failure\)/);
+  assert.match(lines, /boom/);
+  assert.match(lines, /you cannot open it/);
+
+  // A huge log must not crowd the instructions out of the prompt.
+  const big = failingCheckGuidance({ name: 'test', summary: 'x'.repeat(9000) }, 100).join('\n');
+  assert.match(big, /truncated/);
+  assert.ok(big.length < 1000);
+
+  // No output at all must be stated, not invented around.
+  assert.match(failingCheckGuidance({ name: 'lint' }).join('\n'), /reported no output/);
+  assert.deepEqual(failingCheckGuidance(undefined), []);
+});
+
+// One unsuccessful fix-forward must not hand our own regression back to the
+// author: the repair pass records ciFailing:true, so without sticky ownership
+// the next failure reads as pre-existing.
+test('attributeCiFailure: ownership survives a failed repair pass', () => {
+  assert.equal(attributeCiFailure({
+    priorCiFailing: true, priorHeadSha: 'b', currentHeadSha: 'c',
+    leftEdits: true, priorOwnedRegression: true,
+  }), 'ours');
+
+  // Sticky even when nothing new was pushed.
+  assert.equal(attributeCiFailure({
+    priorCiFailing: true, priorHeadSha: 'b', currentHeadSha: 'b',
+    leftEdits: false, priorOwnedRegression: true,
+  }), 'ours');
+
+  // Without ownership the same inputs are correctly pre-existing.
+  assert.equal(attributeCiFailure({
+    priorCiFailing: true, priorHeadSha: 'b', currentHeadSha: 'c',
+    leftEdits: true, priorOwnedRegression: false,
+  }), 'pre-existing');
+});
+
+test('reviewHarnessPrompt includes the failing check output when CI is red', () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5020 };
+  const withCheck = reviewHarnessPrompt(pr, {
+    failing: true, attribution: 'ours',
+    check: { name: 'typecheck', summary: 'src/a.ts(3,1): error TS2322' },
+  });
+  assert.match(withCheck, /TS2322/);
+  assert.match(withCheck, /FAILING_CHECK_OUTPUT/);
+
+  // Green CI carries no check block at all.
+  assert.doesNotMatch(reviewHarnessPrompt(pr), /FAILING_CHECK_OUTPUT/);
+});
+
+test('ciObservationFor records ownership only while CI is red and ours', () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5020, headSha: 'abc' };
+
+  // Our regression: remembered, so a failed repair does not lose provenance.
+  assert.equal(ciObservationFor(pr, { failing: true, attribution: 'ours' }).ownedRegression, true);
+
+  // Someone else's red is never adopted.
+  assert.equal(ciObservationFor(pr, { failing: true, attribution: 'pre-existing' }).ownedRegression, false);
+  assert.equal(ciObservationFor(pr, { failing: true, attribution: 'unknown' }).ownedRegression, false);
+
+  // Green clears ownership — this is the only thing that does.
+  assert.equal(ciObservationFor(pr, { failing: false, attribution: 'ours' }).ownedRegression, false);
+
+  const obs = ciObservationFor(pr, { failing: true, attribution: 'ours' });
+  assert.equal(obs.headSha, 'abc');
+  assert.equal(obs.ciFailing, true);
+  assert.equal(obs.leftEdits, true, 'upper bound: the agent cannot see the push outcome');
+  assert.equal(ciObservationFor({ ...pr, headSha: undefined }, { failing: false, attribution: 'unknown' }).headSha, null);
 });

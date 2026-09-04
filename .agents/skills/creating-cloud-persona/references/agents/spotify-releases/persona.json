@@ -4,23 +4,39 @@
   "tags": [
     "discovery"
   ],
-  "description": "Checks daily for new releases from artists you follow on Spotify and DMs you about them.",
+  "description": "Checks daily for new releases from artists you follow on Spotify and messages you on Slack, Telegram, or both.",
   "cloud": true,
   "integrations": {
     "slack": {
+      "optional": true,
+      "enabledByInput": "SLACK_USER",
       "scope": {
         "paths": "/slack/users/**"
+      }
+    },
+    "telegram": {
+      "optional": true,
+      "enabledByInput": "TELEGRAM_CHAT",
+      "scope": {
+        "chats": "/telegram/chats/**",
+        "layout": "/telegram/LAYOUT.md"
       }
     }
   },
   "inputs": {
     "SLACK_USER": {
-      "description": "Your Slack user id — releases are DMed here.",
+      "description": "Your Slack user id — releases are DMed here. Leave empty to skip Slack delivery.",
       "env": "SLACK_USER",
+      "optional": true,
       "picker": {
         "provider": "slack",
         "resource": "users"
       }
+    },
+    "TELEGRAM_CHAT": {
+      "description": "Telegram chat id — releases are sent here. Leave empty to skip Telegram delivery. No chat picker exists yet; enter the numeric chat id.",
+      "env": "TELEGRAM_CHAT",
+      "optional": true
     },
     "SPOTIFY_TOKEN": {
       "description": "Spotify OAuth token with the user-follow-read scope.",
@@ -29,7 +45,7 @@
   },
   "harnessSettings": {
     "reasoning": "low",
-    "timeoutSeconds": 120
+    "timeoutSeconds": 600
   },
   "memory": {
     "enabled": true,

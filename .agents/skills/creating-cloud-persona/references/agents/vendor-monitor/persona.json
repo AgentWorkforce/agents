@@ -26,7 +26,7 @@
   },
   "harnessSettings": {
     "reasoning": "low",
-    "timeoutSeconds": 120
+    "timeoutSeconds": 600
   },
   "memory": {
     "enabled": true,

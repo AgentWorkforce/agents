@@ -146,24 +146,24 @@ export default defineAgent({
     slack: [{ on: 'app_mention' }]
   },
   handler: async (ctx, event) => {
-    if (event.source === 'github') {
-      const payload = payloadOf(event.payload);
-      if (event.type === 'pull_request.opened') {
+    if (event.type.startsWith('github.')) {
+      const payload = payloadOf((await event.expand('full')).data);
+      if (event.type === 'github.pull_request.opened') {
         await reviewPullRequest(ctx, payload);
         return;
       }
-      if (event.type === 'issue_comment.created' || event.type === 'pull_request_review_comment.created') {
+      if (event.type === 'github.issue_comment.created' || event.type === 'github.pull_request_review_comment.created') {
         await replyToGithubMention(ctx, payload);
         return;
       }
-      if (event.type === 'check_run.completed') {
+      if (event.type === 'github.check_run.completed') {
         await handleFailedCheck(ctx, payload);
         return;
       }
     }
 
-    if (event.source === 'slack' && event.type === 'app_mention') {
-      await replyInSlack(ctx, payloadOf(event.payload));
+    if (event.type === 'slack.app_mention') {
+      await replyInSlack(ctx, payloadOf((await event.expand('full')).data));
     }
   }
 });

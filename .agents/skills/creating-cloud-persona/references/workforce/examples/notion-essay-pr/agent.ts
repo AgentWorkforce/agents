@@ -6,7 +6,7 @@ import {
   writeJsonFile,
   type IntegrationClientOptions,
   type WorkforceCtx,
-  type WorkforceProviderEvent
+  type WorkforceEvent
 } from '@agentworkforce/runtime';
 
 interface NotionPageCreatedPayload {
@@ -32,9 +32,8 @@ function vfsClient(): IntegrationClientOptions {
 export default defineAgent({
   triggers: { notion: [{ on: 'page.created' }] },
   handler: async (ctx, event) => {
-  if (event.source !== 'notion' || event.type !== 'page.created') {
+  if (event.type !== 'notion.page.created') {
     ctx.log('debug', 'notion-essay-pr.ignored', {
-      source: event.source,
       type: event.type
     });
     return;
@@ -43,8 +42,8 @@ export default defineAgent({
   }
 });
 
-async function handleNotionPageCreated(ctx: WorkforceCtx, event: WorkforceProviderEvent): Promise<void> {
-  const payload = readPayload(event.payload);
+async function handleNotionPageCreated(ctx: WorkforceCtx, event: WorkforceEvent): Promise<void> {
+  const payload = readPayload((await event.expand('full')).data);
   const pageId = pageIdFrom(payload);
   const pageTitle = pageTitleFrom(payload, event.summary?.title);
   const pagePath = `/notion/pages/${encodeURIComponent(pageId)}.md`;

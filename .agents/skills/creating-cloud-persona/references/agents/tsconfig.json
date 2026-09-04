@@ -11,6 +11,6 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["*/persona.ts", "*/agent.ts", "workflows/*.ts", "workflows/*.d.ts"],
+  "include": ["*/persona.ts", "*/agent.ts", "*/lib/*.ts", "shared/*.ts", "workflows/*.ts", "workflows/*.d.ts"],
   "exclude": ["node_modules"]
 }

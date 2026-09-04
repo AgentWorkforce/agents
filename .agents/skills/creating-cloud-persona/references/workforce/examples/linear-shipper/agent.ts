@@ -55,11 +55,12 @@ function safeRepoDirName(value: string): string {
 export default defineAgent({
   triggers: { linear: [{ on: 'issue.created' }] },
   handler: async (ctx, event) => {
-  if (event.source !== 'linear' || event.type !== 'issue.created') return;
+  if (event.type !== 'linear.issue.created') return;
 
+  const data = (await event.expand('full')).data;
   const payload =
-    typeof event.payload === 'object' && event.payload !== null
-      ? (event.payload as LinearIssueEvent)
+    typeof data === 'object' && data !== null
+      ? (data as LinearIssueEvent)
       : {};
   const issueRef = payload.issue;
   const issueId = issueRef?.id ?? issueRef?.identifier;

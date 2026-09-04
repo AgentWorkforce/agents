@@ -57,6 +57,8 @@ export interface HarnessSettings {
    * which still prompts.
    */
   dangerouslyBypassApprovalsAndSandbox?: boolean;
+  /** Consumer-defined harness settings are forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -68,6 +70,8 @@ export interface PersonaSkill {
   id: string;
   source: string;
   description: string;
+  /** Consumer-defined skill metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -107,6 +111,8 @@ export interface PersonaInputSpec {
    * coexist with `env`/`default`/`optional`.
    */
   picker?: PersonaInputPicker;
+  /** Consumer-defined input metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -122,6 +128,8 @@ export interface PersonaInputPicker {
   provider: string;
   /** Resource to list from that provider (e.g. `users`, `channels`, `teams`). */
   resource: string;
+  /** Consumer-defined picker metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -138,6 +146,8 @@ export interface PersonaPermissions {
   deny?: string[];
   /** Permission mode for the session. */
   mode?: PermissionMode;
+  /** Consumer-defined permission metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -155,6 +165,8 @@ export interface PersonaMount {
   enabled?: boolean;
   ignoredPatterns?: string[];
   readonlyPatterns?: string[];
+  /** Consumer-defined mount metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -169,12 +181,14 @@ export type McpServerSpec =
       type: 'http' | 'sse';
       url: string;
       headers?: Record<string, string>;
+      [key: string]: unknown;
     }
   | {
       type: 'stdio';
       command: string;
       args?: string[];
       env?: Record<string, string>;
+      [key: string]: unknown;
     };
 
 /**
@@ -194,6 +208,7 @@ export type McpServerSpec =
  *   { on: "pull_request.opened" }
  *   { on: "pull_request_review_comment.created", match: "@mention" }
  *   { on: "check_run.completed", where: "conclusion=failure" }
+ *   { on: "message.created", paths: ["/slack/channels/C_REVIEW/**"] }
  *   { on: "message.created", maxConcurrency: 1 }
  */
 export interface PersonaIntegrationTrigger {
@@ -201,11 +216,18 @@ export interface PersonaIntegrationTrigger {
   match?: string;
   where?: string;
   /**
+   * Optional Relayfile path globs used to scope wake routing before an agent is
+   * provisioned. Paths are absolute (leading `/`) and provider-specific.
+   */
+  paths?: string[];
+  /**
    * Optional delivery backpressure hint for this trigger. Positive integers are
    * preserved by the parser; invalid values are treated as unset so older or
    * malformed specs do not block delivery.
    */
   maxConcurrency?: number;
+  /** Consumer-defined trigger fields are forwarded to the cloud unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -224,9 +246,9 @@ export interface PersonaIntegrationTrigger {
  * which sources are actually permitted at deploy time.
  */
 export type IntegrationSource =
-  | { kind: 'deployer_user' }
-  | { kind: 'workspace' }
-  | { kind: 'workspace_service_account'; name: string };
+  | { kind: 'deployer_user'; [key: string]: unknown }
+  | { kind: 'workspace'; [key: string]: unknown }
+  | { kind: 'workspace_service_account'; name: string; [key: string]: unknown };
 
 /**
  * Per-provider **connection** configuration for a RelayFile provider. The map
@@ -246,11 +268,21 @@ export type IntegrationSource =
  * `config` is a forward-compatible adapter passthrough. Persona-kit validates
  * only that it is an object; provider adapters own the nested schema
  * (for example GitHub materialization policy).
+ *
+ * Optional integrations are deploy-time choices controlled by persona inputs:
+ * set `optional: true` and `enabledByInput: "SLACK_CHANNEL"` to include this
+ * provider only when that input resolves to a non-empty value. Inactive
+ * optional providers are skipped before deploy connects integrations or
+ * registers provider triggers.
  */
 export interface PersonaIntegrationConfig {
   source?: IntegrationSource;
   scope?: Record<string, string>;
   config?: Record<string, unknown>;
+  optional?: boolean;
+  enabledByInput?: string;
+  /** Consumer-defined connection fields are forwarded to the cloud unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -264,6 +296,8 @@ export interface PersonaSchedule {
   name: string;
   cron: string;
   tz?: string;
+  /** Consumer-defined schedule fields are forwarded to the cloud unchanged. */
+  [key: string]: unknown;
 }
 
 export type WatchEvent = 'created' | 'updated' | 'deleted';
@@ -280,6 +314,8 @@ export interface WatchRule {
   events: WatchEvent[];
   debounceMs?: number;
   match?: string;
+  /** Consumer-defined watch fields are forwarded to the cloud unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -312,6 +348,8 @@ export interface AgentSpec {
   schedules?: PersonaSchedule[];
   /** Relayfile-change listeners for proactive cloud agents. */
   watch?: WatchRule[];
+  /** Consumer-defined agent fields are forwarded to the cloud unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -348,6 +386,8 @@ export interface PersonaMemoryConfig {
    * (the how). Object form lets you override the history DB path.
    */
   aiMemory?: boolean | PersonaAiMemoryConfig;
+  /** Consumer-defined memory metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -361,6 +401,8 @@ export interface PersonaTrajectoryConfig {
   enabled?: boolean;
   /** Run mechanical+markdown compaction on completion. Defaults to true. */
   autoCompact?: boolean;
+  /** Consumer-defined trajectory metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 /**
@@ -371,13 +413,15 @@ export interface PersonaAiMemoryConfig {
   enabled?: boolean;
   /** Override the ai-hist history DB path; else `AI_HIST_DB` env / discovery. */
   dbPath?: string;
+  /** Consumer-defined AI-memory metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 export type PersonaMemory = boolean | PersonaMemoryConfig;
 
 /**
- * Relay (agent-relay / relaycast) participation config. Like {@link PersonaMemoryConfig},
- * the persona declares **intent** only — the API key and
+ * Relay (agent-relay / relaycast) participation config. Like {@link
+ * PersonaMemoryConfig}, the persona declares **intent** only — the API key and
  * base URL are secrets that come from workforce env (`RELAY_API_KEY`,
  * `RELAY_BASE_URL`). When enabled, launchers inject the relaycast MCP server
  * (see `buildRelaycastMcpServer`) so the persona is a first-class chat
@@ -405,6 +449,8 @@ export interface PersonaRelayConfig {
   inbox?: string[];
   /** Default relay workspace (`RELAY_DEFAULT_WORKSPACE`); else env. */
   defaultWorkspace?: string;
+  /** Consumer-defined relay metadata is forwarded unchanged. */
+  [key: string]: unknown;
 }
 
 export type PersonaRelay = boolean | PersonaRelayConfig;
@@ -412,6 +458,16 @@ export type PersonaRelay = boolean | PersonaRelayConfig;
 export type CapabilityValue =
   | boolean
   | { enabled?: boolean; [k: string]: unknown };
+
+export interface PersonaHttpReadRule {
+  method: 'GET' | 'HEAD';
+  urlGlob: string;
+}
+
+export type PersonaHttpReadCapability = {
+  enabled?: boolean;
+  allow?: PersonaHttpReadRule[];
+};
 
 /**
  * Portable proactive capability declarations.
@@ -430,6 +486,8 @@ export interface ProactiveCapabilities {
   conflictAutofix?: CapabilityValue;
   /** Legacy alias of `review`. */
   pullRequest?: CapabilityValue;
+  /** Declarative local live-read allowlist for GET/HEAD URLs. */
+  httpRead?: PersonaHttpReadCapability;
   /**
    * Consumer-defined capabilities pass through the parser unchanged. persona-kit
    * is platform-agnostic and must not drop capability keys it does not model
@@ -607,6 +665,8 @@ export interface PersonaSpec {
    * optional so partially-authored specs still parse.
    */
   onEvent?: string;
+  /** Consumer-defined persona fields are forwarded to downstream runtimes unchanged. */
+  [key: string]: unknown;
 }
 
 export interface PersonaSelection {

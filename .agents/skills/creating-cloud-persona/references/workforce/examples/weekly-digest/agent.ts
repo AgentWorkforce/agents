@@ -5,6 +5,7 @@ import {
   resolveMountRoot,
   WorkforceIntegrationError,
   writeJsonFile,
+  isCronTickEvent,
   type IntegrationClientOptions,
   type WorkforceCtx,
   type WorkforceEvent
@@ -25,8 +26,8 @@ interface DigestCluster {
 export default defineAgent({
   schedules: [{ name: 'weekly', cron: '0 9 * * 6', tz: 'UTC' }],
   handler: async (ctx, event) => {
-  if (event.source !== 'cron' || event.name !== 'weekly') {
-    ctx.log('warn', 'weekly-digest.ignored', { source: event.source });
+  if (!isCronTickEvent(event)) {
+    ctx.log('warn', 'weekly-digest.ignored', { reason: 'non-cron event' });
     return;
   }
 

@@ -2,14 +2,14 @@ import { definePersona } from '@agentworkforce/persona-kit';
 
 /**
  * Review Agent — reviews every new PR, applies only mechanical safe fixes,
- * comments on logic/safety findings, pings you on Slack when the PR is ready,
- * and merges it once you approve.
+ * comments on logic/safety findings, says in its review when the PR is ready for
+ * you, and merges it once you approve.
  */
 export default definePersona({
   id: 'pr-reviewer',
   intent: 'review',
   tags: ['review'],
-  description: 'Reviews new PRs, applies only lint/format/typo fixes, comments on logic or safety findings, pings you on Slack when ready, and merges once you approve.',
+  description: 'Reviews new PRs, applies only lint/format/typo fixes, comments on logic or safety findings, flags when the PR is ready for you, and merges once you approve.',
   cloud: true,
 
   // Opt-in, comment-driven merge-conflict resolution. Distinct from cloud's
@@ -27,22 +27,10 @@ export default definePersona({
   },
 
   integrations: {
-    github: {},
-    slack: {
-      // Slack writebacks use bare channel ids while trigger paths can include
-      // display labels; keep the whole channels subtree mounted so ready/merge
-      // pings and merge-request replies both reach the writeback worker.
-      scope: { paths: '/slack/channels/**' }
-    }
+    github: {}
   },
 
   inputs: {
-    SLACK_CHANNEL: {
-      description: 'Slack channel to post review updates to (the message references the PR author).',
-      env: 'SLACK_CHANNEL',
-      optional: true,
-      picker: { provider: 'slack', resource: 'channels' }
-    },
     APPROVERS: {
       description: 'GitHub logins whose approval merges the PR. If unset, any approval merges.',
       env: 'APPROVERS',

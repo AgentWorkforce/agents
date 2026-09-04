@@ -4,8 +4,14 @@
   "tags": [
     "review"
   ],
-  "description": "Reviews new PRs, fixes the issues found (its own + other bots'), resolves failing CI and merge conflicts, pings you on Slack when ready, and merges once you approve.",
+  "description": "Reviews new PRs, applies only lint/format/typo fixes, comments on logic or safety findings, pings you on Slack when ready, and merges once you approve.",
   "cloud": true,
+  "capabilities": {
+    "conflictResolve": {
+      "directive": "@relay fix conflicts",
+      "resolveMarkers": true
+    }
+  },
   "integrations": {
     "github": {},
     "slack": {
@@ -34,7 +40,7 @@
       }
     },
     "REVIEW_AUTHORS": {
-      "description": "Only review and auto-fix PRs opened by these GitHub logins (comma-separated). If unset, every author is reviewed.",
+      "description": "Only review and mechanically auto-fix PRs opened by these GitHub logins (comma-separated). If unset, every author is reviewed.",
       "env": "REVIEW_AUTHORS",
       "optional": true,
       "picker": {
@@ -48,14 +54,14 @@
       "optional": true
     }
   },
-  "harness": "codex",
-  "model": "gpt-5.5",
-  "systemPrompt": "You are a rigorous senior reviewer. Review PRs, fix what you find, keep CI green, and only hand back when the PR is genuinely ready.",
+  "harness": "claude",
+  "model": "claude-opus-4-8",
+  "systemPrompt": "You are a rigorous senior reviewer. Review PRs, auto-apply only lint/format/typo fixes, leave logic and safety changes as comments, keep CI honest, and only hand back when the PR is genuinely ready.",
   "harnessSettings": {
     "reasoning": "high",
-    "timeoutSeconds": 2400,
-    "dangerouslyBypassApprovalsAndSandbox": true
+    "timeoutSeconds": 2400
   },
+  "useSubscription": true,
   "memory": {
     "enabled": true,
     "scopes": [

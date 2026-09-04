@@ -17,7 +17,7 @@ import {
   writeJsonFile,
   type IntegrationClientOptions,
   type WorkforceCtx,
-  type WorkforceProviderEvent
+  type WorkforceEvent
 } from '@agentworkforce/runtime';
 import { githubClient, slackClient } from '@relayfile/relay-helpers';
 
@@ -69,10 +69,9 @@ export default defineAgent({
     ]
   },
   handler: async (ctx, event) => {
-  if (event.source !== 'github') return;
-  if (event.type !== 'pull_request.opened' && event.type !== 'pull_request.synchronize') return;
+  if (event.type !== 'github.pull_request.opened' && event.type !== 'github.pull_request.synchronize') return;
 
-  const pr = readPr(event);
+  const pr = readPr((await event.expand('full')).data);
   if (!pr) return;
 
   const client = vfsClient();
@@ -102,8 +101,8 @@ export default defineAgent({
   }
 });
 
-function readPr(event: WorkforceProviderEvent): PrRef | undefined {
-  const p = event.payload as {
+function readPr(payload: unknown): PrRef | undefined {
+  const p = payload as {
     number?: number;
     pull_request?: {
       number?: number;
@@ -280,7 +279,7 @@ async function writeNotionJournal(
   ctx: WorkforceCtx,
   client: IntegrationClientOptions,
   pr: PrRef,
-  event: WorkforceProviderEvent,
+  event: WorkforceEvent,
   report: HygieneReport,
   prComment: string
 ): Promise<{ id?: string; url?: string }> {
@@ -343,7 +342,7 @@ function chunk(value: string, size: number): string[] {
 async function rememberRun(
   ctx: WorkforceCtx,
   pr: PrRef,
-  event: WorkforceProviderEvent,
+  event: WorkforceEvent,
   report: HygieneReport,
   notionUrl?: string
 ): Promise<void> {

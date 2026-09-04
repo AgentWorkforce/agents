@@ -1,29 +1,37 @@
 import { definePersona } from '@agentworkforce/persona-kit';
 
 /**
- * Review Agent — reviews every new PR, fixes the issues it (and other bots)
- * find, resolves failing CI and merge conflicts, pings you on Slack when the PR
- * is ready, and merges it once you approve.
+ * Review Agent — reviews every new PR, applies only mechanical safe fixes,
+ * comments on logic/safety findings, pings you on Slack when the PR is ready,
+ * and merges it once you approve.
  */
 export default definePersona({
   id: 'pr-reviewer',
   intent: 'review',
   tags: ['review'],
-  description: 'Reviews new PRs, fixes the issues found (its own + other bots\'), resolves failing CI and merge conflicts, pings you on Slack when ready, and merges once you approve.',
+  description: 'Reviews new PRs, applies only lint/format/typo fixes, comments on logic or safety findings, pings you on Slack when ready, and merges once you approve.',
   cloud: true,
+
+  // Opt-in, comment-driven merge-conflict resolution. Distinct from cloud's
+  // deterministic `conflictAutofix` (which only does a clean rebase and aborts
+  // on real textual conflicts): `conflictResolve` is the LLM path — cloud merges
+  // the base branch into the working tree, the harness resolves the conflict
+  // markers (see conflictResolveHarnessPrompt in agent.ts), and cloud finalizes
+  // and pushes the merge commit. It engages ONLY when an authorized commenter
+  // posts the directive (see CONFLICT_DIRECTIVE_PATTERN), never on ordinary PR
+  // events. Inert until cloud models this capability + the merge-in-tree setup
+  // (tracked in AgentWorkforce/cloud): with no merge, the harness finds no
+  // markers and makes no change.
+  capabilities: {
+    conflictResolve: { directive: '@relay fix conflicts', resolveMarkers: true }
+  },
 
   integrations: {
     github: {},
     slack: {
-      // Cloud mounts an integration's relayfile subtree only from `scope`
-      // (or from triggers — and this persona has github triggers only). A
-      // scope-less `slack: {}` mounts nothing, so slackClient().post() wrote
-      // its draft to unmounted local disk and the writeback worker never saw
-      // it: every Slack ping was a silent no-op. The channel is picked at
-      // deploy time (SLACK_CHANNEL input), so the scope can't name one
-      // statically — mount the channels subtree, which covers the
-      // `/slack/channels/{channelId}/messages` writeback path for any picked
-      // channel (and excludes DMs/users).
+      // Slack writebacks use bare channel ids while trigger paths can include
+      // display labels; keep the whole channels subtree mounted so ready/merge
+      // pings and merge-request replies both reach the writeback worker.
       scope: { paths: '/slack/channels/**' }
     }
   },
@@ -42,7 +50,7 @@ export default definePersona({
       picker: { provider: 'github', resource: 'users' }
     },
     REVIEW_AUTHORS: {
-      description: 'Only review and auto-fix PRs opened by these GitHub logins (comma-separated). If unset, every author is reviewed.',
+      description: 'Only review and mechanically auto-fix PRs opened by these GitHub logins (comma-separated). If unset, every author is reviewed.',
       env: 'REVIEW_AUTHORS',
       optional: true,
       picker: { provider: 'github', resource: 'users' }
@@ -54,16 +62,15 @@ export default definePersona({
     }
   },
 
-  harness: 'codex',
-  model: 'gpt-5.5',
-  systemPrompt: 'You are a rigorous senior reviewer. Review PRs, fix what you find, keep CI green, and only hand back when the PR is genuinely ready.',
+  harness: 'claude',
+  model: 'claude-opus-4-8',
+  systemPrompt: 'You are a rigorous senior reviewer. Review PRs, auto-apply only lint/format/typo fixes, leave logic and safety changes as comments, keep CI honest, and only hand back when the PR is genuinely ready.',
   harnessSettings: {
     reasoning: 'high',
     timeoutSeconds: 2400,
-    // Daytona is the trust boundary for cloud fires. Codex's nested
-    // bubblewrap sandbox requires user namespaces that Daytona does not allow.
-    dangerouslyBypassApprovalsAndSandbox: true
   },
+
+  useSubscription: true,
 
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 180 },
 

@@ -70,6 +70,12 @@ export default definePersona({
     }
   },
 
+  // No useSubscription: inference is workforce-billed (Claude per harness/model
+  // below). useSubscription:true would route through your own LLM provider, but
+  // the CLI deploy path doesn't supply a subscription resolver, so it can't deploy.
+  // The failure is misleading — the orchestrator reports "anthropic credentials
+  // are not connected" even for a workspace that HAS Anthropic connected.
+  // Same pattern as hn-monitor (#130) and internal-agents/linear-assistant (ab1f943e22).
   harness: 'claude',
   model: 'claude-opus-4-8',
   systemPrompt: 'You are a rigorous senior reviewer. Review PRs, auto-apply only lint/format/typo fixes, leave logic and safety changes as comments, keep CI honest, and only hand back when the PR is genuinely ready.',
@@ -77,8 +83,6 @@ export default definePersona({
     reasoning: 'high',
     timeoutSeconds: 2400,
   },
-
-  useSubscription: true,
 
   memory: { enabled: true, scopes: ['workspace'], ttlDays: 180 },
 

@@ -63,6 +63,11 @@ export default definePersona({
       optional: true,
       picker: { provider: 'github', resource: 'users' }
     },
+    AUTO_FIX: {
+      description: 'Set to "true" to let the reviewer apply mechanical fixes directly to the PR. Default (unset) is review-only: it proposes every change as a suggestion and never edits files.',
+      env: 'AUTO_FIX',
+      optional: true
+    },
     SKIP_LABELS: {
       description: 'PR labels that disable the reviewer entirely (comma-separated). Defaults to "no-agent-relay-review".',
       env: 'SKIP_LABELS',

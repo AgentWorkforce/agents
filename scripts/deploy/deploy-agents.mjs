@@ -267,6 +267,91 @@ export function missingWorkspaceSecrets(env = process.env) {
   return WORKSPACE_ENV.filter((name) => !(env[name] ?? '').trim());
 }
 
+/**
+ * Waits between deploy attempts. One entry per RETRY, so the attempt count is
+ * this length plus one. Kept short: the failure mode this exists for burns
+ * ~100s inside the request itself before it reports, and it clears as soon as
+ * the next request opens a fresh connection — waiting longer buys nothing.
+ */
+export const DEPLOY_RETRY_BACKOFF_MS = [15_000, 45_000];
+
+/** Transport-level faults, which never carry a reported HTTP status. */
+const TRANSPORT_FAILURE_PATTERNS = [
+  /\bECONNRESET\b/u,
+  /\bECONNREFUSED\b/u,
+  /\bETIMEDOUT\b/u,
+  /\bEAI_AGAIN\b/u,
+  /\bsocket hang up\b/iu,
+  /\bfetch failed\b/iu,
+  /\bnetwork connection lost\b/iu,
+];
+
+/** The status in `cloud deploy failed: 500 {...}` / `failed with status 502`. */
+const REPORTED_STATUS_PATTERN = /\bfailed(?:\s+with\s+status)?:?\s+(\d{3})\b/giu;
+
+/**
+ * Whether a failed deploy is the CLOUD's fault rather than this repo's, and so
+ * whether re-sending the identical request could clear it.
+ *
+ * The motivating case: the deploy POST lands, the cloud worker loses its Neon
+ * pool socket mid-request ("socket severed or lost: Network connection lost"),
+ * and the route's catch-all reports that ~98s later as a generic
+ *
+ *   cloud deploy failed: 500 {"error":"Failed to deploy persona bundle","code":"deployment_failed"}
+ *
+ * with no indication that the bundle was ever the problem. It wasn't — the same
+ * bundle deploys on the next attempt. AgentWorkforce/cloud#2300 tracks the
+ * standing fix (move Worker DB access off the WebSocket-pooled Neon driver);
+ * until it ships, a red deploy here means nothing but "try again".
+ *
+ * Retrying is safe because these deploys are idempotent by construction:
+ * `buildDeployArgs` always passes `--on-exists update`.
+ */
+export function isRetriableDeployFailure(output) {
+  const text = typeof output === 'string' ? output : '';
+  if (!text) return false;
+  const statuses = [...text.matchAll(REPORTED_STATUS_PATTERN)].map(([, code]) => Number(code));
+  // A reported 4xx VETOES the retry, even when a transport word also appears
+  // somewhere in the noise. Those are this repo's to fix — an unconnected
+  // integration, a rejected input, an expired token — and retrying one burns
+  // three CI runs and pushes the real error three screens up the log.
+  if (statuses.some((code) => code >= 400 && code < 500)) return false;
+  if (statuses.some((code) => code >= 500 && code < 600)) return true;
+  return TRANSPORT_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/** Block the (synchronous) deploy loop without spinning a CPU. */
+function sleepSync(ms) {
+  if (!(ms > 0)) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Run one agent's deploy, re-sending it while the cloud keeps failing it
+ * transiently. Returns whether it eventually succeeded.
+ */
+function runDeployWithRetry({ spawn, deployArgs, root, log, agentName, backoffMs, sleep }) {
+  const attempts = backoffMs.length + 1;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const result = runCli(spawn, deployArgs, root, { captureStderr: true });
+    const stderr = typeof result.stderr === 'string' ? result.stderr : '';
+    // Capturing stderr is the only way to read the failure well enough to
+    // classify it, so write it straight back out: swallowing it would hide the
+    // one description of the fault the CLI ever produces.
+    if (stderr.trim()) log.error(stderr.trimEnd());
+    if (result.status === 0) return true;
+    if (attempt === attempts || !isRetriableDeployFailure(stderr)) return false;
+    const waitMs = backoffMs[attempt - 1];
+    log.error(
+      `⟳ ${agentName}: the cloud failed this deploy transiently (attempt ${attempt}/${attempts}).`
+        + ` Retrying in ${Math.round(waitMs / 1000)}s — the persona bundle is unchanged and the`
+        + ' deploy is idempotent (--on-exists update), so re-sending it is safe.',
+    );
+    sleep(waitMs);
+  }
+  return false;
+}
+
 export function deployAgents({
   args,
   registry,
@@ -275,6 +360,8 @@ export function deployAgents({
   env = process.env,
   spawn = spawnSync,
   log = console,
+  retryBackoffMs = DEPLOY_RETRY_BACKOFF_MS,
+  sleep = sleepSync,
 }) {
   const mode = registry.mode ?? 'cloud';
   const bundle = parseInputBundle(env[INPUT_BUNDLE_ENV]);
@@ -346,7 +433,16 @@ export function deployAgents({
     }
 
     log.log(`=== ${agent.name}: deploy (${mode}) ===`);
-    if (runCli(spawn, deployArgs, root).status !== 0) {
+    const deployed = runDeployWithRetry({
+      spawn,
+      deployArgs,
+      root,
+      log,
+      agentName: agent.name,
+      backoffMs: retryBackoffMs,
+      sleep,
+    });
+    if (!deployed) {
       log.error(`✗ ${agent.name}: deploy failed`);
       // The most common first-run failure is a provider the workspace has not
       // connected yet — `--no-connect` fails rather than starting a connect
@@ -383,9 +479,16 @@ export function redactDeployArgs(deployArgs) {
   );
 }
 
-function runCli(spawn, cliArgs, cwd) {
+function runCli(spawn, cliArgs, cwd, { captureStderr = false } = {}) {
   const invocation = getAgentworkforceInvocation(cliArgs);
-  return spawn(invocation.command, invocation.argv, { cwd, stdio: 'inherit' });
+  return spawn(invocation.command, invocation.argv, {
+    cwd,
+    // stdout stays inherited so deploy progress keeps streaming live; only
+    // stderr is piped, and only because the retry decision has to READ the
+    // failure text. The caller writes it back out the moment the attempt ends.
+    stdio: captureStderr ? ['inherit', 'inherit', 'pipe'] : 'inherit',
+    ...(captureStderr ? { encoding: 'utf8' } : {}),
+  });
 }
 
 const USAGE = `usage: node scripts/deploy/deploy-agents.mjs [flags]

@@ -309,6 +309,19 @@ Same shape of problem, for the LLM credential rather than an integration: that
 persona sets `useSubscription: true` and your workspace has no provider
 connected. Fix it the same way — one interactive deploy, then re-dispatch.
 
+**`cloud deploy failed: 500 {"error":"Failed to deploy persona bundle"}`**
+Not your bundle. This is the cloud's generic catch-all, and the usual cause is
+the cloud worker losing its database connection partway through the request —
+which it reports as a bare 500 a minute or two later, with nothing to act on.
+
+The deploy script already handles it: a 5xx or a dropped connection is retried
+up to twice (`⟳ … the cloud failed this deploy transiently`), and because every
+deploy passes `--on-exists update`, re-sending the same bundle is safe. You only
+see this message if all three attempts failed, which usually means the cloud is
+genuinely unwell rather than flaky — wait and re-dispatch.
+
+A **4xx** is never retried. Those are yours to fix, and they're the ones above.
+
 **`skipping slack channels picker for input SLACK_CHANNEL because --no-prompt is
 set`**
 A warning, not an error. Interactively the CLI would have shown you a channel

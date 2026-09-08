@@ -4,7 +4,6 @@ import test from 'node:test';
 
 import { parseIntegrations } from '@agentworkforce/persona-kit';
 import {
-  WATCH_SWEEP_CRON,
   WATCH_STATE_PATH,
   ListenGatewayError,
   createCloudApiListenGateway,
@@ -100,7 +99,25 @@ test('machine-readable capability manifest is versioned and honest about live ac
   );
   assert.equal(ASKABLE_GTM_CAPABILITY.operations[2].availability, 'implemented_unverified');
   assert.equal(ASKABLE_GTM_CAPABILITY.provider.liveResultVerification, 'not-yet-live-verified');
-  assert.equal(WATCH_SWEEP_CRON, '*/15 * * * *');
+  assert.deepEqual(askableGtmAgent.schedules, []);
+});
+
+test('stale cron events do not query providers, access state, or send replies', async (t) => {
+  const event = envelopeToAgentEvent({
+    id: 'stale-watch-sweep', workspace: 'workspace-test', type: 'cron.tick',
+    occurredAt: '2026-09-08T08:00:00Z', name: 'watch-sweep', cron: '*/15 * * * *',
+  });
+  assert.ok(event);
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () => {
+    assert.fail('stale cron must not make network requests');
+  });
+  const ctx = new Proxy({}, {
+    get(_target, property) {
+      assert.fail(`stale cron must not access runtime capabilities: ${String(property)}`);
+    },
+  });
+  await askableGtmAgent.handler(ctx, event);
+  assert.equal(fetchMock.mock.callCount(), 0);
 });
 
 test('conversation commands cover self-description and durable watch management', () => {
@@ -128,7 +145,8 @@ test('human capability advertisement is rendered from the machine manifest', () 
     (operation) => operation.id === 'manage-watch-definitions',
   );
   assert.match(rendered, new RegExp(watchOperation.accepts[0].replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
-  assert.match(rendered, new RegExp(watchOperation.recurrence.sweepCron.replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
+  assert.equal(watchOperation.recurrence.automaticEvaluation, false);
+  assert.match(rendered, /Scheduling: disabled/);
   for (const question of ASKABLE_GTM_CAPABILITY.questions) {
     assert.match(rendered, new RegExp(question.example.replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
   }
@@ -266,8 +284,8 @@ test('relay watch utterance persists durable state and returns the scheduling tr
   assert.equal(state.watches[0].owner, 'relay:requester');
   assert.equal(sent.length, 1);
   assert.equal(sent[0].to, 'requester');
-  assert.match(sent[0].text, /shared 15-minute recurring sweep/);
-  assert.match(sent[0].text, /did not create a per-watch Relaycron schedule/);
+  assert.match(sent[0].text, /Automatic watch evaluation is disabled/);
+  assert.match(sent[0].text, /No recurring schedule was created/);
   assert.match(sent[0].text, /Live execution is unavailable in this runtime/);
   assert.match(sent[0].text, /connected Revternal integration/);
 });
@@ -288,6 +306,10 @@ test('relay list-watches still sees legacy unprefixed owners', async () => {
 
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /legacy query/);
+  assert.match(sent[0].text, new RegExp(cas.state().watches[0].id));
+  assert.match(sent[0].text, /cadence preference: 6h/);
+  assert.match(sent[0].text, /Automatic watch evaluation is disabled/);
+  assert.doesNotMatch(sent[0].text, /every 6h/);
 });
 
 test('slack question replies in Slack and never falls back to relay dm', async () => {

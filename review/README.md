@@ -28,3 +28,14 @@ This never runs on its own; only an explicit directive comment triggers it, and
 only from the PR author or a login in `APPROVERS` / `REVIEW_AUTHORS` (when those
 are set). It is enabled by the `conflictResolve` capability in `persona.ts` and
 depends on cloud support for the merge-in-tree + finalize-push flow.
+
+## Review failures
+
+Failed reviews and conflict-resolution attempts report recognized AI provider
+errors in the PR notice and configured Slack channel: usage or credit limits,
+rate limits, authentication failures, context limits, request timeouts, and
+provider outages. Claude usage-limit notices include the provider's reported
+reset time when it includes an explicit timezone. The notice gives the account
+owner a next step; it does not change credentials or automatically replay the
+review. Raw output stays in operator diagnostics, and an unrecognized failure
+asks the operator to inspect those diagnostics rather than guessing a cause.

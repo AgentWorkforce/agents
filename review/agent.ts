@@ -27,6 +27,7 @@ import {
   type WorkforceCtx
 } from '@agentworkforce/runtime';
 import { githubClient, slackClient } from '@relayfile/relay-helpers';
+import { describeHarnessFailure } from './lib/harness-failure.js';
 
 export interface Pr {
   owner: string;
@@ -481,12 +482,16 @@ export function logHarnessFailureDiagnostics(
   exitCode: number,
 ): void {
   const result = run as { output?: unknown; stderr?: unknown; durationMs?: unknown; usage?: unknown };
+  const failure = describeHarnessFailure(run, exitCode);
   ctx.log?.('error', 'pr-reviewer harness diagnostics', {
     owner: pr.owner,
     repo: pr.repo,
     number: pr.number,
     exitCode,
     infraKill: isInfraKillExitCode(exitCode),
+    failureKind: failure.kind,
+    failureReason: failure.message,
+    resetHint: failure.resetHint,
     durationMs: typeof result.durationMs === 'number' ? result.durationMs : undefined,
     stderrTail: harnessOutputTail(result.stderr),
     outputTail: harnessOutputTail(result.output),
@@ -530,7 +535,7 @@ async function reviewAndFix(
     await abandonReviewRunToInfraKill(ctx, pr, exitCode as number);
   }
   if (exitCode !== null && exitCode !== 0) {
-    await failReviewRun(ctx, pr, `The review harness exited with code ${exitCode}.`);
+    await failReviewRun(ctx, pr, describeHarnessFailure(run, exitCode).message);
   }
 
   // The harness only writes a review when we explicitly post it. Strip the
@@ -570,7 +575,8 @@ async function resolveConflicts(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 
   const exitCode = (run as { exitCode?: unknown }).exitCode;
   if (typeof exitCode === 'number' && exitCode !== 0) {
-    await failReviewRun(ctx, pr, `The conflict-resolution harness exited with code ${exitCode}.`);
+    logHarnessFailureDiagnostics(ctx, pr, run, exitCode);
+    await failReviewRun(ctx, pr, describeHarnessFailure(run, exitCode).message);
   }
 
   const body = (run.output ?? '').trim();
@@ -1479,7 +1485,7 @@ async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise
   const message = [
     `pr-reviewer could not complete review for #${pr.number} in ${pr.owner}/${pr.repo}.`,
     reason,
-    'No review was posted; this needs operator attention.',
+    'No completed review was produced by this attempt.',
   ].join('\n');
   ctx.log?.('error', 'pr-reviewer harness failed', {
     owner: pr.owner,

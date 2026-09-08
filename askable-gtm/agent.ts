@@ -522,6 +522,7 @@ export default defineAgent({
   },
 
   handler: async (ctx, event) => {
+    if (!event.type.startsWith('slack.') && !isRelaycastMessageEvent(event)) return;
     const gateway = createCloudApiListenGateway(ctx);
     if (event.type.startsWith('slack.')) {
       await handleSlackMessage(ctx, event, gateway);
@@ -640,6 +641,7 @@ export async function handleSlackMessage(
   );
 }
 
+/** Answer chat commands and manage saved watch definitions without scheduling runs. */
 async function handleInteractiveCommand(
   ctx: WorkforceCtx,
   actor: InteractiveActor,
@@ -702,7 +704,7 @@ async function handleInteractiveCommand(
       },
     );
     await actor.reply(
-        `Saved ${watch.id}: “${watch.query}” every ${watch.cadence}. `
+        `Saved ${watch.id}: “${watch.query}” (cadence preference: ${watch.cadence}). `
         + 'Automatic watch evaluation is disabled; this saves the definition only. '
         + 'No recurring schedule was created. '
         + (gateway.status === 'configured'
@@ -1065,6 +1067,7 @@ export function presentJsonForSlack(json: string): string {
   ].join('\n');
 }
 
+/** Describe available chat capabilities and the disabled watch evaluator. */
 export function renderCapabilities(gatewayStatus: ListenGateway['status']): string {
   const watchOperation = ASKABLE_GTM_CAPABILITY.operations.find(
     (operation) => operation.id === 'manage-watch-definitions',
@@ -1085,11 +1088,13 @@ export function renderCapabilities(gatewayStatus: ListenGateway['status']): stri
   ].join('\n');
 }
 
+/** List stored definitions without presenting cadence preferences as active schedules. */
 function renderWatches(watches: WatchDefinition[]): string {
   if (watches.length === 0) return 'You have no saved GTM watches.';
-  return watches
-    .map((watch) => `${watch.id} · every ${watch.cadence} · ${watch.query}`)
-    .join('\n');
+  return [
+    'Automatic watch evaluation is disabled; these are saved definitions only.',
+    ...watches.map((watch) => `${watch.id} · cadence preference: ${watch.cadence} · ${watch.query}`),
+  ].join('\n');
 }
 
 export function createRelayfileWatchStateStore(

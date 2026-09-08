@@ -1,6 +1,5 @@
 import {
   defineAgent,
-  isCronTickEvent,
   isRelaycastMessageEvent,
   type AgentEvent,
   type WorkforceCtx,
@@ -31,7 +30,6 @@ const SLACK_OWNER_PREFIX = 'slack:';
 
 export const WATCH_STATE_PATH = '/revternal/_agents/askable-gtm/watch-state.json';
 
-export const WATCH_SWEEP_CRON = '*/15 * * * *';
 
 export type WatchCadence = '15m' | '1h' | '6h' | '12h' | '24h' | '7d';
 
@@ -514,10 +512,8 @@ export type ParsedCommand =
   | { kind: 'question'; query: string };
 
 export default defineAgent({
-  // User watch definitions live in revisioned Relayfile state. This one
-  // deploy-time Relaycron schedule evaluates which definitions are due every
-  // 15 minutes.
-  schedules: [{ name: 'watch-sweep', cron: WATCH_SWEEP_CRON, tz: 'UTC' }],
+  // Interactive only. Saved watch definitions do not provision periodic runs.
+  schedules: [],
   triggers: {
     // Human chat runs through Slack, not the relay inbox. Match the configured
     // channel and require an @mention so the agent does not wake on every
@@ -534,9 +530,6 @@ export default defineAgent({
     if (isRelaycastMessageEvent(event)) {
       await handleRelayMessage(ctx, event, gateway);
       return;
-    }
-    if (isCronTickEvent(event)) {
-      await runWatchSweep(ctx, new Date(), gateway);
     }
   },
 });
@@ -710,8 +703,8 @@ async function handleInteractiveCommand(
     );
     await actor.reply(
         `Saved ${watch.id}: “${watch.query}” every ${watch.cadence}. `
-        + 'It is evaluated by the agent’s shared 15-minute recurring sweep; '
-        + 'this did not create a per-watch Relaycron schedule. '
+        + 'Automatic watch evaluation is disabled; this saves the definition only. '
+        + 'No recurring schedule was created. '
         + (gateway.status === 'configured'
           ? 'The Cloud integration action gateway is configured; Revternal connection, credential, and entitlement are checked on each run.'
           : 'Live execution is unavailable in this runtime until the persona is deployed in Cloud with a connected Revternal integration.'),
@@ -1087,7 +1080,7 @@ export function renderCapabilities(gatewayStatus: ListenGateway['status']): stri
     `Live Revternal search: ${gatewayStatus === 'configured' ? 'the Cloud integration action gateway is configured; Revternal connection, credential, and entitlement are checked per request, and result quality remains unverified' : 'available only in a cloud runtime with a connected Revternal workspace integration'}.`,
     `Designed questions: ${designedQuestions}`,
     `Watch syntax: ${watchSyntax}.`,
-    `Scheduling: ${watchOperation?.recurrence.mechanism ?? 'not advertised'} at ${watchOperation?.recurrence.sweepCron ?? 'not advertised'}; per-watch Relaycron schedule: ${String(watchOperation?.recurrence.perWatchRelaycronSchedule ?? false)}.`,
+    'Scheduling: disabled. Saved watch definitions are not evaluated automatically.',
     'Send “capabilities --json” for the complete machine-readable manifest.',
   ].join('\n');
 }

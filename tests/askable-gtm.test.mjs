@@ -4,7 +4,6 @@ import test from 'node:test';
 
 import { parseIntegrations } from '@agentworkforce/persona-kit';
 import {
-  WATCH_SWEEP_CRON,
   WATCH_STATE_PATH,
   ListenGatewayError,
   createCloudApiListenGateway,
@@ -100,7 +99,7 @@ test('machine-readable capability manifest is versioned and honest about live ac
   );
   assert.equal(ASKABLE_GTM_CAPABILITY.operations[2].availability, 'implemented_unverified');
   assert.equal(ASKABLE_GTM_CAPABILITY.provider.liveResultVerification, 'not-yet-live-verified');
-  assert.equal(WATCH_SWEEP_CRON, '*/15 * * * *');
+  assert.deepEqual(askableGtmAgent.schedules, []);
 });
 
 test('conversation commands cover self-description and durable watch management', () => {
@@ -128,7 +127,8 @@ test('human capability advertisement is rendered from the machine manifest', () 
     (operation) => operation.id === 'manage-watch-definitions',
   );
   assert.match(rendered, new RegExp(watchOperation.accepts[0].replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
-  assert.match(rendered, new RegExp(watchOperation.recurrence.sweepCron.replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
+  assert.equal(watchOperation.recurrence.automaticEvaluation, false);
+  assert.match(rendered, /Scheduling: disabled/);
   for (const question of ASKABLE_GTM_CAPABILITY.questions) {
     assert.match(rendered, new RegExp(question.example.replace(/[|\\{}()[\]^$+*?.-]/g, '\\$&')));
   }
@@ -266,8 +266,8 @@ test('relay watch utterance persists durable state and returns the scheduling tr
   assert.equal(state.watches[0].owner, 'relay:requester');
   assert.equal(sent.length, 1);
   assert.equal(sent[0].to, 'requester');
-  assert.match(sent[0].text, /shared 15-minute recurring sweep/);
-  assert.match(sent[0].text, /did not create a per-watch Relaycron schedule/);
+  assert.match(sent[0].text, /Automatic watch evaluation is disabled/);
+  assert.match(sent[0].text, /No recurring schedule was created/);
   assert.match(sent[0].text, /Live execution is unavailable in this runtime/);
   assert.match(sent[0].text, /connected Revternal integration/);
 });

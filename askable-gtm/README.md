@@ -9,8 +9,7 @@ Ask it what the market is saying, get cited public posts back.
 
 It searches **LinkedIn** through [Revternal](https://revternal.com) — the
 strongest public surface for B2B go-to-market chatter — and answers with the
-post, its author, its engagement, and a link. Save a query as a watch and it
-re-runs on a 15-minute sweep, DMing you only what is new.
+post, its author, its engagement, and a link. Save a query as a watch definition. Automatic watch evaluation is disabled.
 
 Deploy
 ------
@@ -45,8 +44,8 @@ what can you tell me?                                     what it does
 capabilities --json                                       the same, as JSON
 ```
 
-A watch is a durable query definition evaluated by one shared sweep, not a
-schedule of its own. Saved watches deliver only posts you have not been sent.
+A watch saves a durable query definition and cadence preference. It does not
+create a schedule or send automatic updates.
 
 What it will and won't say
 --------------------------

@@ -10,6 +10,7 @@ import {
   buildDeployArgs,
   deployAgents,
   formatMissingInputs,
+  isRetriableDeployFailure,
   readPersonaIntegrationNames,
   loadRegistry,
   missingWorkspaceSecrets,
@@ -553,4 +554,142 @@ test('readPersonaIntegrationNames names the providers a failed deploy needs conn
   writeFileSync(personaJson, 'not json at all');
   assert.deepEqual(readPersonaIntegrationNames(personaJson), []);
   assert.deepEqual(readPersonaIntegrationNames(join(dir, 'absent.json')), []);
+});
+
+// --- transient cloud failures -----------------------------------------------
+
+/**
+ * A cloud deploy can fail for reasons that have nothing to do with the bundle
+ * it was handed — most often the cloud worker losing its Neon pool socket
+ * mid-request, which surfaces ~98s later as a bare 500. These guard that the
+ * script re-sends THOSE and only those. See AgentWorkforce/cloud#2300.
+ */
+
+/** A deploy that fails `failures.length` times before succeeding. */
+function flakySpawn(failures, stderr) {
+  const calls = [];
+  const spawn = (command, argv, options) => {
+    calls.push({ argv, options });
+    const isDeploy = argv.includes('deploy');
+    if (!isDeploy) return { status: 0 };
+    const deployCount = calls.filter((call) => call.argv.includes('deploy')).length;
+    return deployCount <= failures ? { status: 1, stderr } : { status: 0 };
+  };
+  return { calls, spawn };
+}
+
+const CLOUD_500 = 'agentworkforce deploy failed: cloud deploy failed: 500 '
+  + '{"error":"Failed to deploy persona bundle","code":"deployment_failed"}\n';
+
+test('isRetriableDeployFailure retries a cloud 5xx and transport faults', () => {
+  assert.equal(isRetriableDeployFailure(CLOUD_500), true);
+  assert.equal(isRetriableDeployFailure('cloud deploy failed: 502 Bad Gateway'), true);
+  assert.equal(isRetriableDeployFailure('deploy failed with status 504'), true);
+  assert.equal(isRetriableDeployFailure('Error: socket hang up'), true);
+  assert.equal(isRetriableDeployFailure('TypeError: fetch failed\n  cause: ECONNRESET'), true);
+  assert.equal(isRetriableDeployFailure('Uncaught Error: Network connection lost.'), true);
+});
+
+test('isRetriableDeployFailure never retries a client error or an empty failure', () => {
+  // These are THIS repo's to fix. Retrying buries the real error and burns CI.
+  assert.equal(isRetriableDeployFailure('cloud deploy failed: 401 Unauthorized'), false);
+  assert.equal(isRetriableDeployFailure('cloud deploy failed: 409 integration not connected'), false);
+  assert.equal(isRetriableDeployFailure('cloud deploy failed: 422 invalid persona'), false);
+  assert.equal(isRetriableDeployFailure(''), false);
+  assert.equal(isRetriableDeployFailure(undefined), false);
+  // A reported 4xx wins even when a transport word appears in the same blob.
+  assert.equal(
+    isRetriableDeployFailure('cloud deploy failed: 403 forbidden\n(previously: socket hang up)'),
+    false,
+  );
+});
+
+test('deployAgents re-sends a deploy the cloud failed transiently, and reports success', () => {
+  const root = fixtureRoot({});
+  const selected = [{ name: 'demo', persona: 'demo/persona.ts' }];
+  const { calls, spawn } = flakySpawn(1, CLOUD_500);
+  const log = makeLog();
+  const waits = [];
+  const failures = deployAgents({
+    args: parseArgs(['--skip-compile']),
+    registry: { mode: 'cloud', agents: selected },
+    selected,
+    root,
+    env: {},
+    spawn,
+    log,
+    sleep: (ms) => waits.push(ms),
+  });
+  assert.deepEqual(failures, [], 'a transient cloud fault must not fail the build');
+  assert.equal(calls.length, 2, 'the deploy is sent again after the transient failure');
+  assert.deepEqual(calls[0].argv, calls[1].argv, 'the retry re-sends the identical request');
+  assert.equal(waits.length, 1, 'exactly one backoff for one retry');
+  const output = log.lines.join('\n');
+  assert.match(output, /⟳ demo: the cloud failed this deploy transiently \(attempt 1\/3\)/u);
+  // The CLI's own stderr is captured to classify the failure — it must still
+  // reach the log, or the one description of the fault would be lost.
+  assert.match(output, /Failed to deploy persona bundle/u);
+  assert.match(output, /✓ demo deployed/u);
+});
+
+test('deployAgents gives up after the last attempt and reports the agent failed', () => {
+  const root = fixtureRoot({});
+  const selected = [{ name: 'demo', persona: 'demo/persona.ts' }];
+  const { calls, spawn } = flakySpawn(Number.POSITIVE_INFINITY, CLOUD_500);
+  const log = makeLog();
+  const failures = deployAgents({
+    args: parseArgs(['--skip-compile']),
+    registry: { mode: 'cloud', agents: selected },
+    selected,
+    root,
+    env: {},
+    spawn,
+    log,
+    sleep: () => {},
+  });
+  assert.deepEqual(failures, ['demo']);
+  assert.equal(calls.length, 3, 'three attempts: the initial send plus two retries');
+  assert.match(log.lines.join('\n'), /✗ demo: deploy failed/u);
+});
+
+test('deployAgents does not retry a failure that is this repo to fix', () => {
+  const root = fixtureRoot({});
+  const selected = [{ name: 'demo', persona: 'demo/persona.ts' }];
+  const { calls, spawn } = flakySpawn(
+    Number.POSITIVE_INFINITY,
+    'cloud deploy failed: 409 integration "github" is not connected\n',
+  );
+  const log = makeLog();
+  const failures = deployAgents({
+    args: parseArgs(['--skip-compile']),
+    registry: { mode: 'cloud', agents: selected },
+    selected,
+    root,
+    env: {},
+    spawn,
+    log,
+    sleep: () => assert.fail('a client error must not back off and retry'),
+  });
+  assert.deepEqual(failures, ['demo']);
+  assert.equal(calls.length, 1, 'a 4xx fails on the first attempt');
+});
+
+test('the deploy captures stderr but leaves stdout streaming live', () => {
+  const root = fixtureRoot({});
+  const selected = [{ name: 'demo', persona: 'demo/persona.ts' }];
+  const { calls, spawn } = flakySpawn(0, '');
+  deployAgents({
+    args: parseArgs(['--skip-compile']),
+    registry: { mode: 'cloud', agents: selected },
+    selected,
+    root,
+    env: {},
+    spawn,
+    log: makeLog(),
+    sleep: () => {},
+  });
+  // A deploy can sit for ~100s before it reports; piping stdout too would hold
+  // every progress line back until the process exited.
+  assert.deepEqual(calls[0].options.stdio, ['inherit', 'inherit', 'pipe']);
+  assert.equal(calls[0].options.encoding, 'utf8');
 });

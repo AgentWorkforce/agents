@@ -8,7 +8,9 @@ import {
   commentBody,
   commenterLogin,
   attributeCiFailure,
+  autoFixEnabled,
   ciObservationFor,
+  editPolicyGuidance,
   conflictResolveHarnessPrompt,
   failingCheckGuidance,
   readFailingCheck,
@@ -474,7 +476,10 @@ test('reviewHarnessPrompt keeps fixes within the PR scope and verifies CI-deep',
 });
 
 test('reviewHarnessPrompt limits auto-edits to mechanical changes', () => {
-  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 266 });
+  // The default is now review-only, so these limits apply to the AUTO_FIX mode.
+  // Kept rather than dropped: when an operator turns applied edits back on,
+  // this is the guarantee that stops them being unbounded.
+  const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 266 }, undefined, { autoFix: true });
   assert.match(prompt, /Auto-edit only lint, formatting, spelling, typo, import-order, or other mechanical non-semantic changes/);
   assert.match(prompt, /Do not auto-edit semantic or safety-critical logic/);
   assert.match(prompt, /leave a clear suggestion or review comment instead of changing files/);
@@ -1196,4 +1201,48 @@ test('ciObservationFor records ownership only while CI is red and ours', () => {
   assert.equal(obs.ciFailing, true);
   assert.equal(obs.leftEdits, true, 'upper bound: the agent cannot see the push outcome');
   assert.equal(ciObservationFor({ ...pr, headSha: undefined }, { failing: false, attribution: 'unknown' }).headSha, null);
+});
+
+// Verification moved to the repo's CI, so an applied edit is no longer proven
+// before it lands. Review-only is the default until the agent can revert its
+// own push; AUTO_FIX is the single switch back.
+test('autoFixEnabled defaults to off and accepts the obvious truthy spellings', () => {
+  const ctx = (value) => ({
+    persona: { inputSpecs: { AUTO_FIX: { env: '__TEST_AUTO_FIX__' } }, inputs: value === undefined ? {} : { AUTO_FIX: value } },
+  });
+  assert.equal(autoFixEnabled(ctx(undefined)), false, 'unset must mean review-only');
+  assert.equal(autoFixEnabled(ctx('')), false);
+  assert.equal(autoFixEnabled(ctx('false')), false);
+  assert.equal(autoFixEnabled(ctx('no')), false);
+  assert.equal(autoFixEnabled(ctx('true')), true);
+  assert.equal(autoFixEnabled(ctx('TRUE')), true);
+  assert.equal(autoFixEnabled(ctx(' yes ')), true);
+  assert.equal(autoFixEnabled(ctx('1')), true);
+});
+
+test('editPolicyGuidance forbids edits when auto-fix is off', () => {
+  const off = editPolicyGuidance(false).join('\n');
+  assert.match(off, /REVIEW-ONLY: do not edit, create, or delete any file/);
+  assert.match(off, /an edit here IS a\s+push/);
+  assert.match(off, /includes failing CI: diagnose it and state the fix, but do not apply it/);
+  // The permissive wording must be gone entirely, not merely softened.
+  assert.doesNotMatch(off, /Auto-edit only/);
+  assert.doesNotMatch(off, /Resolve failing CI checks by editing the code/);
+
+  const on = editPolicyGuidance(true).join('\n');
+  assert.match(on, /Auto-edit only lint, formatting/);
+  assert.doesNotMatch(on, /REVIEW-ONLY/);
+});
+
+test('reviewHarnessPrompt is review-only unless autoFix is passed', () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5020 };
+  assert.match(reviewHarnessPrompt(pr), /REVIEW-ONLY/);
+  assert.match(reviewHarnessPrompt(pr, undefined, {}), /REVIEW-ONLY/);
+  assert.match(reviewHarnessPrompt(pr, undefined, { autoFix: false }), /REVIEW-ONLY/);
+  assert.doesNotMatch(reviewHarnessPrompt(pr, undefined, { autoFix: true }), /REVIEW-ONLY/);
+
+  // Review-only must not silently drop the rest of the contract.
+  const prompt = reviewHarnessPrompt(pr);
+  assert.match(prompt, /Do NOT install dependencies, build the repo, or run its test suite/);
+  assert.match(prompt, /Stay within this PR's purpose/);
 });

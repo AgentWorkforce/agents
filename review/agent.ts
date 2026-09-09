@@ -511,7 +511,7 @@ async function reviewAndFix(
   const { run, exitCode, infraKill } = await runReviewHarnessWithRetry(
     () => ctx.harness.run({
       cwd: ctx.sandbox.cwd,
-      prompt: reviewHarnessPrompt(pr, ci),
+      prompt: reviewHarnessPrompt(pr, ci, { autoFix: autoFixEnabled(ctx) }),
       env: HARNESS_RESOURCE_ENV,
     }),
     {
@@ -927,25 +927,66 @@ function ciAttributionGuidance(
   ];
 }
 
-export function reviewHarnessPrompt(
-  pr: { owner: string; repo: string; number: number },
-  ci?: { failing: boolean; attribution: CiFailureAttribution; check?: FailingCheck },
-): string {
+/**
+ * Applied edits are opt-in. Unset means review-only.
+ *
+ * Verification moved to the repo's CI, so an applied edit is no longer proven
+ * before it lands — the agent finds out it broke something only afterwards.
+ * Until the CI-reaction loop has proven itself, and until the agent can revert
+ * its own push, the safe default is to propose rather than apply: a wrong
+ * suggestion costs a reader a moment, a wrong push costs the author a broken
+ * PR. cloud#1926 is what the second one looks like in practice.
+ */
+export function autoFixEnabled(ctx: WorkforceCtx): boolean {
+  const raw = (input(ctx, 'AUTO_FIX') ?? '').trim().toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'yes';
+}
+
+/**
+ * What this run is allowed to change.
+ *
+ * One switch, not a gradient: the deployed behaviour should be legible from a
+ * single input rather than inferred from several interacting rules.
+ */
+export function editPolicyGuidance(autoFix: boolean): string[] {
+  if (!autoFix) {
+    return [
+      `Flag breakage even when the affected file is outside the changed-file set, but do not do an unrelated full-repo audit.`,
+      `This run is REVIEW-ONLY: do not edit, create, or delete any file, and leave the working tree exactly as you`,
+      `found it. Anything left in the tree is committed and pushed to the PR after you exit, so an edit here IS a`,
+      `push — and this run has no way to verify a push before it lands.`,
+      `Everything you would have fixed becomes a suggestion instead. Name the file and line, say what is wrong, and`,
+      `give the exact replacement you would make. A precise suggestion a human applies in one click is worth more`,
+      `than a silent edit they have to audit afterwards.`,
+      `This includes failing CI: diagnose it and state the fix, but do not apply it.`,
+    ];
+  }
   return [
-    ...ciAttributionGuidance(ci),
-    ...(ci?.failing ? failingCheckGuidance(ci.check) : []),
-    `Review pull request #${pr.number} in ${pr.owner}/${pr.repo}. The PR code is checked out in the current directory.`,
-    `Focus on the actual PR changes: read .workforce/pr.diff first, then .workforce/changed-files.txt and .workforce/context.json.`,
-    `Use the checked-out repo to trace the impact of this diff across callers, types, tests, config, and related files.`,
     `Flag and fix breakage even when the affected file is outside the changed-file set, but do not do an unrelated full-repo audit.`,
     `Auto-edit only lint, formatting, spelling, typo, import-order, or other mechanical non-semantic changes.`,
     `Do not auto-edit semantic or safety-critical logic. For behavior changes, architecture changes, and any reviewer`,
     `request that needs human judgment, leave a clear suggestion or review comment instead of changing files.`,
     `If the PR already has a human review or approval, switch to suggestion/comment-only for everything except`,
     `obvious mechanical cleanup that cannot change runtime behavior.`,
-    `Resolve failing CI checks by editing the code only when the fix is mechanical and non-semantic. Don't use git or the gh CLI; cloud commits`,
-    `and pushes your file edits to the PR after this run. In your output, do not claim that fixes were pushed,`,
-    `a GitHub review was submitted, or CI was verified; those are post-harness actions that cloud reports separately.`,
+    `Resolve failing CI checks by editing the code only when the fix is mechanical and non-semantic.`,
+  ];
+}
+
+export function reviewHarnessPrompt(
+  pr: { owner: string; repo: string; number: number },
+  ci?: { failing: boolean; attribution: CiFailureAttribution; check?: FailingCheck },
+  options: { autoFix?: boolean } = {},
+): string {
+  const autoFix = options.autoFix === true;
+  return [
+    ...ciAttributionGuidance(ci),
+    ...(ci?.failing ? failingCheckGuidance(ci.check) : []),
+    `Review pull request #${pr.number} in ${pr.owner}/${pr.repo}. The PR code is checked out in the current directory.`,
+    `Focus on the actual PR changes: read .workforce/pr.diff first, then .workforce/changed-files.txt and .workforce/context.json.`,
+    `Use the checked-out repo to trace the impact of this diff across callers, types, tests, config, and related files.`,
+    ...editPolicyGuidance(autoFix),
+    `Don't use git or the gh CLI. In your output, do not claim that fixes were pushed, a GitHub review was`,
+    `submitted, or CI was verified; those are post-harness actions that cloud reports separately.`,
     `Validate every finding — yours or another bot's — against the CURRENT checkout before editing: review comments`,
     `are often stale (already fixed by a later push). Reproduce the problem in the code as it is now, or skip it.`,
     `Make the smallest fix that addresses a demonstrated problem. Do not rewrite, restructure, or "harden" working`,

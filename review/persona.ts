@@ -27,7 +27,22 @@ export default definePersona({
   },
 
   integrations: {
-    github: {},
+    // source: workspace — the GitHub connection this agent runs on belongs to
+    // the WORKSPACE, not to whoever deployed it.
+    //
+    // persona-kit defaults an omitted `source` to `{ kind: 'deployer_user' }`,
+    // which asks the deploy to find a connection owned by the deploying user.
+    // A CI deploy authenticates with a workspace token and has no such user, so
+    // the preflight reports `integrations.github: not connected` for a
+    // workspace where GitHub demonstrably IS connected — and with --no-prompt
+    // it aborts rather than offering to connect.
+    //
+    // There is a fallback for the implicit case, but it is carried by a
+    // NON-ENUMERABLE marker (`__agentworkforceImplicitSource`, set via
+    // Object.defineProperty in persona-kit's parse), so it cannot survive the
+    // JSON the CLI actually deploys. Declaring the source explicitly is the
+    // only way to state this that survives compilation.
+    github: { source: { kind: 'workspace' } },
     slack: {
       // Slack is a notification transport, not a requirement: every Slack call
       // in agent.ts is guarded on SLACK_CHANNEL, and the reviewer's GitHub work

@@ -48,6 +48,14 @@ on:
           AGENT_INPUTS secret instead.
         required: false
         type: string
+      harness-source:
+        description: >-
+          Which stored credential to use for the agent's harness: managed, byok,
+          oauth, or plan. Leave empty to use the WORKFORCE_DEPLOY_HARNESS_SOURCE
+          Environment variable, or to let the CLI resolve it. Use "oauth" when
+          the harness was connected with a setup token.
+        required: false
+        type: string
       dry-run:
         description: Print what would be deployed without deploying it
         required: false
@@ -83,6 +91,9 @@ jobs:
           # workflow that silently reads empty from the other place costs an
           # operator a failed deploy and a confused hour. `||` takes the first
           # non-empty, so both work and neither needs migrating.
+          # Dispatch box wins, then the Environment variable, then empty (the
+          # CLI resolves it). Same precedence as the other stacked inputs.
+          harness-source: ${{ inputs.harness-source || vars.WORKFORCE_DEPLOY_HARNESS_SOURCE }}
           workspace-id: ${{ vars.WORKFORCE_WORKSPACE_ID || secrets.WORKFORCE_WORKSPACE_ID }}
           workspace-token: ${{ secrets.WORKFORCE_WORKSPACE_TOKEN }}
           # Stacked lowest-precedence first; the deploy script lets later lines

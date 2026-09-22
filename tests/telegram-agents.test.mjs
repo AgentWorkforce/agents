@@ -313,6 +313,47 @@ test('spotify-releases (telegram): does not checkpoint after a Telegram no-recei
   assert.equal((await ctx.memory.recall('x', { tags: ['spotify-releases:notified'] })).length, 0);
 });
 
+test('spotify-releases (telegram): persists delivered releases after a partial artist failure', async () => {
+  const originalFetch = globalThis.fetch;
+  const ctx = makeCtx();
+  const tg = makeTelegram();
+  await ctx.memory.save('2026-06-10', { tags: ['spotify-releases:last-check'], scope: 'workspace' });
+  globalThis.fetch = async (url) => {
+    const s = String(url);
+    if (s.includes('/me/following')) {
+      return Response.json({
+        artists: {
+          items: [
+            { id: 'a1', name: 'Artist One' },
+            { id: 'a2', name: 'Artist Two' }
+          ]
+        }
+      });
+    }
+    if (s.includes('/artists/a2/')) return new Response('unavailable', { status: 503 });
+    return Response.json({
+      items: [{ name: 'Delivered Single', release_date: '2026-06-11', external_urls: { spotify: 'https://open.spotify.com/album/3' } }]
+    });
+  };
+  try {
+    const releaseCtx = {
+      ...ctx,
+      persona: { inputs: { TELEGRAM_CHAT: '5', SPOTIFY_TOKEN: 'tok' }, inputSpecs: {} }
+    };
+    await checkReleases(releaseCtx, { telegram: tg });
+    await checkReleases(releaseCtx, { telegram: tg });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(tg.sends.length, 1);
+  assert.match(tg.sends[0].text, /Delivered Single/);
+  const notified = await ctx.memory.recall('x', { tags: ['spotify-releases:notified'] });
+  assert.deepEqual(JSON.parse(notified[0].content), ['https://open.spotify.com/album/3']);
+  const lastCheck = await ctx.memory.recall('x', { tags: ['spotify-releases:last-check'], limit: 1 });
+  assert.equal(lastCheck[0].content, '2026-06-10');
+});
+
 // ── Slack side of the unified agents (dual-transport dispatch + fan-out) ───────
 
 /** A fake Slack client capturing post/reply/dm calls. */

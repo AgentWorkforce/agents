@@ -404,8 +404,8 @@ Flags:
   -h, --help            Print this message
 
 Auth (required unless --dry-run):
-  WORKFORCE_WORKSPACE_ID     your workspace id
-  WORKFORCE_WORKSPACE_TOKEN  that workspace's token
+  WORKFORCE_WORKSPACE_ID     your cloud workspace id (UUID)
+  WORKFORCE_WORKSPACE_TOKEN  your cloud access token (docs/SELF-DEPLOY.md)
 
 See docs/SELF-DEPLOY.md for where to get both.
 `;

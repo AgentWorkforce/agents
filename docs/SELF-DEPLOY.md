@@ -270,9 +270,8 @@ node scripts/deploy/deploy-agents.mjs --list
 node scripts/deploy/deploy-agents.mjs --agent hn-monitor --dry-run
 
 # Deploy for real.
-# With a CLI that includes AgentWorkforce/workforce#342 you can skip both and
-# rely on `npx agentworkforce login`.
-# To exercise the CI path, use the values from section 2:
+# The deploy script requires both variables, even after `npx agentworkforce login`.
+# Use the values from section 2:
 export WORKFORCE_WORKSPACE_ID="<cloud-workspace-uuid>"
 export WORKFORCE_WORKSPACE_TOKEN="$(jq -r '.accessToken' ~/.agentworkforce/relay/cloud-auth.json)"
 export SLACK_CHANNEL=C0123ABCD          # or: --input SLACK_CHANNEL=C0123ABCD

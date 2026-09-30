@@ -75,13 +75,12 @@ Fork  →  Settings ▸ Environments ▸ "workforce"  →  Actions ▸ Deploy ag
 ```
 
 1. **Get the two secrets.** `npm install && npx agentworkforce login` logs you in
-   through the browser and writes the workspace and its token to
-   `~/.agentworkforce/relay/workspaces.json`. Read them back with:
-
-   ```sh
-   jq -r '.active' ~/.agentworkforce/relay/workspaces.json                 # WORKFORCE_WORKSPACE_ID
-   jq -r '.workspaces[.active].key' ~/.agentworkforce/relay/workspaces.json # WORKFORCE_WORKSPACE_TOKEN
-   ```
+   through the browser. `WORKFORCE_WORKSPACE_ID` is the workspace's **cloud
+   workspace id** (a UUID) and `WORKFORCE_WORKSPACE_TOKEN` is your **cloud access
+   token** — see [docs/SELF-DEPLOY.md § 2](docs/SELF-DEPLOY.md#2-get-the-two-values)
+   for how to read both. Do **not** use the `rk_…` `key` from
+   `~/.agentworkforce/relay/workspaces.json` (cloud rejects it with `401`) or the
+   `rw_…` relaycast id (cloud rejects it with `403`).
 
 2. **Add them to your fork** under Settings → Environments → new environment
    named `workforce` → Environment secrets. The name matters: the deploy job

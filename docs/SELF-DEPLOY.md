@@ -56,30 +56,43 @@ npm install                 # the agentworkforce CLI is a devDependency of this 
 npx agentworkforce login    # opens your browser, then asks which workspace
 ```
 
-`login` writes the workspace and its token to **`~/.agentworkforce/relay/workspaces.json`**
-(created `0600`, readable only by you). The file looks like this:
+`login` stores your cloud session in **`~/.agentworkforce/relay/cloud-auth.json`**
+and the selected workspace in `~/.agentworkforce/relay/workspaces.json` (both
+created `0600`, readable only by you).
 
-```json
-{
-  "active": "your-workspace-name",
-  "workspaces": {
-    "your-workspace-name": { "key": "rk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
-  }
-}
-```
+> **Two look-alikes that do not work.** `workspaces.json` holds a relaycast
+> workspace *key* (`rk_live_…`) and relaycast ids look like `rw_…`. Neither is
+> what the deploy API wants: the `rk_` key is rejected with **401** and the `rw_`
+> id with **403 Forbidden**. Newer CLIs refuse an `rk_` token up front.
 
-Read the two values back out of it:
+**`WORKFORCE_WORKSPACE_TOKEN`** is the cloud access token from your login session:
 
 ```sh
-# WORKFORCE_WORKSPACE_ID
-jq -r '.active' ~/.agentworkforce/relay/workspaces.json
-
-# WORKFORCE_WORKSPACE_TOKEN  — prints a live credential, so don't do this on a shared screen
-jq -r '.workspaces[.active].key' ~/.agentworkforce/relay/workspaces.json
+# prints a live credential, so don't do this on a shared screen
+jq -r '.accessToken' ~/.agentworkforce/relay/cloud-auth.json
+# when it stops working:
+jq -r '.accessTokenExpiresAt' ~/.agentworkforce/relay/cloud-auth.json
 ```
 
-If you have several workspaces, replace `.active` with the one you want:
-`jq -r '.workspaces["other-workspace"].key' …`.
+This token **expires**. When a deploy starts failing with `401`, run
+`npx agentworkforce login` again and update the secret.
+
+**`WORKFORCE_WORKSPACE_ID`** is the workspace's cloud workspace id (a UUID).
+CLIs that include [AgentWorkforce/workforce#342](https://github.com/AgentWorkforce/workforce/pull/342)
+print it after `login` (`cloud workspace id: …`). With an older CLI, ask the cloud
+to resolve your active workspace:
+
+```sh
+AUTH=~/.agentworkforce/relay/cloud-auth.json
+curl -fsS \
+  -H "Authorization: Bearer $(jq -r '.accessToken' "$AUTH")" \
+  "$(jq -r '.apiUrl' "$AUTH")/api/v1/workspaces/$(jq -r '.workspaces[.active].key' ~/.agentworkforce/relay/workspaces.json)/resolve" \
+  | jq -r '.cloudWorkspaceId'
+```
+
+If you have several workspaces, replace `.workspaces[.active]` with the one you
+want, e.g. `.workspaces["other-workspace"]`. If that prints `null`, your relay workspace isn't linked to a cloud workspace
+yet — contact support rather than substituting another id.
 
 > **If `login` can't list your workspaces** (some accounts get a 403 on the
 > workspace list), pass the workspace explicitly and it will skip the listing
@@ -257,8 +270,10 @@ node scripts/deploy/deploy-agents.mjs --list
 node scripts/deploy/deploy-agents.mjs --agent hn-monitor --dry-run
 
 # Deploy for real.
-export WORKFORCE_WORKSPACE_ID="$(jq -r '.active' ~/.agentworkforce/relay/workspaces.json)"
-export WORKFORCE_WORKSPACE_TOKEN="$(jq -r '.workspaces[.active].key' ~/.agentworkforce/relay/workspaces.json)"
+# The deploy script requires both variables, even after `npx agentworkforce login`.
+# Use the values from section 2:
+export WORKFORCE_WORKSPACE_ID="<cloud-workspace-uuid>"
+export WORKFORCE_WORKSPACE_TOKEN="$(jq -r '.accessToken' ~/.agentworkforce/relay/cloud-auth.json)"
 export SLACK_CHANNEL=C0123ABCD          # or: --input SLACK_CHANNEL=C0123ABCD
 node scripts/deploy/deploy-agents.mjs --agent hn-monitor
 ```

@@ -1508,8 +1508,9 @@ async function reconcilePendingSlackThreadRefs(
   if (!channel) return posts;
   const draftPrefix = `/slack/channels/${encodeURIComponent(channel)}/messages/`;
   return Promise.all(posts.map(async (post) => {
-    const refs = post.threadRefs ?? [];
-    let changed = false;
+    const storedRefs = post.threadRefs ?? [];
+    const refs = storedRefs.filter(isSavedHeaderRef);
+    let changed = refs.length !== storedRefs.length;
     const resolvedRefs = await Promise.all(refs.map(async (ref): Promise<SavedHeaderRef> => {
       if (
         ref.provider !== 'slack' ||
@@ -1947,7 +1948,10 @@ function isSavedHeaderRef(value: unknown): value is SavedHeaderRef {
   return Boolean(
     ref &&
     (ref.provider === 'slack' || ref.provider === 'telegram') &&
-    typeof ref.draftRef === 'string' && ref.draftRef.length > 0
+    typeof ref.draftRef === 'string' && ref.draftRef.length > 0 &&
+    (ref.channel === undefined || typeof ref.channel === 'string') &&
+    (ref.chatId === undefined || typeof ref.chatId === 'string') &&
+    (ref.threadTs === undefined || typeof ref.threadTs === 'string')
   );
 }
 

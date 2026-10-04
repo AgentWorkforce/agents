@@ -510,7 +510,7 @@ test('postFreshStories persists exact digest state and warns when semantic memor
   assert.equal(posts.length, 2, 'memory unavailability must not break Slack posting');
 });
 
-test('Slack Q&A reconciles a delayed header receipt before resolving an ordinal', async () => {
+test('Slack Q&A ignores malformed refs and reconciles a delayed header receipt before resolving an ordinal', async () => {
   const { ctx, files, logs } = fakeCtx();
   const posts = [];
   const story = {
@@ -529,8 +529,12 @@ test('Slack Q&A reconciles a delayed header receipt before resolving an ordinal'
   const state = JSON.parse(files.get(statePath));
   const draftRef = '/slack/channels/C123/messages/delayed-header.json';
   state.posts[0].threadRefs[0].draftRef = draftRef;
+  state.posts[0].threadRefs.unshift(
+    { provider: 'slack' },
+    { provider: 'slack', draftRef: '/slack/channels/C123/messages/bad-ts.json', threadTs: 17 },
+  );
   files.set(statePath, JSON.stringify(state));
-  assert.equal(state.posts[0].threadRefs[0].threadTs, '');
+  assert.equal(state.posts[0].threadRefs[2].threadTs, '');
 
   // Relayfile rewrites the accepted draft with the eventual provider receipt.
   files.set(draftRef, JSON.stringify({ created: 'accepted', externalId: '1710000000.4243' }));
@@ -568,7 +572,9 @@ test('Slack Q&A reconciles a delayed header receipt before resolving an ordinal'
   });
 
   assert.equal(selectedId, story.id);
-  assert.ok(files.has('/slack/channels/C123/hn-monitor/digests/by-thread/1710000000.4243.json'));
+  const threadStatePath = '/slack/channels/C123/hn-monitor/digests/by-thread/1710000000.4243.json';
+  assert.ok(files.has(threadStatePath));
+  assert.equal(JSON.parse(files.get(threadStatePath)).threadRefs.length, 1);
   assert.ok(logs.some((entry) => entry.message === 'hn-monitor.post-thread-reconciled'));
   assert.equal(logs.findLast((entry) => entry.message === 'hn-monitor.qa.selected').attrs.source, 'exact_state');
 });

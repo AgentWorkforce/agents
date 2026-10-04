@@ -1485,10 +1485,77 @@ async function loadExactPosts(ctx: WorkforceCtx, threadTs?: string): Promise<Pos
     const indexed = state.kind === 'hn-monitor exact recent digests' && state.version === 1 && Array.isArray(state.posts)
       ? state.posts.filter(isPostRecord)
       : [];
-    return mergePosts(threadPost ? [threadPost] : [], indexed).slice(0, 12);
+    const reconciled = await reconcilePendingSlackThreadRefs(ctx, indexed);
+    return mergePosts(threadPost ? [threadPost] : [], reconciled).slice(0, 12);
   } catch {
     return threadPost ? [threadPost] : [];
   }
+}
+
+/**
+ * A non-blocking Slack write returns its stable Relayfile draft path before the
+ * provider receipt (and therefore the root message ts) exists. Relayfile later
+ * rewrites that draft as a receipt. Resolve those delayed receipts when a Q&A
+ * event loads recent digests, then persist the authoritative per-thread shard
+ * so ordinary Slack `thread_ts` replies remain grounded without making the
+ * scheduled delivery wait for a provider round trip.
+ */
+async function reconcilePendingSlackThreadRefs(
+  ctx: WorkforceCtx,
+  posts: PostRecord[]
+): Promise<PostRecord[]> {
+  const channel = input(ctx, 'SLACK_CHANNEL')?.trim();
+  if (!channel) return posts;
+  const draftPrefix = `/slack/channels/${encodeURIComponent(channel)}/messages/`;
+  return Promise.all(posts.map(async (post) => {
+    const refs = post.threadRefs ?? [];
+    let changed = false;
+    const resolvedRefs = await Promise.all(refs.map(async (ref): Promise<SavedHeaderRef> => {
+      if (
+        ref.provider !== 'slack' ||
+        ref.threadTs ||
+        !ref.draftRef.startsWith(draftPrefix) ||
+        (ref.channel && ref.channel !== channel)
+      ) return ref;
+      try {
+        const threadTs = slackThreadTsFromDraftReceipt(JSON.parse(await ctx.files.read(ref.draftRef)) as unknown);
+        if (!threadTs) return ref;
+        changed = true;
+        return { ...ref, threadTs };
+      } catch {
+        // The draft is still pending, absent from this mount snapshot, or was
+        // not valid JSON yet. Keep the stable ref and try again on a later Q&A.
+        return ref;
+      }
+    }));
+    if (!changed) return post;
+
+    const reconciled: PostRecord = { ...post, threadRefs: resolvedRefs };
+    for (const ref of resolvedRefs) {
+      if (ref.provider !== 'slack' || !ref.threadTs) continue;
+      const threadPath = exactDigestThreadPath(ctx, ref.threadTs);
+      if (!threadPath) continue;
+      try {
+        await ctx.files.write(threadPath, `${JSON.stringify(reconciled, null, 2)}\n`);
+        ctx.log('info', 'hn-monitor.post-thread-reconciled', {
+          channel: ref.channel,
+          threadTs: ref.threadTs
+        });
+      } catch (error) {
+        ctx.log('warn', 'hn-monitor.post-state-shard-unavailable', { error: String(error) });
+      }
+    }
+    return reconciled;
+  }));
+}
+
+/** Extract only a real Slack-style provider timestamp from a delayed receipt. */
+function slackThreadTsFromDraftReceipt(value: unknown): string | undefined {
+  const root = asRecord(value);
+  const receipt = asRecord(root?.receipt) ?? root;
+  const providerResult = asRecord(receipt?.providerResult);
+  const candidate = str(receipt?.externalId) ?? str(receipt?.ts) ?? str(providerResult?.ts);
+  return candidate && /^\d{1,20}\.\d{1,20}$/u.test(candidate) ? candidate : undefined;
 }
 
 async function saveExactPost(ctx: WorkforceCtx, record: PostRecord): Promise<ExactPostSaveResult> {

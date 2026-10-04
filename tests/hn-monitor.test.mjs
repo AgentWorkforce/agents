@@ -510,6 +510,69 @@ test('postFreshStories persists exact digest state and warns when semantic memor
   assert.equal(posts.length, 2, 'memory unavailability must not break Slack posting');
 });
 
+test('Slack Q&A reconciles a delayed header receipt before resolving an ordinal', async () => {
+  const { ctx, files, logs } = fakeCtx();
+  const posts = [];
+  const story = {
+    id: 4243,
+    title: 'Durable Relayfile receipts for agent digests',
+    url: 'https://example.com/durable-relayfile-receipts',
+    hnUrl: 'https://news.ycombinator.com/item?id=4243',
+    points: 61,
+    comments: 19,
+    category: 'Agent infrastructure',
+    feeds: ['new'],
+  };
+
+  await postFreshStories(ctx, fakeDelivery(posts), [], [story]);
+  const statePath = '/slack/channels/C123/hn-monitor/recent-digests.json';
+  const state = JSON.parse(files.get(statePath));
+  const draftRef = '/slack/channels/C123/messages/delayed-header.json';
+  state.posts[0].threadRefs[0].draftRef = draftRef;
+  files.set(statePath, JSON.stringify(state));
+  assert.equal(state.posts[0].threadRefs[0].threadTs, '');
+
+  // Relayfile rewrites the accepted draft with the eventual provider receipt.
+  files.set(draftRef, JSON.stringify({ created: 'accepted', externalId: '1710000000.4243' }));
+  const event = envelopeToAgentEvent({
+    id: 'evt-hn-delayed-receipt',
+    workspace: 'ws-test',
+    type: 'slack.app_mention',
+    occurredAt: '2026-10-04T06:15:00Z',
+    resource: {
+      channel: 'C123',
+      ts: '1710000000.5000',
+      thread_ts: '1710000000.4243',
+      user: 'U1',
+      text: '<@UBOT> tell me more about story 1',
+    },
+  });
+  let selectedId;
+
+  await handleQaMessage(ctx, event, 'slack', {
+    searchByTitle: async () => null,
+    fetchDetails: async (id) => {
+      selectedId = id;
+      return {
+        id,
+        title: story.title,
+        url: story.url,
+        hnUrl: story.hnUrl,
+        points: story.points,
+        commentsCount: story.comments,
+        topComments: [],
+      };
+    },
+    complete: async () => 'Grounded delayed-receipt answer.',
+    slackReply: async () => {},
+  });
+
+  assert.equal(selectedId, story.id);
+  assert.ok(files.has('/slack/channels/C123/hn-monitor/digests/by-thread/1710000000.4243.json'));
+  assert.ok(logs.some((entry) => entry.message === 'hn-monitor.post-thread-reconciled'));
+  assert.equal(logs.findLast((entry) => entry.message === 'hn-monitor.qa.selected').attrs.source, 'exact_state');
+});
+
 test('concurrent digest posts preserve authoritative per-thread state for both Slack threads', async () => {
   const { ctx, files } = fakeCtx();
   const first = { ...STORY, id: 6101, title: 'First concurrent agent runtime digest' };

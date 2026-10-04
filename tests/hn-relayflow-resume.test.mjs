@@ -65,8 +65,14 @@ test('production resume guard uses the exact workflow name journaled by pinned R
 });
 
 test('production Relayflow budget covers core v1 transient replays and caller overhead', async () => {
+  const source = scheduledDigestWorkflowSource();
   assert.equal(SCHEDULED_DIGEST_WORKFLOW_TIMEOUT_MS, 480_000);
   assert.equal(SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS, 510_000);
+  // Focused tests use esbuild (`48e4`); the repository suite uses tsc
+  // (`480_000`). Pin the emitted program as well as its exported constants so
+  // materialization cannot silently drop the workflow-level timeout.
+  assert.match(source, /const WORKFLOW_TIMEOUT_MS = (?:48e4|480_000);/u);
+  assert.match(source, /\.timeout\(WORKFLOW_TIMEOUT_MS\)/u);
 });
 
 test('production Relayflow runner uses sandbox-local Agent Relay without a hosted workflow allocation', async () => {

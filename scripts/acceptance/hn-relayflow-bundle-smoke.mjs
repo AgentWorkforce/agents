@@ -13,6 +13,8 @@ const saved = [];
 const files = new Map();
 const preview = new PreviewTransport({ idFactory: (_request, sequence) => String(sequence) });
 let workflowCall;
+let workflowSource;
+let sandboxExec;
 
 const ctx = {
   workspaceId: 'bundle-smoke-workspace',
@@ -44,19 +46,25 @@ const ctx = {
     },
     async write(name, value) { files.set(name, value); },
   },
+  sandbox: {
+    cwd: '/workspace',
+    async writeFile(filePath, contents) {
+      workflowSource = { filePath, contents };
+    },
+    async exec(command, options) {
+      sandboxExec = { command, options };
+      workflowCall = JSON.parse(options.env.invocationArgs);
+      return {
+        exitCode: 0,
+        output: 'HN_DIGEST_NOTES_JSON:{"theme":"Durable HN orchestration.","stories":[{"id":20,"why":"Exercises the bundled local runner."}]}\nHN_RELAYFLOW_RUN_ID:bundle-smoke\n',
+      };
+    },
+  },
   workflow: {
     async run() {
       throw new Error('bundle smoke must not allocate a hosted workflow sandbox');
     },
   },
-};
-
-const runDigestWorkflow = async (args) => {
-  workflowCall = args;
-  return {
-    runId: 'bundle-smoke',
-    output: 'HN_DIGEST_NOTES_JSON:{"theme":"Durable HN orchestration.","stories":[{"id":20,"why":"Exercises a journaled agent workflow."}]}',
-  };
 };
 
 const fixtureStory = {
@@ -73,7 +81,6 @@ setPreviewTransport(preview);
 try {
   await bundle.runScheduledScan(ctx, {
     fetchStories: async () => [fixtureStory],
-    runDigestWorkflow,
   });
 } finally {
   clearPreviewTransport();
@@ -83,6 +90,11 @@ const posts = preview.actions.filter((action) => action.kind === 'provider.write
 
 assert.equal(workflowCall?.relayflowVersion, 'v1');
 assert.equal(workflowCall?.batchKey, 'hn-monitor:v1:20');
+assert.match(workflowSource?.filePath ?? '', /\.agentworkforce\/hn-monitor\/workflows\/hn-monitor-scheduled-digest-v1\.ts$/u);
+assert.match(workflowSource?.contents ?? '', /from '@relayflows\/core'/u);
+assert.match(sandboxExec?.command ?? '', /command -v agent-relay/u);
+assert.match(sandboxExec?.command ?? '', /node --experimental-strip-types/u);
+assert.equal(sandboxExec?.options?.cwd, '/workspace');
 assert.equal(posts.length, 2);
 assert.ok(posts.every((post) => typeof post.body.idempotencyKey === 'string'));
 assert.equal(posts[1].body.parentRef, posts[0].path);
@@ -97,5 +109,5 @@ console.log(JSON.stringify({
   version: workflowCall.relayflowVersion,
   posts: posts.length,
   stateSaves: saved.length,
-  localRunnerInjected: true,
+  bundledLocalRunnerExercised: true,
 }));

@@ -1084,6 +1084,8 @@ test('legacy pending body migration drops malformed refs without discarding the 
   const exactState = JSON.parse(files.get('/slack/channels/C123/hn-monitor/recent-digests.json'));
   assert.equal(exactState.posts[0].digest, 'legacy header\nlegacy body');
   assert.deepEqual(exactState.posts[0].threadRefs, []);
+  assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-thread-body') && JSON.parse(entry.content).cleared));
+  assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-post-state') && JSON.parse(entry.content).cleared));
   assert.ok(saved.some(isClearedOutbox));
   assert.ok(logs.some((entry) => entry.message === 'hn-monitor.legacy-recovery-migrated'));
 });

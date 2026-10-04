@@ -39,9 +39,9 @@ import {
   skipReason as telegramSkipReason
 } from '../shared/telegram.js';
 import {
-  materializeScheduledDigestWorkflow,
-  SCHEDULED_DIGEST_WORKFLOW_NAME
-} from './workflows/materialize.js';
+  runScheduledDigestWorkflow,
+  type ScheduledDigestWorkflowResult
+} from './workflows/scheduled-digest.js';
 import {
   createDigestDelivery,
   type DigestDeliveryClient,
@@ -164,7 +164,23 @@ const scheduledScanLocks = new Map<string, Promise<void>>();
 interface ScheduledScanDependencies {
   delivery?: DigestDeliveryClient | DeliveryClient;
   fetchStories?: (lookbackHours: number) => Promise<Story[]>;
+  runDigestWorkflow?: DigestWorkflowRunner;
 }
+
+type DigestWorkflowRunner = (args: {
+  relayflowVersion: typeof SCHEDULED_DIGEST_VERSION;
+  batchKey: string;
+  stories: Array<{
+    id: number;
+    title: string;
+    category?: string;
+    points: number;
+    comments: number;
+    feeds: string[];
+    url: string;
+    hnUrl?: string;
+  }>;
+}) => Promise<ScheduledDigestWorkflowResult>;
 
 // ── message parsing ──────────────────────────────────────────────────────
 
@@ -335,7 +351,7 @@ export async function runScheduledScan(
       return;
     }
 
-    await postFreshStories(ctx, delivery, seen, fresh);
+    await postFreshStories(ctx, delivery, seen, fresh, deps.runDigestWorkflow);
   });
 }
 
@@ -601,10 +617,11 @@ export async function postFreshStories(
   ctx: WorkforceCtx,
   delivery: DigestDeliveryClient | DeliveryClient,
   seen: number[],
-  fresh: Story[]
+  fresh: Story[],
+  runDigestWorkflow: DigestWorkflowRunner = (args) => runScheduledDigestWorkflow(ctx, args),
 ): Promise<void> {
   ctx.log('info', 'hn-monitor.summarizing', { fresh: fresh.length });
-  const { header, body, stories } = await summarize(ctx, fresh);
+  const { header, body, stories } = await summarize(ctx, fresh, runDigestWorkflow);
   const batchKey = scheduledDigestBatchKey(fresh);
   const outbox = newDigestOutbox(batchKey, header, body, stories, seen, delivery.targets);
 
@@ -690,7 +707,11 @@ async function resumeDigestOutbox(
     for (const [provider, state] of digestProviderEntries(outbox)) {
       if (state.header.status !== 'pending') continue;
       const ref = await sendDigestOperation(delivery, provider, outbox.header, {
-        idempotencyKey: state.header.operationKey
+        idempotencyKey: state.header.operationKey,
+        // Slack supports server-side parentRef ordering, so the draft path is
+        // sufficient to enqueue the body without waiting for a provider ts.
+        // Telegram still needs the delivered numeric message id to reply.
+        ...(provider === 'slack' ? { nonBlocking: true } : {})
       });
       state.header.ref = saveMessageRef(ref);
       state.header.status = 'delivered';
@@ -1000,7 +1021,11 @@ interface DigestNotes {
   whyById: Map<number, string>;
 }
 
-async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header: string; body: string; stories: PostedStory[] }> {
+async function summarize(
+  ctx: WorkforceCtx,
+  stories: Story[],
+  runDigestWorkflow: DigestWorkflowRunner,
+): Promise<{ header: string; body: string; stories: PostedStory[] }> {
   const storyData = stories.map((story) => ({
     id: story.id,
     title: story.title,
@@ -1014,32 +1039,26 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
   let notes: DigestNotes = { theme: fallbackTheme(stories), whyById: new Map() };
   const batchKey = scheduledDigestBatchKey(stories);
   try {
-    await materializeScheduledDigestWorkflow(ctx);
+    ctx.log('info', 'hn-monitor.relayflow-started', {
+      batchKey,
+      version: SCHEDULED_DIGEST_VERSION,
+      execution: 'local'
+    });
     const run = await withTimeout(
-      ctx.workflow.run(SCHEDULED_DIGEST_WORKFLOW_NAME, {
+      runDigestWorkflow({
         relayflowVersion: SCHEDULED_DIGEST_VERSION,
         batchKey,
         stories: storyData
       }),
-      30_000,
-      `ctx.workflow.run(${SCHEDULED_DIGEST_WORKFLOW_NAME})`
-    );
-    ctx.log('info', 'hn-monitor.relayflow-started', { batchKey, runId: run.runId, version: SCHEDULED_DIGEST_VERSION });
-    const completion = await withTimeout(
-      run.completion(),
       SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS,
-      `ctx.workflow.completion(${run.runId})`
+      'runScheduledDigestWorkflow(local)'
     );
-    if (completion.status !== 'success') {
-      throw new Error(`Relayflow ${run.runId} completed with status ${completion.status}`);
-    }
-    if (completion.output !== null && completion.output !== undefined) {
-      notes = parseDigestNotes(workflowOutputText(completion.output), stories);
-    }
+    notes = parseDigestNotes(run.output, stories);
     ctx.log('info', 'hn-monitor.relayflow-completed', {
       batchKey,
       runId: run.runId,
-      usedFallback: completion.output === null || completion.output === undefined
+      usedFallback: false,
+      execution: 'local'
     });
   } catch (error) {
     // Keep the existing delivery semantics: orchestration/model unavailability
@@ -1052,15 +1071,6 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
 export function scheduledDigestBatchKey(stories: Story[]): string {
   const ids = [...new Set(stories.map((story) => story.id))].sort((a, b) => a - b);
   return `hn-monitor:${SCHEDULED_DIGEST_VERSION}:${ids.join(',')}`;
-}
-
-function workflowOutputText(output: unknown): string {
-  if (typeof output === 'string') return output;
-  try {
-    return JSON.stringify(output);
-  } catch {
-    return String(output);
-  }
 }
 
 function parseDigestNotes(output: string, stories: Story[]): DigestNotes {
@@ -1475,10 +1485,78 @@ async function loadExactPosts(ctx: WorkforceCtx, threadTs?: string): Promise<Pos
     const indexed = state.kind === 'hn-monitor exact recent digests' && state.version === 1 && Array.isArray(state.posts)
       ? state.posts.filter(isPostRecord)
       : [];
-    return mergePosts(threadPost ? [threadPost] : [], indexed).slice(0, 12);
+    const reconciled = await reconcilePendingSlackThreadRefs(ctx, indexed);
+    return mergePosts(threadPost ? [threadPost] : [], reconciled).slice(0, 12);
   } catch {
     return threadPost ? [threadPost] : [];
   }
+}
+
+/**
+ * A non-blocking Slack write returns its stable Relayfile draft path before the
+ * provider receipt (and therefore the root message ts) exists. Relayfile later
+ * rewrites that draft as a receipt. Resolve those delayed receipts when a Q&A
+ * event loads recent digests, then persist the authoritative per-thread shard
+ * so ordinary Slack `thread_ts` replies remain grounded without making the
+ * scheduled delivery wait for a provider round trip.
+ */
+async function reconcilePendingSlackThreadRefs(
+  ctx: WorkforceCtx,
+  posts: PostRecord[]
+): Promise<PostRecord[]> {
+  const channel = input(ctx, 'SLACK_CHANNEL')?.trim();
+  if (!channel) return posts;
+  const draftPrefix = `/slack/channels/${encodeURIComponent(channel)}/messages/`;
+  return Promise.all(posts.map(async (post) => {
+    const storedRefs = post.threadRefs ?? [];
+    const refs = storedRefs.filter(isSavedHeaderRef);
+    let changed = refs.length !== storedRefs.length;
+    const resolvedRefs = await Promise.all(refs.map(async (ref): Promise<SavedHeaderRef> => {
+      if (
+        ref.provider !== 'slack' ||
+        ref.threadTs ||
+        !ref.draftRef.startsWith(draftPrefix) ||
+        (ref.channel && ref.channel !== channel)
+      ) return ref;
+      try {
+        const threadTs = slackThreadTsFromDraftReceipt(JSON.parse(await ctx.files.read(ref.draftRef)) as unknown);
+        if (!threadTs) return ref;
+        changed = true;
+        return { ...ref, threadTs };
+      } catch {
+        // The draft is still pending, absent from this mount snapshot, or was
+        // not valid JSON yet. Keep the stable ref and try again on a later Q&A.
+        return ref;
+      }
+    }));
+    if (!changed) return post;
+
+    const reconciled: PostRecord = { ...post, threadRefs: resolvedRefs };
+    for (const ref of resolvedRefs) {
+      if (ref.provider !== 'slack' || !ref.threadTs) continue;
+      const threadPath = exactDigestThreadPath(ctx, ref.threadTs);
+      if (!threadPath) continue;
+      try {
+        await ctx.files.write(threadPath, `${JSON.stringify(reconciled, null, 2)}\n`);
+        ctx.log('info', 'hn-monitor.post-thread-reconciled', {
+          channel: ref.channel,
+          threadTs: ref.threadTs
+        });
+      } catch (error) {
+        ctx.log('warn', 'hn-monitor.post-state-shard-unavailable', { error: String(error) });
+      }
+    }
+    return reconciled;
+  }));
+}
+
+/** Extract only a real Slack-style provider timestamp from a delayed receipt. */
+function slackThreadTsFromDraftReceipt(value: unknown): string | undefined {
+  const root = asRecord(value);
+  const receipt = asRecord(root?.receipt) ?? root;
+  const providerResult = asRecord(receipt?.providerResult);
+  const candidate = str(receipt?.externalId) ?? str(receipt?.ts) ?? str(providerResult?.ts);
+  return candidate && /^\d{1,20}\.\d{1,20}$/u.test(candidate) ? candidate : undefined;
 }
 
 async function saveExactPost(ctx: WorkforceCtx, record: PostRecord): Promise<ExactPostSaveResult> {
@@ -1826,8 +1904,13 @@ async function loadLegacyPendingThreadBody(ctx: WorkforceCtx): Promise<LegacyPen
         typeof record.body === 'string' &&
         typeof record.createdAt === 'string' &&
         Array.isArray(record.stories) && record.stories.every(isPostedStory) &&
-        Array.isArray(record.headerRefs) && record.headerRefs.every(isSavedHeaderRef)
-      ) return record as unknown as LegacyPendingThreadBody;
+        Array.isArray(record.headerRefs)
+      ) {
+        return {
+          ...record,
+          headerRefs: record.headerRefs.filter(isSavedHeaderRef)
+        } as unknown as LegacyPendingThreadBody;
+      }
     } catch {
       // try the next recalled version
     }
@@ -1849,10 +1932,12 @@ async function loadLegacyPendingPostState(ctx: WorkforceCtx): Promise<LegacyPend
       if (
         record &&
         isPostRecord(record.record) &&
-        record.record.stories.every(isPostedStory) &&
-        (record.record.threadRefs ?? []).every(isSavedHeaderRef)
+        record.record.stories.every(isPostedStory)
       ) {
-        return { record: record.record };
+        const threadRefs = Array.isArray(record.record.threadRefs)
+          ? record.record.threadRefs.filter(isSavedHeaderRef)
+          : [];
+        return { record: { ...record.record, threadRefs } };
       }
     } catch {
       // try the next recalled version
@@ -1870,7 +1955,10 @@ function isSavedHeaderRef(value: unknown): value is SavedHeaderRef {
   return Boolean(
     ref &&
     (ref.provider === 'slack' || ref.provider === 'telegram') &&
-    typeof ref.draftRef === 'string' && ref.draftRef.length > 0
+    typeof ref.draftRef === 'string' && ref.draftRef.length > 0 &&
+    (ref.channel === undefined || typeof ref.channel === 'string') &&
+    (ref.chatId === undefined || typeof ref.chatId === 'string') &&
+    (ref.threadTs === undefined || typeof ref.threadTs === 'string')
   );
 }
 

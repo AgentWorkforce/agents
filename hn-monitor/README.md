@@ -19,11 +19,12 @@ matters” note.
 
 The deployed `defineAgent` schedule remains the product entrypoint. After the
 existing HN fetch, relevance ranking, and channel-scoped seen check, it invokes
-`workflows/hn-monitor-scheduled-digest-v1.ts` through `ctx.workflow.run()` and
-waits for completion before staging the dedupe claim and delivery. The current
-four-file deploy format does not carry auxiliary workflow files, so the handler
-materializes that file through `ctx.files` from its bundled, typechecked source
-generator immediately before the runtime uploads it. That Relayflow
+`runScheduledDigestWorkflow()` from the bundled handler and waits for completion
+before staging the dedupe claim and delivery. The handler materializes the
+typechecked workflow source under its current workspace and starts it as a local
+Node child process using the Agent Relay/RelayFlow runtime already installed in
+the proactive sandbox. It does not call `ctx.workflow.run()` and does not
+allocate a second hosted sandbox. That Relayflow
 uses the v1 journal with stable `prepare-input`, `analyze-stories`,
 `review-digest`, and `validate-digest` step identities. Completed step outputs
 survive `RESUME_RUN_ID`. A small v1 compatibility helper reactivates only
@@ -49,11 +50,9 @@ workspace/agent across the durable seen read, claim, workflow, and provider
 effects. The second delivery therefore re-reads the first delivery's claim
 instead of composing or posting the same batch from a stale snapshot.
 
-The invocation carries `relayflowVersion: v1`, while the current Cloud workflow
-request intentionally omits a runtime selector and therefore preserves the v1
-default. After Cloud v2 is proven, the narrow migration seam is the
-`SCHEDULED_DIGEST_VERSION` constant plus the single `ctx.workflow.run()` call;
-there is no v2 fallback in this workflow today.
+The local invocation carries `relayflowVersion: v1`. After RelayFlow v2 is
+proven, the narrow migration seam remains the `SCHEDULED_DIGEST_VERSION`
+constant and the local runner; there is no v2 fallback in this workflow today.
 
 You can also chat with it:
 
@@ -114,13 +113,13 @@ agentworkforce deploy ./hn-monitor/persona.ts --mode cloud --dry-run
 ```
 
 Local invocation always previews Slack actions; it never sends them. The
-scheduled preview records the `compose.run` request without launching the
-remote workflow, so the rendered preview uses the same deterministic fallback
-as an unavailable orchestration run. The explicit `live-model.case.yaml`
+scheduled path logs `hn-monitor.relayflow-started` and never records a hosted
+`compose.run` request. If the local model runtime is unavailable, the handler
+uses the same deterministic fallback as any other orchestration failure. The explicit `live-model.case.yaml`
 command exercises the live-model request and grounded fallback on the
 conversational Slack follow-up path;
-its final event source is `slack`, while its scheduled turn remains a Relayflow
-compose preview. `npm run evals:hn`
+its final event source is `slack`, while its scheduled turn remains a local
+RelayFlow run. `npm run evals:hn`
 and `npm run preview:hn` are thin wrappers
 around the platform invoke surface and fail closed until the Workforce CLI
 ships the required `--case` / `--schedule --reads --model` closure flags.

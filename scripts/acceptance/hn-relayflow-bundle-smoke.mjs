@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PreviewTransport, clearPreviewTransport, setPreviewTransport } from '@relayfile/relay-helpers';
@@ -15,6 +13,8 @@ const saved = [];
 const files = new Map();
 const preview = new PreviewTransport({ idFactory: (_request, sequence) => String(sequence) });
 let workflowCall;
+let workflowSource;
+let sandboxExec;
 
 const ctx = {
   workspaceId: 'bundle-smoke-workspace',
@@ -46,18 +46,23 @@ const ctx = {
     },
     async write(name, value) { files.set(name, value); },
   },
-  workflow: {
-    async run(name, args) {
-      workflowCall = { name, args, source: files.get(`workflows/${name}.ts`) };
+  sandbox: {
+    cwd: '/workspace',
+    async writeFile(filePath, contents) {
+      workflowSource = { filePath, contents };
+    },
+    async exec(command, options) {
+      sandboxExec = { command, options };
+      workflowCall = JSON.parse(options.env.invocationArgs);
       return {
-        runId: 'bundle-smoke',
-        async completion() {
-          return {
-            status: 'success',
-            output: 'HN_DIGEST_NOTES_JSON:{"theme":"Durable HN orchestration.","stories":[{"id":20,"why":"Exercises a journaled agent workflow."}]}',
-          };
-        },
+        exitCode: 0,
+        output: 'HN_DIGEST_NOTES_JSON:{"theme":"Durable HN orchestration.","stories":[{"id":20,"why":"Exercises the bundled local runner."}]}\nHN_RELAYFLOW_RUN_ID:bundle-smoke\n',
       };
+    },
+  },
+  workflow: {
+    async run() {
+      throw new Error('bundle smoke must not allocate a hosted workflow sandbox');
     },
   },
 };
@@ -74,17 +79,22 @@ const fixtureStory = {
 
 setPreviewTransport(preview);
 try {
-  await bundle.runScheduledScan(ctx, { fetchStories: async () => [fixtureStory] });
+  await bundle.runScheduledScan(ctx, {
+    fetchStories: async () => [fixtureStory],
+  });
 } finally {
   clearPreviewTransport();
 }
 
 const posts = preview.actions.filter((action) => action.kind === 'provider.write' && action.provider === 'slack');
 
-assert.equal(workflowCall?.name, 'hn-monitor-scheduled-digest-v1');
-assert.equal(workflowCall?.args.relayflowVersion, 'v1');
-assert.match(workflowCall?.source ?? '', /from '@relayflows\/core'/u);
-assert.doesNotMatch(workflowCall?.source ?? '', /from ['"]\.\/relayflow-v1-resume/u);
+assert.equal(workflowCall?.relayflowVersion, 'v1');
+assert.equal(workflowCall?.batchKey, 'hn-monitor:v1:20');
+assert.match(workflowSource?.filePath ?? '', /\.agentworkforce\/hn-monitor\/workflows\/hn-monitor-scheduled-digest-v1\.ts$/u);
+assert.match(workflowSource?.contents ?? '', /from '@relayflows\/core'/u);
+assert.match(sandboxExec?.command ?? '', /command -v agent-relay/u);
+assert.match(sandboxExec?.command ?? '', /node --experimental-strip-types/u);
+assert.equal(sandboxExec?.options?.cwd, '/workspace');
 assert.equal(posts.length, 2);
 assert.ok(posts.every((post) => typeof post.body.idempotencyKey === 'string'));
 assert.equal(posts[1].body.parentRef, posts[0].path);
@@ -94,36 +104,10 @@ const outboxSaves = saved.filter((entry) => entry.opts?.tags?.includes('hn-monit
 assert.equal(outboxSaves.length, 7);
 assert.equal(JSON.parse(outboxSaves.at(-1).content).cleared, true);
 
-const sourceDir = await mkdtemp(path.resolve('.hn-relayflow-bundle-source-'));
-let sourceDryRun;
-try {
-  const workflowPath = path.join(sourceDir, 'hn-monitor-scheduled-digest-v1.ts');
-  await writeFile(workflowPath, workflowCall.source);
-  sourceDryRun = spawnSync(
-    path.resolve('node_modules/.bin/tsx'),
-    [workflowPath],
-    {
-      cwd: sourceDir,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        DRY_RUN: '1',
-        invocationArgs: JSON.stringify(workflowCall.args),
-      },
-    },
-  );
-  assert.equal(sourceDryRun.status, 0, `${sourceDryRun.stdout}\n${sourceDryRun.stderr}`);
-  assert.match(sourceDryRun.stdout, /HN_RELAYFLOW_DRY_RUN:/u);
-  assert.match(sourceDryRun.stdout, /"name":"hn-monitor-scheduled-digest-v1-workflow"/u);
-} finally {
-  await rm(sourceDir, { recursive: true, force: true });
-}
-
 console.log(JSON.stringify({
-  workflow: workflowCall.name,
-  version: workflowCall.args.relayflowVersion,
-  sourceBytes: workflowCall.source.length,
+  workflow: 'hn-monitor-scheduled-digest-v1',
+  version: workflowCall.relayflowVersion,
   posts: posts.length,
   stateSaves: saved.length,
-  emittedSourceDryRun: sourceDryRun?.status === 0,
+  bundledLocalRunnerExercised: true,
 }));

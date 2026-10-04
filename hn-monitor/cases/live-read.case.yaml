@@ -14,7 +14,6 @@ policy:
   writes: preview
   model: stub
   shell: simulate
-  compose: preview
 expect:
   status: succeeded
   eventSource: cron

@@ -70,7 +70,7 @@ test('local invoke case policy rejects writes: sandbox from a case file', () => 
   );
 });
 
-test('scheduled scan case pins Relayflow composition and the Slack thread assertion', () => {
+test('scheduled scan case pins local Relayflow execution and the Slack thread assertion', () => {
   const scan = cases.get('scheduled-scan.case.yaml').value;
   assert.deepEqual(scan.event, { schedule: 'scan' });
   assert.deepEqual(scan.policy, {
@@ -78,10 +78,10 @@ test('scheduled scan case pins Relayflow composition and the Slack thread assert
     writes: 'preview',
     model: 'stub',
     shell: 'simulate',
-    compose: 'preview',
   });
   assert.ok(scan.expect.logsContain.includes('hn-monitor.feed-scan'));
-  assert.ok(scan.expect.effectsContain.includes('compose.run'));
+  assert.ok(scan.expect.logsContain.includes('hn-monitor.relayflow-started'));
+  assert.ok(!scan.expect.effectsContain.includes('compose.run'));
   assert.ok(!scan.expect.effectsContain.includes('model.complete'));
   assert.ok(scan.expect.effectsContain.includes('provider.write'));
   assert.deepEqual(scan.expect.providerActions[0], {
@@ -107,7 +107,8 @@ test('deterministic feed case preserves story-selection and memory coverage', ()
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.matched-agentic matched=3'));
   assert.ok(deterministic.expect.logsContain.includes('hn-monitor.posted'));
   assert.ok(deterministic.expect.effectsContain.includes('memory.save'));
-  assert.ok(deterministic.expect.effectsContain.includes('compose.run'));
+  assert.ok(deterministic.expect.logsContain.includes('hn-monitor.relayflow-started'));
+  assert.ok(!deterministic.expect.effectsContain.includes('compose.run'));
 });
 
 test('legacy eval JSONL keeps the HN deterministic feed-count contract in sync', () => {
@@ -164,7 +165,7 @@ test('live-read case is non-vacuous: has inputs and asserts only stable live-rea
   assert.equal(liveRead.expect?.providerActions, undefined, 'live-read must not pin data-dependent preview writes');
 });
 
-test('live-model case composes the scheduled digest and reserves the live model for follow-up Q&A', () => {
+test('live-model case runs the scheduled digest locally and reserves the live model for follow-up Q&A', () => {
   const liveModel = cases.get('live-model.case.yaml').value;
   assert.equal(liveModel.policy?.reads, 'fixtures', 'live-model must use fixture reads');
   assert.equal(liveModel.policy?.model, 'live', 'live-model must use model: live');
@@ -183,8 +184,10 @@ test('live-model case composes the scheduled digest and reserves the live model 
     'live-model must assert feed-scan log with concrete counts');
   assert.ok(liveModel.expect?.effectsContain?.includes('http.read'),
     'live-model must assert http.read effect for fixture-backed HN fetches');
-  assert.ok(liveModel.expect?.effectsContain?.includes('compose.run'),
-    'live-model must assert the scheduled Relayflow v1 boundary');
+  assert.ok(liveModel.expect?.logsContain?.includes('hn-monitor.relayflow-started'),
+    'live-model must assert the local scheduled Relayflow v1 boundary');
+  assert.ok(!liveModel.expect?.effectsContain?.includes('compose.run'),
+    'local Relayflow execution must not request a hosted compose run');
   assert.ok(liveModel.expect?.effectsContain?.includes('model.complete'),
     'live-model must assert model.complete for the conversational follow-up only');
   assert.ok(liveModel.expect?.effectsContain?.includes('provider.write'),
@@ -201,20 +204,23 @@ test('slack-follow-up case keeps memory and grounding assertions without claimin
     'follow-up case must assert qa.slack-replied');
   assert.ok(followUp.expect?.effectsContain?.includes('memory.save'),
     'follow-up case must assert memory.save (turn 1 must persist post data for turn 2)');
-  assert.ok(followUp.expect?.effectsContain?.includes('compose.run'),
-    'follow-up turn 1 must cross the scheduled Relayflow boundary');
+  assert.ok(followUp.expect?.logsContain?.includes('hn-monitor.relayflow-started'),
+    'follow-up turn 1 must cross the local scheduled Relayflow boundary');
+  assert.ok(!followUp.expect?.effectsContain?.includes('compose.run'),
+    'follow-up turn 1 must not request a hosted compose run');
   assert.equal(followUp.turns?.[1]?.thread_ts, '200.1',
     'follow-up fixture should keep a concrete thread_ts for the inbound Slack thread');
 });
 
 test('scheduled product handler is backed by a resumable, repairable Relayflow v1 DAG', () => {
   const agentSource = readFileSync(resolve('hn-monitor/agent.ts'), 'utf8');
-  const materializerSource = readFileSync(resolve('hn-monitor/workflows/materialize.ts'), 'utf8');
   const workflowSource = readFileSync(resolve('hn-monitor/workflows/scheduled-digest.ts'), 'utf8');
   const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf8'));
 
   assert.match(agentSource, /if \(!isCronTickEvent[\s\S]*await runScheduledScan\(ctx\);/u);
-  assert.match(agentSource, /await materializeScheduledDigestWorkflow\(ctx\);[\s\S]*ctx\.workflow\.run\(SCHEDULED_DIGEST_WORKFLOW_NAME/u);
+  assert.match(agentSource, /runDigestWorkflow\(\{[\s\S]*relayflowVersion:\s*SCHEDULED_DIGEST_VERSION/u);
+  assert.doesNotMatch(agentSource, /ctx\.workflow\.run/u);
+  assert.equal(existsSync(resolve('hn-monitor/workflows/materialize.ts')), false);
   assert.match(agentSource, /relayflowVersion:\s*SCHEDULED_DIGEST_VERSION/u);
   assert.equal(pkg.dependencies['@relayflows/core'], '^1.0.6');
 
@@ -224,13 +230,15 @@ test('scheduled product handler is backed by a resumable, repairable Relayflow v
   assert.match(workflowSource, /\.step\('review-digest'/u);
   assert.match(workflowSource, /\.step\('validate-digest'/u);
   assert.match(workflowSource, /\.repairable\(/u);
-  assert.match(workflowSource, /process\.env\.RESUME_RUN_ID/u);
+  assert.match(workflowSource, /options\.resumeRunId/u);
+  assert.match(workflowSource, /builder\.run\(\{ cwd: workflowCwd, renderer: false \}\)/u);
+  assert.match(workflowSource, /export async function runScheduledDigestWorkflow/u);
+  assert.match(workflowSource, /ctx\.sandbox\.exec/u);
+  assert.match(workflowSource, /command -v agent-relay/u);
   assert.match(workflowSource, /reactivateSkippedV1Steps/u);
   assert.match(workflowSource, /\.agent\('curator'/u);
   assert.match(workflowSource, /\.agent\('reviewer'/u);
   assert.doesNotMatch(workflowSource, /relayflowVersion:\s*'v2'/u);
-  assert.match(materializerSource, /scheduledDigestWorkflowSource\(\)/u);
-  assert.match(materializerSource, /ctx\.files\.write\(target, scheduledDigestWorkflowSource\(\)\)/u);
 });
 
 test('HN eval and preview scripts are thin platform-invoke wrappers', () => {

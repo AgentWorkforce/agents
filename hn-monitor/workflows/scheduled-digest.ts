@@ -1,9 +1,12 @@
+import type { WorkforceCtx } from '@agentworkforce/runtime';
+
 interface JournalRun {
   workflowName: string;
   status: string;
 }
 
 export const SCHEDULED_DIGEST_WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
+export const SCHEDULED_DIGEST_WORKFLOW_TIMEOUT_MS = 480_000;
 
 /** Core v1 journals the builder's executable workflow definition with this suffix. */
 export function scheduledDigestJournalWorkflowName(publicName: string): string {
@@ -72,7 +75,27 @@ interface WorkflowProgramDependencies {
   scheduledDigestJournalWorkflowName: typeof scheduledDigestJournalWorkflowName;
 }
 
-function workflowProgram({
+interface WorkflowProgramOptions {
+  invocationArgs: unknown;
+  dryRun?: boolean;
+  resumeRunId?: string;
+  cwd?: string;
+}
+
+export interface ScheduledDigestWorkflowResult {
+  runId: string;
+  output: string;
+}
+
+const LOCAL_WORKFLOW_ROOT = '.agentworkforce/hn-monitor';
+const LOCAL_WORKFLOW_PATH = `${LOCAL_WORKFLOW_ROOT}/workflows/${SCHEDULED_DIGEST_WORKFLOW_NAME}.ts`;
+const LOCAL_RELAYFLOWS_CORE_LINK = `${LOCAL_WORKFLOW_ROOT}/node_modules/@relayflows/core`;
+
+function localShellArg(value: string): string {
+  return `'${value.replace(/'/gu, `'"'"'`)}'`;
+}
+
+async function workflowProgram({
   readFile,
   mkdir,
   writeFile,
@@ -82,7 +105,7 @@ function workflowProgram({
   JsonFileWorkflowDb,
   reactivateSkippedV1Steps,
   scheduledDigestJournalWorkflowName,
-}: WorkflowProgramDependencies): void {
+}: WorkflowProgramDependencies, options: WorkflowProgramOptions): Promise<ScheduledDigestWorkflowResult> {
 const WORKFLOW_NAME = 'hn-monitor-scheduled-digest-v1';
 const OUTPUT_MARKER = 'HN_DIGEST_NOTES_JSON:';
 // Core v1.0.6 may replay each nominal agent attempt twice for a transient
@@ -109,8 +132,9 @@ interface DigestInvocationArgs {
   stories: DigestStoryInput[];
 }
 
-async function main(): Promise<void> {
-  const args = readInvocationArgs();
+async function main(): Promise<ScheduledDigestWorkflowResult> {
+  const args = readInvocationArgs(options.invocationArgs);
+  const workflowCwd = options.cwd || process.cwd();
   const batchToken = createHash('sha256').update(args.batchKey).digest('hex').slice(0, 20);
   const artifactDir = path.posix.join('.relayflow', 'hn-monitor', batchToken);
   const requestPath = path.posix.join(artifactDir, 'request.json');
@@ -122,7 +146,10 @@ async function main(): Promise<void> {
   // non-destructive placeholders so the restricted grants below resolve to
   // exactly the three workflow artifacts. The journaled prepare step remains
   // authoritative and overwrites/removes their contents on a fresh run.
-  await ensurePermissionTargets(artifactDir, [requestPath, candidatePath, digestPath]);
+  await ensurePermissionTargets(
+    path.join(workflowCwd, artifactDir),
+    [requestPath, candidatePath, digestPath].map((target) => path.join(workflowCwd, target)),
+  );
 
   // @relayflows/core v1 journals these static step names and persists each
   // completed output under the run id. Its .run() automatically resumes the
@@ -232,8 +259,8 @@ async function main(): Promise<void> {
       onExhaustion: 'fail',
     });
 
-  if (process.env.DRY_RUN) {
-    const report = await builder.run({ dryRun: true, renderer: false });
+  if (options.dryRun) {
+    const report = await builder.run({ cwd: workflowCwd, dryRun: true, renderer: false });
     const permissionByAgent = new Map((report.permissions ?? []).map((entry) => [entry.agent, entry]));
     const curatorPermission = permissionByAgent.get('curator');
     const reviewerPermission = permissionByAgent.get('reviewer');
@@ -249,26 +276,28 @@ async function main(): Promise<void> {
     if (!report.valid || report.totalSteps !== 4 || !leastPrivilegeValid) {
       throw new Error(`Relayflow dry run invalid: ${report.errors.join('; ') || `${report.totalSteps} steps; expected 4`}`);
     }
-    process.stdout.write(`HN_RELAYFLOW_DRY_RUN:${JSON.stringify({
+    return {
+      runId: 'dry-run',
+      output: `HN_RELAYFLOW_DRY_RUN:${JSON.stringify({
       name: report.name,
       stepCount: report.totalSteps,
       batchKey: args.batchKey,
       permissions: report.permissions,
-    })}\n`);
-    return;
+      })}`,
+    };
   }
 
-  const requestedResumeRunId = process.env.RESUME_RUN_ID?.trim();
+  const requestedResumeRunId = options.resumeRunId?.trim();
   if (requestedResumeRunId) {
     await reactivateSkippedV1Steps(
       requestedResumeRunId,
       scheduledDigestJournalWorkflowName(WORKFLOW_NAME),
-      path.join(process.cwd(), '.agent-relay', 'workflow-runs.jsonl'),
+      path.join(workflowCwd, '.agent-relay', 'workflow-runs.jsonl'),
       (filePath) => new JsonFileWorkflowDb(filePath),
       ['analyze-stories', 'review-digest', 'validate-digest'],
     );
   }
-  const run = await builder.run({ renderer: false });
+  const run = await builder.run({ cwd: workflowCwd, renderer: false });
   if (run.status !== 'completed') {
     throw new Error(`Relayflow run ${run.id} ended with status ${run.status}`);
   }
@@ -276,17 +305,16 @@ async function main(): Promise<void> {
     throw new Error(`Relayflow resumed unexpected run ${run.id}; expected ${requestedResumeRunId}`);
   }
 
-  const outputPath = path.join(process.cwd(), '.agent-relay', 'step-outputs', run.id, 'validate-digest.md');
+  const outputPath = path.join(workflowCwd, '.agent-relay', 'step-outputs', run.id, 'validate-digest.md');
   const output = await readFile(outputPath, 'utf8');
   if (!output.includes(OUTPUT_MARKER)) {
     throw new Error(`Relayflow run ${run.id} has no validated digest output`);
   }
-  process.stdout.write(`${output.trim()}\n`);
+  return { runId: run.id, output: output.trim() };
 }
 
-function readInvocationArgs(): DigestInvocationArgs {
-  const raw = process.env.invocationArgs ?? '{}';
-  const parsed = JSON.parse(raw) as unknown;
+function readInvocationArgs(value: unknown): DigestInvocationArgs {
+  const parsed = (typeof value === 'string' ? JSON.parse(value) : value) as unknown;
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('invocationArgs must be a JSON object');
   }
@@ -390,16 +418,13 @@ async function ensurePermissionTargets(directory: string, targets: string[]): Pr
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+return main();
 }
 
 /**
- * The deploy bundle contains this generator. The scheduled persona writes its
- * result to workflows/<name>.ts immediately before ctx.workflow.run uploads
- * that one self-contained source file to Cloud.
+ * Self-contained source written into the proactive agent's existing sandbox.
+ * The RelayFlow dependency stays a source-level import so the persona deploy
+ * bundle does not inline Agent Relay's optional SSH/Daytona dependency graph.
  */
 export function scheduledDigestWorkflowSource(): string {
   return [
@@ -408,11 +433,90 @@ export function scheduledDigestWorkflowSource(): string {
     "import path from 'node:path';",
     "import { JsonFileWorkflowDb, workflow } from '@relayflows/core';",
     // esbuild/tsx can add this helper inside Function#toString() output. The
-    // uploaded workflow is a new module, so carry the tiny helper with it.
+    // materialized workflow is a new module, so carry the tiny helper with it.
     'const __name = (target) => target;',
     `const reactivateSkippedV1Steps = (${reactivateSkippedV1Steps.toString()});`,
     `const scheduledDigestJournalWorkflowName = (${scheduledDigestJournalWorkflowName.toString()});`,
-    `(${workflowProgram.toString()})({ readFile, mkdir, writeFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps, scheduledDigestJournalWorkflowName });`,
+    `const workflowProgram = (${workflowProgram.toString()});`,
+    'async function runLocalWorkflow() {',
+    '  const result = await workflowProgram({ readFile, mkdir, writeFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps, scheduledDigestJournalWorkflowName }, {',
+    "    invocationArgs: process.env.invocationArgs ?? '{}',",
+    "    dryRun: process.env.DRY_RUN === 'true',",
+    '    resumeRunId: process.env.RESUME_RUN_ID,',
+    '    cwd: process.cwd(),',
+    '  });',
+    "  process.stdout.write(`${result.output.trim()}\\nHN_RELAYFLOW_RUN_ID:${result.runId}\\n`);",
+    '}',
+    'runLocalWorkflow().catch((error) => {',
+    "  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\\n`);",
+    '  process.exitCode = 1;',
+    '});',
     '',
   ].join('\n');
+}
+
+/**
+ * Run the HN RelayFlow as a child process in the proactive agent's sandbox.
+ *
+ * Full Daytona and E2B images already contain Agent Relay (and therefore its
+ * RelayFlow core). We resolve that exact installed core from the `agent-relay`
+ * executable and expose it to the materialized workflow with a local symlink.
+ * No hosted workflow API is called and no second sandbox is allocated.
+ */
+export async function runScheduledDigestWorkflow(
+  ctx: Pick<WorkforceCtx, 'sandbox'>,
+  invocationArgs: unknown,
+): Promise<ScheduledDigestWorkflowResult> {
+  await ctx.sandbox.writeFile(LOCAL_WORKFLOW_PATH, scheduledDigestWorkflowSource());
+
+  const coreLinkParent = LOCAL_RELAYFLOWS_CORE_LINK.slice(0, LOCAL_RELAYFLOWS_CORE_LINK.lastIndexOf('/'));
+  const command = [
+    'set -eu',
+    'RELAY_BIN="$(command -v agent-relay || command -v relay || true)"',
+    'if [ -z "$RELAY_BIN" ]; then echo "agent-relay is not installed in this sandbox" >&2; exit 127; fi',
+    "RELAYFLOWS_CORE_DIR=\"$(node - \"$RELAY_BIN\" <<'HN_RELAY_CORE'",
+    "const { createRequire } = require('node:module');",
+    "const { execFileSync } = require('node:child_process');",
+    "const fs = require('node:fs');",
+    "const os = require('node:os');",
+    "const path = require('node:path');",
+    'const relayBin = process.argv[2];',
+    'const anchors = [',
+    "  path.join(os.homedir(), 'package.json'),",
+    '];',
+    "if (process.env.RELAY_SANDBOX_HOME) anchors.push(path.join(process.env.RELAY_SANDBOX_HOME, 'package.json'));",
+    'try { anchors.unshift(fs.realpathSync(relayBin)); } catch {}',
+    "try { anchors.push(path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'agent-relay', 'package.json')); } catch {}",
+    'for (const anchor of anchors) {',
+    '  try {',
+    '    const packageJson = createRequire(anchor).resolve(\'@relayflows/core/package.json\');',
+    '    process.stdout.write(path.dirname(packageJson));',
+    '    process.exit(0);',
+    '  } catch {}',
+    '}',
+    "process.stderr.write('could not resolve @relayflows/core from the sandbox Agent Relay installation\\n');",
+    'process.exit(1);',
+    'HN_RELAY_CORE',
+    ')"',
+    'if [ ! -f "$RELAYFLOWS_CORE_DIR/package.json" ]; then echo "could not resolve the sandbox RelayFlow runtime" >&2; exit 1; fi',
+    `mkdir -p ${localShellArg(coreLinkParent)}`,
+    `if [ -e ${localShellArg(LOCAL_RELAYFLOWS_CORE_LINK)} ] && [ ! -L ${localShellArg(LOCAL_RELAYFLOWS_CORE_LINK)} ]; then echo ${localShellArg(`${LOCAL_RELAYFLOWS_CORE_LINK} exists and is not a symlink`)} >&2; exit 1; fi`,
+    `ln -sfn "$RELAYFLOWS_CORE_DIR" ${localShellArg(LOCAL_RELAYFLOWS_CORE_LINK)}`,
+    `node --experimental-strip-types --no-warnings=ExperimentalWarning ${localShellArg(LOCAL_WORKFLOW_PATH)}`,
+  ].join('\n');
+
+  const result = await ctx.sandbox.exec(command, {
+    cwd: ctx.sandbox.cwd,
+    env: { invocationArgs: JSON.stringify(invocationArgs) },
+    timeoutMs: SCHEDULED_DIGEST_WORKFLOW_TIMEOUT_MS + 30_000,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`Local RelayFlow exited ${result.exitCode}: ${result.output.slice(-4_000)}`);
+  }
+  const runId = result.output.match(/^HN_RELAYFLOW_RUN_ID:(.+)$/mu)?.[1]?.trim();
+  if (!runId) throw new Error('Local RelayFlow completed without a run id');
+  if (!result.output.includes('HN_DIGEST_NOTES_JSON:')) {
+    throw new Error(`Local RelayFlow ${runId} completed without validated digest output`);
+  }
+  return { runId, output: result.output };
 }

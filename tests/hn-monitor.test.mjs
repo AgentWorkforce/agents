@@ -1022,9 +1022,10 @@ test('legacy pending exact-state intent migrates without replaying provider effe
     postedAt: '2026-09-03T09:00:00.000Z',
     digest: 'legacy header\nlegacy body',
     stories: [{ ...STORY, rank: 1 }],
-    threadRefs: [{
-      provider: 'slack', channel: 'C123', threadTs: '1710000000.100', draftRef: 'legacy-ref',
-    }],
+    threadRefs: [
+      { provider: 'slack', channel: 'C123', threadTs: 17, draftRef: 'malformed-legacy-ref' },
+      { provider: 'slack', channel: 'C123', threadTs: '1710000000.100', draftRef: 'legacy-ref' },
+    ],
   };
   ctx.memory.recall = async (_query, opts) => opts?.tags?.includes('hn-monitor:pending-post-state')
     ? [{
@@ -1043,9 +1044,46 @@ test('legacy pending exact-state intent migrates without replaying provider effe
 
   assert.equal(recovered, true);
   assert.equal(sends, 0);
-  assert.ok(files.has('/slack/channels/C123/hn-monitor/recent-digests.json'));
+  const exactState = JSON.parse(files.get('/slack/channels/C123/hn-monitor/recent-digests.json'));
+  assert.equal(exactState.posts[0].threadRefs.length, 1);
+  assert.equal(exactState.posts[0].threadRefs[0].draftRef, 'legacy-ref');
   assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-thread-body') && JSON.parse(entry.content).cleared));
   assert.ok(saved.some((entry) => entry.opts?.tags?.includes('hn-monitor:pending-post-state') && JSON.parse(entry.content).cleared));
+  assert.ok(saved.some(isClearedOutbox));
+  assert.ok(logs.some((entry) => entry.message === 'hn-monitor.legacy-recovery-migrated'));
+});
+
+test('legacy pending body migration drops malformed refs without discarding the digest', async () => {
+  const { ctx, saved, files, logs } = fakeCtx();
+  const createdAt = '2026-09-03T09:05:00.000Z';
+  ctx.memory.recall = async (_query, opts) => opts?.tags?.includes('hn-monitor:pending-thread-body')
+    ? [{
+        id: 'legacy-body',
+        content: JSON.stringify({
+          targets: 'slack',
+          header: 'legacy header',
+          body: 'legacy body',
+          createdAt,
+          stories: [{ ...STORY, rank: 1 }],
+          headerRefs: [{ provider: 'slack', draftRef: 'legacy-ref', threadTs: 17 }],
+        }),
+        tags: ['hn-monitor:pending-thread-body'],
+        scope: 'workspace',
+        createdAt,
+      }]
+    : [];
+  let sends = 0;
+
+  const recovered = await retryPendingThreadBody(ctx, {
+    targets: ['slack'],
+    async sendOperation() { sends += 1; throw new Error('a malformed legacy ref must not be replayed'); },
+  });
+
+  assert.equal(recovered, true);
+  assert.equal(sends, 0);
+  const exactState = JSON.parse(files.get('/slack/channels/C123/hn-monitor/recent-digests.json'));
+  assert.equal(exactState.posts[0].digest, 'legacy header\nlegacy body');
+  assert.deepEqual(exactState.posts[0].threadRefs, []);
   assert.ok(saved.some(isClearedOutbox));
   assert.ok(logs.some((entry) => entry.message === 'hn-monitor.legacy-recovery-migrated'));
 });

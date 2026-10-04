@@ -1904,8 +1904,13 @@ async function loadLegacyPendingThreadBody(ctx: WorkforceCtx): Promise<LegacyPen
         typeof record.body === 'string' &&
         typeof record.createdAt === 'string' &&
         Array.isArray(record.stories) && record.stories.every(isPostedStory) &&
-        Array.isArray(record.headerRefs) && record.headerRefs.every(isSavedHeaderRef)
-      ) return record as unknown as LegacyPendingThreadBody;
+        Array.isArray(record.headerRefs)
+      ) {
+        return {
+          ...record,
+          headerRefs: record.headerRefs.filter(isSavedHeaderRef)
+        } as unknown as LegacyPendingThreadBody;
+      }
     } catch {
       // try the next recalled version
     }
@@ -1927,10 +1932,12 @@ async function loadLegacyPendingPostState(ctx: WorkforceCtx): Promise<LegacyPend
       if (
         record &&
         isPostRecord(record.record) &&
-        record.record.stories.every(isPostedStory) &&
-        (record.record.threadRefs ?? []).every(isSavedHeaderRef)
+        record.record.stories.every(isPostedStory)
       ) {
-        return { record: record.record };
+        const threadRefs = Array.isArray(record.record.threadRefs)
+          ? record.record.threadRefs.filter(isSavedHeaderRef)
+          : [];
+        return { record: { ...record.record, threadRefs } };
       }
     } catch {
       // try the next recalled version

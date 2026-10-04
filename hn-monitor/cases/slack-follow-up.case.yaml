@@ -21,7 +21,6 @@ policy:
   writes: preview
   model: stub
   shell: simulate
-  compose: preview
 http:
   - method: GET
     match: tags=front_page
@@ -39,11 +38,11 @@ expect:
   status: succeeded
   eventSource: slack
   logsContain:
+    - hn-monitor.relayflow-started
     - hn-monitor.qa.hydrated
     - hn-monitor.qa.slack-replied
   effectsContain:
     - memory.save
-    - compose.run
     - model.complete
     - provider.write
   providerActions:

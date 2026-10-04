@@ -14,7 +14,6 @@ policy:
   writes: preview
   model: stub
   shell: simulate
-  compose: preview
 http:
   - method: GET
     match: tags=front_page
@@ -24,8 +23,8 @@ expect:
   eventSource: cron
   logsContain:
     - hn-monitor.feed-scan
+    - hn-monitor.relayflow-started
   effectsContain:
-    - compose.run
     - provider.write
   providerActions:
     - provider: slack

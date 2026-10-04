@@ -9,7 +9,7 @@ import {
   fetchHackerNewsFeeds,
   findStoryByExactTitle,
   handleQaMessage,
-  postFreshStories,
+  postFreshStories as productPostFreshStories,
   renderDigest,
   retryPendingThreadBody,
   selectQuestionStories,
@@ -107,6 +107,37 @@ function fakeDelivery(posts) {
   };
 }
 
+async function runFakeDigestWorkflow(ctx, args) {
+  const run = await ctx.workflow.run('hn-monitor-scheduled-digest-v1', args);
+  const completion = await run.completion();
+  if (completion.status !== 'success') {
+    throw new Error(`Relayflow ${run.runId} completed with status ${completion.status}`);
+  }
+  return {
+    runId: run.runId,
+    output: typeof completion.output === 'string'
+      ? completion.output
+      : JSON.stringify(completion.output ?? {}),
+  };
+}
+
+function postFreshStories(ctx, delivery, seen, fresh) {
+  return productPostFreshStories(
+    ctx,
+    delivery,
+    seen,
+    fresh,
+    (args) => runFakeDigestWorkflow(ctx, args),
+  );
+}
+
+function scheduledScanDeps(ctx, deps) {
+  return {
+    ...deps,
+    runDigestWorkflow: deps.runDigestWorkflow ?? ((args) => runFakeDigestWorkflow(ctx, args)),
+  };
+}
+
 function savedSeenIds(entry) {
   return JSON.parse(entry.content).ids;
 }
@@ -130,7 +161,7 @@ function latestActiveOutbox(saved) {
 
 const STORY = { id: 20, title: 'Agent Workforce cron leases', url: 'https://example.com/20', points: 42 };
 
-test('defineAgent scan schedule invokes the durable Relayflow v1 digest before publishing', async () => {
+test('defineAgent scan schedule runs the durable Relayflow v1 digest locally before publishing', async () => {
   assert.deepEqual(hnMonitorAgent.schedules, [
     { name: 'scan', cron: '0 9,17 * * *', tz: 'America/New_York' },
   ]);
@@ -141,36 +172,31 @@ test('defineAgent scan schedule invokes the durable Relayflow v1 digest before p
   );
 
   const workflowCalls = [];
-  const { ctx, events, saved, files } = fakeCtx({
+  const { ctx, saved } = fakeCtx({
     llm: {
       async complete() {
         throw new Error('the scheduled product path must not call ctx.llm directly');
       },
     },
   });
-  ctx.workflow.run = async (name, args) => {
-    events.push('workflow.run');
-    const source = files.get(`workflows/${name}.ts`);
-    assert.equal(typeof source, 'string', 'the deployable workflow source must exist before ctx.workflow.run');
-    workflowCalls.push({ name, args, source });
+  ctx.workflow.run = async () => {
+    throw new Error('the scheduled product path must not allocate a hosted workflow sandbox');
+  };
+  const runDigestWorkflow = async (args) => {
+    workflowCalls.push(args);
     return {
       runId: 'wf-hn-v1-20',
-      async completion() {
-        events.push('workflow.completion');
-        return {
-          status: 'success',
-          output: JSON.stringify({
-            theme: 'Durable orchestration is moving into the product path.',
-            stories: [{ id: 20, why: 'The scan now has journaled, resumable workflow steps.' }],
-          }),
-        };
-      },
+      output: `HN_DIGEST_NOTES_JSON:${JSON.stringify({
+        theme: 'Durable orchestration is moving into the product path.',
+        stories: [{ id: 20, why: 'The scan now has journaled, resumable workflow steps.' }],
+      })}`,
     };
   };
   const posts = [];
 
   await hnMonitor.runScheduledScan(ctx, {
     delivery: fakeDelivery(posts),
+    runDigestWorkflow,
     fetchStories: async () => [{
       ...STORY,
       title: 'AgentWorkforce durable agent runtime orchestration',
@@ -179,14 +205,9 @@ test('defineAgent scan schedule invokes the durable Relayflow v1 digest before p
   });
 
   assert.equal(workflowCalls.length, 1);
-  assert.equal(workflowCalls[0].name, 'hn-monitor-scheduled-digest-v1');
-  assert.equal(workflowCalls[0].args.relayflowVersion, 'v1');
-  assert.equal(workflowCalls[0].args.batchKey, 'hn-monitor:v1:20');
-  assert.deepEqual(workflowCalls[0].args.stories.map((story) => story.id), [20]);
-  assert.match(workflowCalls[0].source, /from '@relayflows\/core'/u);
-  assert.match(workflowCalls[0].source, /\.step\(["']validate-digest["']/u);
-  assert.doesNotMatch(workflowCalls[0].source, /from ['"]\.\/relayflow-v1-resume/u);
-  assert.ok(events.indexOf('workflow.run') < events.indexOf('workflow.completion'));
+  assert.equal(workflowCalls[0].relayflowVersion, 'v1');
+  assert.equal(workflowCalls[0].batchKey, 'hn-monitor:v1:20');
+  assert.deepEqual(workflowCalls[0].stories.map((story) => story.id), [20]);
   const seenSave = saved.find((entry) => entry.opts?.tags?.includes('hn-monitor:seen'));
   assert.deepEqual(savedSeenIds(seenSave), [20]);
   assert.ok(saved.find(isClearedOutbox), 'the completed provider/state transaction clears its outbox');
@@ -238,8 +259,8 @@ test('runScheduledScan serializes concurrent claims before starting a second Rel
   };
 
   await Promise.all([
-    hnMonitor.runScheduledScan(ctx, deps),
-    hnMonitor.runScheduledScan(ctx, deps),
+    hnMonitor.runScheduledScan(ctx, scheduledScanDeps(ctx, deps)),
+    hnMonitor.runScheduledScan(ctx, scheduledScanDeps(ctx, deps)),
   ]);
 
   assert.equal(workflowRuns, 1, 'the serialized durable claim must suppress duplicate orchestration');
@@ -482,7 +503,8 @@ test('postFreshStories persists exact digest state and warns when semantic memor
   assert.equal(state.posts[0].stories[0].id, 4242);
   assert.equal(state.posts[0].stories[0].rank, 1);
   assert.equal(state.posts[0].threadRefs[0].channel, 'C123');
-  assert.ok(state.posts[0].threadRefs[0].threadTs, 'delivered Slack timestamp should be retained for thread correlation');
+  assert.equal(state.posts[0].threadRefs[0].threadTs, '', 'non-blocking Slack delivery does not fabricate a provider timestamp');
+  assert.ok(state.posts[0].threadRefs[0].draftRef, 'the stable draft path should be retained for server-side threading and correlation');
   assert.ok(logs.some((entry) => entry.message === 'hn-monitor.post-state-saved'));
   assert.ok(logs.some((entry) => entry.level === 'warn' && entry.message === 'hn-monitor.post-memory-unavailable'));
   assert.equal(posts.length, 2, 'memory unavailability must not break Slack posting');
@@ -635,7 +657,7 @@ test('next scheduled tick repairs exact state after delivery without reposting',
   };
 
   await assert.rejects(
-    () => hnMonitor.runScheduledScan(ctx, deps),
+    () => hnMonitor.runScheduledScan(ctx, scheduledScanDeps(ctx, deps)),
     /deterministic HN grounding state could not be persisted/u,
   );
   assert.equal(posts.length, 2);
@@ -643,7 +665,7 @@ test('next scheduled tick repairs exact state after delivery without reposting',
   assert.equal(failedOutbox.phase, 'state');
 
   exactWritesFail = false;
-  await hnMonitor.runScheduledScan(ctx, deps);
+  await hnMonitor.runScheduledScan(ctx, scheduledScanDeps(ctx, deps));
 
   assert.equal(posts.length, 2, 'state-only recovery must not repeat header or body effects');
   assert.equal(workflowRuns, 1, 'the recovered seen claim must suppress a second orchestration');
@@ -1006,8 +1028,8 @@ test('partial multi-target header recovery retries only the missing provider', a
 
   const seenSaves = saved.filter((entry) => entry.opts?.tags?.includes('hn-monitor:seen'));
   assert.deepEqual(seenSaves.map(savedSeenIds), [[10, 20]], 'recovery does not repeat the claim');
-  assert.equal(calls.filter((call) => call.provider === 'slack' && !call.opts.nonBlocking).length, 1,
-    'the successful Slack header is not duplicated');
+  assert.equal(calls.filter((call) => call.provider === 'slack' && call.opts.nonBlocking).length, 2,
+    'the accepted Slack header and its body are each enqueued once without waiting for receipts');
   assert.equal(calls.filter((call) => call.provider === 'telegram' && !call.opts.nonBlocking).length, 2,
     'only the failed Telegram header is retried');
   assert.ok(saved.some(isClearedOutbox));
@@ -1041,7 +1063,7 @@ test('partial multi-target body recovery does not repeat the successful provider
   telegramBodyAvailable = true;
   await retryPendingThreadBody(ctx, delivery);
 
-  assert.equal(calls.filter((call) => call.provider === 'slack' && call.opts.nonBlocking).length, 1);
+  assert.equal(calls.filter((call) => call.provider === 'slack' && call.opts.nonBlocking).length, 2);
   assert.equal(calls.filter((call) => call.provider === 'telegram' && call.opts.nonBlocking).length, 2);
   assert.ok(saved.some(isClearedOutbox));
 });

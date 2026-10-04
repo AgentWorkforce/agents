@@ -39,9 +39,9 @@ import {
   skipReason as telegramSkipReason
 } from '../shared/telegram.js';
 import {
-  materializeScheduledDigestWorkflow,
-  SCHEDULED_DIGEST_WORKFLOW_NAME
-} from './workflows/materialize.js';
+  runScheduledDigestWorkflow,
+  type ScheduledDigestWorkflowResult
+} from './workflows/scheduled-digest.js';
 import {
   createDigestDelivery,
   type DigestDeliveryClient,
@@ -164,7 +164,23 @@ const scheduledScanLocks = new Map<string, Promise<void>>();
 interface ScheduledScanDependencies {
   delivery?: DigestDeliveryClient | DeliveryClient;
   fetchStories?: (lookbackHours: number) => Promise<Story[]>;
+  runDigestWorkflow?: DigestWorkflowRunner;
 }
+
+type DigestWorkflowRunner = (args: {
+  relayflowVersion: typeof SCHEDULED_DIGEST_VERSION;
+  batchKey: string;
+  stories: Array<{
+    id: number;
+    title: string;
+    category?: string;
+    points: number;
+    comments: number;
+    feeds: string[];
+    url: string;
+    hnUrl?: string;
+  }>;
+}) => Promise<ScheduledDigestWorkflowResult>;
 
 // ── message parsing ──────────────────────────────────────────────────────
 
@@ -335,7 +351,7 @@ export async function runScheduledScan(
       return;
     }
 
-    await postFreshStories(ctx, delivery, seen, fresh);
+    await postFreshStories(ctx, delivery, seen, fresh, deps.runDigestWorkflow);
   });
 }
 
@@ -601,10 +617,11 @@ export async function postFreshStories(
   ctx: WorkforceCtx,
   delivery: DigestDeliveryClient | DeliveryClient,
   seen: number[],
-  fresh: Story[]
+  fresh: Story[],
+  runDigestWorkflow: DigestWorkflowRunner = (args) => runScheduledDigestWorkflow(ctx, args),
 ): Promise<void> {
   ctx.log('info', 'hn-monitor.summarizing', { fresh: fresh.length });
-  const { header, body, stories } = await summarize(ctx, fresh);
+  const { header, body, stories } = await summarize(ctx, fresh, runDigestWorkflow);
   const batchKey = scheduledDigestBatchKey(fresh);
   const outbox = newDigestOutbox(batchKey, header, body, stories, seen, delivery.targets);
 
@@ -690,7 +707,11 @@ async function resumeDigestOutbox(
     for (const [provider, state] of digestProviderEntries(outbox)) {
       if (state.header.status !== 'pending') continue;
       const ref = await sendDigestOperation(delivery, provider, outbox.header, {
-        idempotencyKey: state.header.operationKey
+        idempotencyKey: state.header.operationKey,
+        // Slack supports server-side parentRef ordering, so the draft path is
+        // sufficient to enqueue the body without waiting for a provider ts.
+        // Telegram still needs the delivered numeric message id to reply.
+        ...(provider === 'slack' ? { nonBlocking: true } : {})
       });
       state.header.ref = saveMessageRef(ref);
       state.header.status = 'delivered';
@@ -1000,7 +1021,11 @@ interface DigestNotes {
   whyById: Map<number, string>;
 }
 
-async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header: string; body: string; stories: PostedStory[] }> {
+async function summarize(
+  ctx: WorkforceCtx,
+  stories: Story[],
+  runDigestWorkflow: DigestWorkflowRunner,
+): Promise<{ header: string; body: string; stories: PostedStory[] }> {
   const storyData = stories.map((story) => ({
     id: story.id,
     title: story.title,
@@ -1014,32 +1039,26 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
   let notes: DigestNotes = { theme: fallbackTheme(stories), whyById: new Map() };
   const batchKey = scheduledDigestBatchKey(stories);
   try {
-    await materializeScheduledDigestWorkflow(ctx);
+    ctx.log('info', 'hn-monitor.relayflow-started', {
+      batchKey,
+      version: SCHEDULED_DIGEST_VERSION,
+      execution: 'local'
+    });
     const run = await withTimeout(
-      ctx.workflow.run(SCHEDULED_DIGEST_WORKFLOW_NAME, {
+      runDigestWorkflow({
         relayflowVersion: SCHEDULED_DIGEST_VERSION,
         batchKey,
         stories: storyData
       }),
-      30_000,
-      `ctx.workflow.run(${SCHEDULED_DIGEST_WORKFLOW_NAME})`
-    );
-    ctx.log('info', 'hn-monitor.relayflow-started', { batchKey, runId: run.runId, version: SCHEDULED_DIGEST_VERSION });
-    const completion = await withTimeout(
-      run.completion(),
       SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS,
-      `ctx.workflow.completion(${run.runId})`
+      'runScheduledDigestWorkflow(local)'
     );
-    if (completion.status !== 'success') {
-      throw new Error(`Relayflow ${run.runId} completed with status ${completion.status}`);
-    }
-    if (completion.output !== null && completion.output !== undefined) {
-      notes = parseDigestNotes(workflowOutputText(completion.output), stories);
-    }
+    notes = parseDigestNotes(run.output, stories);
     ctx.log('info', 'hn-monitor.relayflow-completed', {
       batchKey,
       runId: run.runId,
-      usedFallback: completion.output === null || completion.output === undefined
+      usedFallback: false,
+      execution: 'local'
     });
   } catch (error) {
     // Keep the existing delivery semantics: orchestration/model unavailability
@@ -1052,15 +1071,6 @@ async function summarize(ctx: WorkforceCtx, stories: Story[]): Promise<{ header:
 export function scheduledDigestBatchKey(stories: Story[]): string {
   const ids = [...new Set(stories.map((story) => story.id))].sort((a, b) => a - b);
   return `hn-monitor:${SCHEDULED_DIGEST_VERSION}:${ids.join(',')}`;
-}
-
-function workflowOutputText(output: unknown): string {
-  if (typeof output === 'string') return output;
-  try {
-    return JSON.stringify(output);
-  } catch {
-    return String(output);
-  }
 }
 
 function parseDigestNotes(output: string, stories: Story[]): DigestNotes {

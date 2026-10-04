@@ -26,14 +26,23 @@ Node child process using the Agent Relay/RelayFlow runtime already installed in
 the proactive sandbox. It does not call `ctx.workflow.run()` and does not
 allocate a second hosted sandbox. That Relayflow
 uses the v1 journal with stable `prepare-input`, `analyze-stories`,
-`review-digest`, and `validate-digest` step identities. Completed step outputs
+`validate-candidate`, `review-digest`, and `validate-digest` step identities. Completed step outputs
 survive `RESUME_RUN_ID`. A small v1 compatibility helper reactivates only
 descendants on core `1.0.6` journaled as `skipped`; that version resets the failed
-step itself but otherwise leaves skipped descendants inert on resume. A
-deterministic final gate checks the exact batch key, story ids, and output
-bounds before the persona can consume the notes. Curator and reviewer agents
-run from the batch artifact directory with restricted file grants (request →
-candidate → digest), no inherited workspace access, and a `network: false`
+step itself but otherwise leaves skipped descendants inert on resume. If a
+marked model response contains malformed JSON, the workflow reactivates that
+producer and its validation chain once; it never retries the same invalid bytes
+indefinitely or replays the completed input step.
+Deterministic gates check the exact batch key, story ids, and output bounds
+before handing the normalized candidate to the reviewer or returning notes to the
+persona. Curator and reviewer agents return marked one-line JSON through their
+captured stdout—the contract RelayFlow's non-interactive worker wrapper owns—so
+they never depend on a conflicting direct file-write instruction. The gates read
+the current run's persisted step outputs without shell interpolation; a
+per-process run-id hint prevents concurrent or newer runs from being selected.
+The reviewer receives only the normalized candidate as prompt data. Both agents
+run from the batch artifact directory with a restricted read-only request grant,
+no inherited workspace access, and a `network: false`
 declaration. The workflow dry run fails unless those grants resolve exactly;
 enforcement beyond Relayflow's compiled permission policy remains the hosting
 runtime's responsibility. Provider writes and their exact Slack grounding
@@ -41,8 +50,9 @@ records intentionally remain in the persona so existing delivery and
 conversation semantics do not move.
 
 Pinned core v1.0.6 can perform two additional same-attempt agent replays for a
-transient network failure. The supported worst case is therefore about 451
-seconds. The workflow timeout is 480 seconds, the handler completion wait is
+transient network failure. Agent attempts are capped at 45 seconds so one
+malformed-output regeneration remains within the workflow budget. The workflow
+timeout is 480 seconds, the handler completion wait is
 510 seconds, and the persona harness timeout is 600 seconds.
 
 Within a deployed worker, overlapping schedule deliveries are serialized per

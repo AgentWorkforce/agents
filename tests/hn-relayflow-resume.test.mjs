@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
@@ -9,6 +9,8 @@ import { promisify } from 'node:util';
 import { JsonFileWorkflowDb, workflow } from '@relayflows/core';
 import { SCHEDULED_DIGEST_COMPLETION_TIMEOUT_MS } from '../.test-build/hn-monitor/agent.js';
 import {
+  buildPersistedAgentJsonCommand,
+  reactivateInvalidArtifactV1Steps,
   reactivateSkippedV1Steps,
   runScheduledDigestWorkflow,
   scheduledDigestJournalWorkflowName,
@@ -55,6 +57,70 @@ function resumeFixture() {
     .onError('fail-fast', { maxRetries: 0 });
 }
 
+function invalidArtifactRecoveryFixture() {
+  const batchKey = 'hn-monitor:v1:20';
+  const candidateValidator = buildPersistedAgentJsonCommand({
+    sourceStep: 'analyze-stories',
+    sourceMarker: 'HN_CANDIDATE_JSON:',
+    batchKey,
+    expectedIds: [20],
+    successMarker: 'HN_CANDIDATE_VALIDATED',
+  });
+  const digestValidator = buildPersistedAgentJsonCommand({
+    sourceStep: 'review-digest',
+    sourceMarker: 'HN_REVIEWED_DIGEST_JSON:',
+    batchKey,
+    expectedIds: [20],
+    successMarker: 'HN_DIGEST_NOTES_JSON:',
+    emitDigest: true,
+  });
+  return workflow('hn-monitor-v1-artifact-recovery-fixture')
+    .pattern('pipeline')
+    .step('prepare-input', {
+      type: 'deterministic',
+      command: 'if test -f prepare-once; then touch prepare-replayed; exit 91; fi\ntouch prepare-once',
+      captureOutput: true,
+      failOnError: true,
+    })
+    .step('analyze-stories', {
+      type: 'deterministic',
+      dependsOn: ['prepare-input'],
+      command: [
+        'if test ! -f analyze-attempted; then',
+        '  touch analyze-attempted',
+        `  printf '%s\\n' 'HN_CANDIDATE_JSON:{"batchKey":"${batchKey}",'`,
+        'else',
+        `  printf '%s\\n' 'HN_CANDIDATE_JSON:{"batchKey":"${batchKey}","theme":"recovered","stories":[{"id":20,"why":"valid retry"}]}'`,
+        'fi',
+      ].join('\n'),
+      captureOutput: true,
+      failOnError: true,
+      verification: { type: 'output_contains', value: 'HN_CANDIDATE_JSON:' },
+    })
+    .step('validate-candidate', {
+      type: 'deterministic',
+      dependsOn: ['analyze-stories'],
+      command: candidateValidator,
+      captureOutput: true,
+      failOnError: true,
+    })
+    .step('review-digest', {
+      type: 'deterministic',
+      dependsOn: ['validate-candidate'],
+      command: `printf '%s\\n' 'HN_REVIEWED_DIGEST_JSON:{"batchKey":"${batchKey}","theme":"reviewed","stories":[{"id":20,"why":"validated"}]}'`,
+      captureOutput: true,
+      failOnError: true,
+    })
+    .step('validate-digest', {
+      type: 'deterministic',
+      dependsOn: ['review-digest'],
+      command: digestValidator,
+      captureOutput: true,
+      failOnError: true,
+    })
+    .onError('fail-fast', { maxRetries: 0 });
+}
+
 test('production resume guard uses the exact workflow name journaled by pinned Relayflow v1', () => {
   const config = workflow(SCHEDULED_DIGEST_WORKFLOW_NAME)
     .step('name-contract', { type: 'deterministic', command: 'true' })
@@ -73,6 +139,77 @@ test('production Relayflow budget covers core v1 transient replays and caller ov
   // materialization cannot silently drop the workflow-level timeout.
   assert.match(source, /const WORKFLOW_TIMEOUT_MS = (?:48e4|480_000);/u);
   assert.match(source, /\.timeout\(WORKFLOW_TIMEOUT_MS\)/u);
+});
+
+test('production Relayflow hands non-interactive agent output to deterministic artifact validators', () => {
+  const source = scheduledDigestWorkflowSource();
+
+  assert.match(source, /HN_CANDIDATE_JSON:/u);
+  assert.match(source, /HN_REVIEWED_DIGEST_JSON:/u);
+  assert.match(source, /\.step\(["']validate-candidate["']/u);
+  assert.match(source, /sourceName = sourceStep \+ ["']\.md["']/u);
+  assert.match(source, /AGENT_RELAY_RUN_ID_FILE/u);
+  assert.match(source, /step-outputs["'], runId, sourceName/u);
+  assert.match(source, /await unlink\(runIdHint\)/u);
+  assert.match(source, /while \(run\.status !== ["']completed["'] && !regenerationUsed\)/u,
+    'a workflow invocation must cap total artifact regeneration at one');
+  assert.match(source, /expected exactly one/u);
+  assert.doesNotMatch(source, /verification:\s*\{ type: ["']file_exists["'], value: (?:candidatePath|digestPath) \}/u);
+  assert.match(source, /\{\{steps\.validate-candidate\.output\}\}/u,
+    'the validated candidate may be passed as prompt data to the reviewer');
+  assert.doesNotMatch(buildPersistedAgentJsonCommand({
+    sourceStep: 'analyze-stories',
+    sourceMarker: 'HN_CANDIDATE_JSON:',
+    batchKey: 'hn-monitor:v1:20',
+    expectedIds: [20],
+    successMarker: 'HN_CANDIDATE_VALIDATED',
+  }), /\{\{steps\./u, 'untrusted model output must never be shell-interpolated');
+});
+
+test('persisted stdout materialization validates JSON without shell-interpolating model output', async () => {
+  const runtimeDir = await mkdtemp(path.resolve('.hn-relayflow-handoff-'));
+  const runId = '111111111111111111111111';
+  const outputDir = path.join(runtimeDir, '.agent-relay', 'step-outputs', runId);
+  const runIdFile = path.join(runtimeDir, 'current-run-id');
+  try {
+    await mkdir(outputDir, { recursive: true });
+    await writeFile(
+      path.join(outputDir, 'analyze-stories.md'),
+      [
+        'curator preface',
+        `HN_CANDIDATE_JSON:${JSON.stringify({
+          batchKey: 'hn-monitor:v1:20',
+          theme: 'Safe persisted handoff',
+          stories: [{ id: 20, why: 'Literal $(touch should-not-exist) stays data.' }],
+        })}`,
+        'OWNER_DECISION: COMPLETE',
+      ].join('\n'),
+    );
+    const decoyDir = path.join(runtimeDir, '.agent-relay', 'step-outputs', '222222222222222222222222');
+    await mkdir(decoyDir, { recursive: true });
+    await writeFile(path.join(decoyDir, 'analyze-stories.md'), 'HN_CANDIDATE_JSON:{"batchKey":"wrong"}\n');
+    await writeFile(runIdFile, `${runId}\n`);
+
+    const command = buildPersistedAgentJsonCommand({
+      sourceStep: 'analyze-stories',
+      sourceMarker: 'HN_CANDIDATE_JSON:',
+      batchKey: 'hn-monitor:v1:20',
+      expectedIds: [20],
+      successMarker: 'HN_CANDIDATE_VALIDATED',
+    });
+    const { stdout } = await execFileAsync('/bin/sh', ['-c', command], {
+      cwd: runtimeDir,
+      env: { ...process.env, AGENT_RELAY_RUN_ID_FILE: runIdFile },
+    });
+
+    assert.equal(
+      stdout,
+      'HN_CANDIDATE_VALIDATED{"batchKey":"hn-monitor:v1:20","theme":"Safe persisted handoff","stories":[{"id":20,"why":"Literal $(touch should-not-exist) stays data."}]}\n',
+    );
+    assert.equal(existsSync(path.join(runtimeDir, 'should-not-exist')), false);
+  } finally {
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
 });
 
 test('production Relayflow runner uses sandbox-local Agent Relay without a hosted workflow allocation', async () => {
@@ -122,7 +259,7 @@ test('production Relayflow runner uses sandbox-local Agent Relay without a hoste
   assert.deepEqual(JSON.parse(execs[0].options.env.invocationArgs), args);
 });
 
-test('materialized production Relayflow source validates its four-step least-privilege plan locally', async () => {
+test('materialized production Relayflow source validates its five-step least-privilege plan locally', async () => {
   const runtimeDir = await mkdtemp(path.resolve('.hn-relayflow-local-'));
   try {
     await writeFile(path.join(runtimeDir, 'unrelated-cloud-credential.txt'), 'must-not-be-readable');
@@ -157,12 +294,12 @@ test('materialized production Relayflow source validates its four-step least-pri
     assert.ok(dryRunLine);
     const report = JSON.parse(dryRunLine.slice('HN_RELAYFLOW_DRY_RUN:'.length));
     assert.equal(report.name, 'hn-monitor-scheduled-digest-v1-workflow');
-    assert.equal(report.stepCount, 4);
+    assert.equal(report.stepCount, 5);
     assert.deepEqual(
       report.permissions.map(({ agent, access, readPaths, writePaths }) => ({ agent, access, readPaths, writePaths })),
       [
-        { agent: 'curator', access: 'restricted', readPaths: 1, writePaths: 1 },
-        { agent: 'reviewer', access: 'restricted', readPaths: 2, writePaths: 1 },
+        { agent: 'curator', access: 'restricted', readPaths: 1, writePaths: 0 },
+        { agent: 'reviewer', access: 'restricted', readPaths: 1, writePaths: 0 },
       ],
     );
     assert.ok(report.permissions.every((permission) => permission.denyPaths > 0));
@@ -214,6 +351,44 @@ test('pinned Relayflow v1 resumes a failed run without replaying completed HN st
   }
 });
 
+test('five-step v1 flow regenerates malformed model JSON in the same run without replaying input', async () => {
+  const runtimeDir = await mkdtemp(path.resolve('.hn-relayflow-artifact-retry-'));
+  const previousResumeRunId = process.env.RESUME_RUN_ID;
+  const previousRunIdFile = process.env.AGENT_RELAY_RUN_ID_FILE;
+  try {
+    delete process.env.RESUME_RUN_ID;
+    process.env.AGENT_RELAY_RUN_ID_FILE = path.join(runtimeDir, 'current-run-id');
+    const first = await invalidArtifactRecoveryFixture().run({ cwd: runtimeDir, renderer: false });
+    assert.equal(first.status, 'failed');
+
+    assert.deepEqual(
+      await reactivateInvalidArtifactV1Steps(
+        first.id,
+        'hn-monitor-v1-artifact-recovery-fixture-workflow',
+        path.join(runtimeDir, '.agent-relay', 'workflow-runs.jsonl'),
+        (filePath) => new JsonFileWorkflowDb(filePath),
+      ),
+      { producerStep: 'analyze-stories', reactivated: 4 },
+    );
+    process.env.RESUME_RUN_ID = first.id;
+    const resumed = await invalidArtifactRecoveryFixture().run({ cwd: runtimeDir, renderer: false });
+
+    assert.equal(resumed.id, first.id);
+    assert.equal(resumed.status, 'completed');
+    assert.equal(existsSync(path.join(runtimeDir, 'prepare-replayed')), false);
+    assert.match(
+      await readFile(path.join(runtimeDir, '.agent-relay', 'step-outputs', first.id, 'validate-digest.md'), 'utf8'),
+      /HN_DIGEST_NOTES_JSON:\{"theme":"reviewed","stories":\[\{"id":20,"why":"validated"\}\]\}/u,
+    );
+  } finally {
+    if (previousResumeRunId === undefined) delete process.env.RESUME_RUN_ID;
+    else process.env.RESUME_RUN_ID = previousResumeRunId;
+    if (previousRunIdFile === undefined) delete process.env.AGENT_RELAY_RUN_ID_FILE;
+    else process.env.AGENT_RELAY_RUN_ID_FILE = previousRunIdFile;
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});
+
 test('v1 resume reactivation rejects non-failed runs and touches only named descendants', async () => {
   const steps = [
     { id: 'prepare-row', stepName: 'prepare-input', status: 'skipped' },
@@ -242,4 +417,86 @@ test('v1 resume reactivation rejects non-failed runs and touches only named desc
     1,
   );
   assert.deepEqual(updates.map((update) => update.id), ['validate-row']);
+});
+
+test('v1 invalid-artifact recovery replays only the producer validation chain once', async () => {
+  const steps = [
+    { id: 'prepare-row', stepName: 'prepare-input', status: 'completed' },
+    { id: 'analyze-row', stepName: 'analyze-stories', status: 'completed' },
+    { id: 'candidate-row', stepName: 'validate-candidate', status: 'failed' },
+    { id: 'review-row', stepName: 'review-digest', status: 'skipped' },
+    { id: 'digest-row', stepName: 'validate-digest', status: 'skipped' },
+  ];
+  const updates = [];
+  const journal = {
+    async getRun() { return { status: 'failed', workflowName: 'hn-monitor-scheduled-digest-v1-workflow' }; },
+    async getStepsByRunId() { return steps; },
+    async updateStep(id, patch) { updates.push({ id, patch }); },
+  };
+
+  assert.deepEqual(
+    await reactivateInvalidArtifactV1Steps(
+      'run-1',
+      'hn-monitor-scheduled-digest-v1-workflow',
+      'journal',
+      () => journal,
+    ),
+    { producerStep: 'analyze-stories', reactivated: 4 },
+  );
+  assert.deepEqual(updates.map((update) => update.id), ['analyze-row', 'candidate-row', 'review-row', 'digest-row']);
+  assert.ok(updates.every((update) => update.patch.status === 'pending'));
+});
+
+test('v1 invalid-artifact recovery regenerates a producer that omitted its marker', async () => {
+  const steps = [
+    { id: 'prepare-row', stepName: 'prepare-input', status: 'completed' },
+    { id: 'analyze-row', stepName: 'analyze-stories', status: 'failed' },
+    { id: 'candidate-row', stepName: 'validate-candidate', status: 'skipped' },
+    { id: 'review-row', stepName: 'review-digest', status: 'skipped' },
+    { id: 'digest-row', stepName: 'validate-digest', status: 'skipped' },
+  ];
+  const updates = [];
+  const journal = {
+    async getRun() { return { status: 'failed', workflowName: 'hn-monitor-scheduled-digest-v1-workflow' }; },
+    async getStepsByRunId() { return steps; },
+    async updateStep(id, patch) { updates.push({ id, patch }); },
+  };
+
+  assert.deepEqual(
+    await reactivateInvalidArtifactV1Steps(
+      'run-1',
+      'hn-monitor-scheduled-digest-v1-workflow',
+      'journal',
+      () => journal,
+    ),
+    { producerStep: 'analyze-stories', reactivated: 4 },
+  );
+  assert.deepEqual(updates.map((update) => update.id), ['analyze-row', 'candidate-row', 'review-row', 'digest-row']);
+});
+
+test('v1 invalid final digest recovery keeps the valid curator chain immutable', async () => {
+  const steps = [
+    { id: 'prepare-row', stepName: 'prepare-input', status: 'completed' },
+    { id: 'analyze-row', stepName: 'analyze-stories', status: 'completed' },
+    { id: 'candidate-row', stepName: 'validate-candidate', status: 'completed' },
+    { id: 'review-row', stepName: 'review-digest', status: 'completed' },
+    { id: 'digest-row', stepName: 'validate-digest', status: 'failed' },
+  ];
+  const updates = [];
+  const journal = {
+    async getRun() { return { status: 'failed', workflowName: 'hn-monitor-scheduled-digest-v1-workflow' }; },
+    async getStepsByRunId() { return steps; },
+    async updateStep(id, patch) { updates.push({ id, patch }); },
+  };
+
+  assert.deepEqual(
+    await reactivateInvalidArtifactV1Steps(
+      'run-1',
+      'hn-monitor-scheduled-digest-v1-workflow',
+      'journal',
+      () => journal,
+    ),
+    { producerStep: 'review-digest', reactivated: 2 },
+  );
+  assert.deepEqual(updates.map((update) => update.id), ['review-row', 'digest-row']);
 });

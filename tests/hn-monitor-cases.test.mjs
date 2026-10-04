@@ -212,7 +212,7 @@ test('slack-follow-up case keeps memory and grounding assertions without claimin
     'follow-up fixture should keep a concrete thread_ts for the inbound Slack thread');
 });
 
-test('scheduled product handler is backed by a resumable, repairable Relayflow v1 DAG', () => {
+test('scheduled product handler is backed by a resumable, validated Relayflow v1 DAG', () => {
   const agentSource = readFileSync(resolve('hn-monitor/agent.ts'), 'utf8');
   const workflowSource = readFileSync(resolve('hn-monitor/workflows/scheduled-digest.ts'), 'utf8');
   const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf8'));
@@ -227,9 +227,14 @@ test('scheduled product handler is backed by a resumable, repairable Relayflow v
   assert.match(workflowSource, /from '@relayflows\/core'/u);
   assert.match(workflowSource, /\.step\('prepare-input'/u);
   assert.match(workflowSource, /\.step\('analyze-stories'/u);
+  assert.match(workflowSource, /\.step\('validate-candidate'/u);
   assert.match(workflowSource, /\.step\('review-digest'/u);
   assert.match(workflowSource, /\.step\('validate-digest'/u);
-  assert.match(workflowSource, /\.repairable\(/u);
+  assert.match(workflowSource, /HN_CANDIDATE_JSON:/u);
+  assert.match(workflowSource, /HN_REVIEWED_DIGEST_JSON:/u);
+  assert.match(workflowSource, /persisted .* output is missing for current run/u);
+  assert.match(workflowSource, /reactivateInvalidArtifactV1Steps/u);
+  assert.match(workflowSource, /\.onError\('fail-fast'/u);
   assert.match(workflowSource, /options\.resumeRunId/u);
   assert.match(workflowSource, /builder\.run\(\{ cwd: workflowCwd, renderer: false \}\)/u);
   assert.match(workflowSource, /export async function runScheduledDigestWorkflow/u);

@@ -150,6 +150,9 @@ test('production Relayflow hands non-interactive agent output to deterministic a
   assert.match(source, /sourceName = sourceStep \+ ["']\.md["']/u);
   assert.match(source, /AGENT_RELAY_RUN_ID_FILE/u);
   assert.match(source, /step-outputs["'], runId, sourceName/u);
+  assert.match(source, /await unlink\(runIdHint\)/u);
+  assert.match(source, /while \(run\.status !== ["']completed["'] && !regenerationUsed\)/u,
+    'a workflow invocation must cap total artifact regeneration at one');
   assert.match(source, /expected exactly one/u);
   assert.doesNotMatch(source, /verification:\s*\{ type: ["']file_exists["'], value: (?:candidatePath|digestPath) \}/u);
   assert.match(source, /\{\{steps\.validate-candidate\.output\}\}/u,
@@ -442,17 +445,33 @@ test('v1 invalid-artifact recovery replays only the producer validation chain on
   );
   assert.deepEqual(updates.map((update) => update.id), ['analyze-row', 'candidate-row', 'review-row', 'digest-row']);
   assert.ok(updates.every((update) => update.patch.status === 'pending'));
+});
+
+test('v1 invalid-artifact recovery regenerates a producer that omitted its marker', async () => {
+  const steps = [
+    { id: 'prepare-row', stepName: 'prepare-input', status: 'completed' },
+    { id: 'analyze-row', stepName: 'analyze-stories', status: 'failed' },
+    { id: 'candidate-row', stepName: 'validate-candidate', status: 'skipped' },
+    { id: 'review-row', stepName: 'review-digest', status: 'skipped' },
+    { id: 'digest-row', stepName: 'validate-digest', status: 'skipped' },
+  ];
+  const updates = [];
+  const journal = {
+    async getRun() { return { status: 'failed', workflowName: 'hn-monitor-scheduled-digest-v1-workflow' }; },
+    async getStepsByRunId() { return steps; },
+    async updateStep(id, patch) { updates.push({ id, patch }); },
+  };
+
   assert.deepEqual(
     await reactivateInvalidArtifactV1Steps(
       'run-1',
       'hn-monitor-scheduled-digest-v1-workflow',
       'journal',
       () => journal,
-      ['analyze-stories'],
     ),
-    { producerStep: 'analyze-stories', reactivated: 0 },
-    'the same malformed producer must not be retried forever',
+    { producerStep: 'analyze-stories', reactivated: 4 },
   );
+  assert.deepEqual(updates.map((update) => update.id), ['analyze-row', 'candidate-row', 'review-row', 'digest-row']);
 });
 
 test('v1 invalid final digest recovery keeps the valid curator chain immutable', async () => {

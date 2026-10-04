@@ -30,16 +30,18 @@ uses the v1 journal with stable `prepare-input`, `analyze-stories`,
 survive `RESUME_RUN_ID`. A small v1 compatibility helper reactivates only
 descendants on core `1.0.6` journaled as `skipped`; that version resets the failed
 step itself but otherwise leaves skipped descendants inert on resume. If a
-marked model response contains malformed JSON, the workflow reactivates that
-producer and its validation chain once; it never retries the same invalid bytes
-indefinitely or replays the completed input step.
+model response omits its marker or contains malformed JSON, the workflow
+reactivates that producer and its validation chain once per invocation; it
+never retries the same invalid bytes indefinitely or replays the completed
+input step.
 Deterministic gates check the exact batch key, story ids, and output bounds
 before handing the normalized candidate to the reviewer or returning notes to the
 persona. Curator and reviewer agents return marked one-line JSON through their
 captured stdout—the contract RelayFlow's non-interactive worker wrapper owns—so
 they never depend on a conflicting direct file-write instruction. The gates read
-the current run's persisted step outputs without shell interpolation; a
-per-process run-id hint prevents concurrent or newer runs from being selected.
+the current run's persisted step outputs without shell interpolation; an
+ephemeral per-process run-id hint prevents concurrent or newer runs from being
+selected and is deleted when the workflow call finishes.
 The reviewer receives only the normalized candidate as prompt data. Both agents
 run from the batch artifact directory with a restricted read-only request grant,
 no inherited workspace access, and a `network: false`

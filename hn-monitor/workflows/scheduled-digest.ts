@@ -80,7 +80,6 @@ export async function reactivateInvalidArtifactV1Steps(
   workflowName: string,
   journalPath: string,
   createJournal: (filePath: string) => V1Journal,
-  excludedProducerSteps: readonly string[] = [],
 ): Promise<InvalidArtifactRetryResult> {
   const db = createJournal(journalPath);
   const run = await db.getRun(runId);
@@ -94,12 +93,12 @@ export async function reactivateInvalidArtifactV1Steps(
 
   const steps = await db.getStepsByRunId(runId);
   const failedNames = new Set(steps.filter((step) => step.status === 'failed').map((step) => step.stepName));
-  const producerStep = failedNames.has('validate-candidate')
+  const producerStep = failedNames.has('analyze-stories') || failedNames.has('validate-candidate')
     ? 'analyze-stories'
-    : failedNames.has('validate-digest')
+    : failedNames.has('review-digest') || failedNames.has('validate-digest')
       ? 'review-digest'
       : undefined;
-  if (!producerStep || excludedProducerSteps.includes(producerStep)) {
+  if (!producerStep) {
     return { producerStep, reactivated: 0 };
   }
 
@@ -124,6 +123,7 @@ interface WorkflowProgramDependencies {
   readFile: typeof import('node:fs/promises').readFile;
   mkdir: typeof import('node:fs/promises').mkdir;
   writeFile: typeof import('node:fs/promises').writeFile;
+  unlink: typeof import('node:fs/promises').unlink;
   createHash: typeof import('node:crypto').createHash;
   path: typeof import('node:path');
   workflow: typeof import('@relayflows/core').workflow;
@@ -208,6 +208,7 @@ async function workflowProgram({
   readFile,
   mkdir,
   writeFile,
+  unlink,
   createHash,
   path,
   workflow,
@@ -418,7 +419,7 @@ async function main(): Promise<ScheduledDigestWorkflowResult> {
   const journalPath = path.join(workflowCwd, '.agent-relay', 'workflow-runs.jsonl');
   const workflowName = scheduledDigestJournalWorkflowName(WORKFLOW_NAME);
   const requestedResumeRunId = options.resumeRunId?.trim();
-  const retriedProducers: string[] = [];
+  let regenerationUsed = false;
   if (requestedResumeRunId) {
     const invalidRetry = await reactivateInvalidArtifactV1Steps(
       requestedResumeRunId,
@@ -427,7 +428,7 @@ async function main(): Promise<ScheduledDigestWorkflowResult> {
       (filePath) => new JsonFileWorkflowDb(filePath),
     );
     if (invalidRetry.producerStep && invalidRetry.reactivated > 0) {
-      retriedProducers.push(invalidRetry.producerStep);
+      regenerationUsed = true;
     } else {
       await reactivateSkippedV1Steps(
         requestedResumeRunId,
@@ -456,16 +457,15 @@ async function main(): Promise<ScheduledDigestWorkflowResult> {
   let run;
   try {
     run = await runBuilder(requestedResumeRunId);
-    while (run.status !== 'completed') {
+    while (run.status !== 'completed' && !regenerationUsed) {
       const invalidRetry = await reactivateInvalidArtifactV1Steps(
         run.id,
         workflowName,
         journalPath,
         (filePath) => new JsonFileWorkflowDb(filePath),
-        retriedProducers,
       );
       if (!invalidRetry.producerStep || invalidRetry.reactivated === 0) break;
-      retriedProducers.push(invalidRetry.producerStep);
+      regenerationUsed = true;
       run = await runBuilder(run.id);
     }
   } finally {
@@ -473,6 +473,8 @@ async function main(): Promise<ScheduledDigestWorkflowResult> {
     else process.env.AGENT_RELAY_RUN_ID_FILE = previousRunIdHint;
     if (previousResumeRunId === undefined) delete process.env.RESUME_RUN_ID;
     else process.env.RESUME_RUN_ID = previousResumeRunId;
+    // The hint is process-local coordination, not a durable workflow artifact.
+    try { await unlink(runIdHint); } catch {}
   }
   if (run.status !== 'completed') throw new Error(`Relayflow run ${run.id} ended with status ${run.status}`);
   if (requestedResumeRunId && requestedResumeRunId !== run.id) {
@@ -577,7 +579,7 @@ return main();
  */
 export function scheduledDigestWorkflowSource(): string {
   return [
-    "import { mkdir, readFile, writeFile } from 'node:fs/promises';",
+    "import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';",
     "import { createHash } from 'node:crypto';",
     "import path from 'node:path';",
     "import { JsonFileWorkflowDb, workflow } from '@relayflows/core';",
@@ -590,7 +592,7 @@ export function scheduledDigestWorkflowSource(): string {
     `const materializeAgentJsonCommand = (${buildPersistedAgentJsonCommand.toString()});`,
     `const workflowProgram = (${workflowProgram.toString()});`,
     'async function runLocalWorkflow() {',
-    '  const result = await workflowProgram({ readFile, mkdir, writeFile, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps, reactivateInvalidArtifactV1Steps, scheduledDigestJournalWorkflowName, materializeAgentJsonCommand }, {',
+    '  const result = await workflowProgram({ readFile, mkdir, writeFile, unlink, createHash, path, workflow, JsonFileWorkflowDb, reactivateSkippedV1Steps, reactivateInvalidArtifactV1Steps, scheduledDigestJournalWorkflowName, materializeAgentJsonCommand }, {',
     "    invocationArgs: process.env.invocationArgs ?? '{}',",
     "    dryRun: process.env.DRY_RUN === 'true',",
     '    resumeRunId: process.env.RESUME_RUN_ID,',
